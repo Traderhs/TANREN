@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "app.tanren.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run web:dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../../Results/web-dist"
@@ -21,13 +21,19 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/app.tanren.desktop/audio/**/*"
+        ]
+      }
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "icon": [],
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
     "externalBin": ["../../Results/sidecar/tanren-language"]
   }
 }
