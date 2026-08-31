@@ -1,0 +1,209 @@
+use std::{
+    fs::{self, File},
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
+
+use serde::Serialize;
+
+const INSTALLER: &str = include_str!("../sidecar/install_voicevox.ps1");
+const ENGINE_VERSION: &str = "0.25.2";
+
+struct RuntimeState {
+    phase: String,
+    port: Option<u16>,
+    child: Option<Child>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VoicevoxRuntimeStatus {
+    pub phase: String,
+    pub engine_version: String,
+    pub backend: String,
+    pub error: Option<String>,
+}
+
+pub struct VoicevoxRuntime {
+    home: PathBuf,
+    state: Mutex<RuntimeState>,
+}
+
+impl VoicevoxRuntime {
+    pub fn install(home: PathBuf) -> Arc<Self> {
+        let runtime = Arc::new(Self {
+            home,
+            state: Mutex::new(RuntimeState {
+                phase: "starting".into(),
+                port: None,
+                child: None,
+                error: None,
+            }),
+        });
+        let worker = Arc::clone(&runtime);
+        thread::spawn(move || worker.prepare());
+        runtime
+    }
+
+    fn prepare(&self) {
+        if let Err(error) = self.prepare_inner() {
+            if let Ok(mut state) = self.state.lock() {
+                state.phase = "unavailable".into();
+                state.error = Some(error);
+            }
+        }
+    }
+
+    fn prepare_inner(&self) -> Result<(), String> {
+        fs::create_dir_all(&self.home).map_err(|e| e.to_string())?;
+        let runtime_dir = self.home.join("runtime");
+        let mut run = find_file(&runtime_dir, "run.exe");
+        if run.is_none() {
+            self.set_phase("downloading")?;
+            let installer = self.home.join("install_voicevox.ps1");
+            if fs::read_to_string(&installer).ok().as_deref() != Some(INSTALLER) {
+                fs::write(&installer, INSTALLER).map_err(|e| e.to_string())?;
+            }
+            let logs = self.home.join("logs");
+            fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
+            let stdout = File::create(logs.join("installer.stdout.log")).map_err(|e| e.to_string())?;
+            let stderr = File::create(logs.join("installer.stderr.log")).map_err(|e| e.to_string())?;
+            let status = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(&installer)
+                .arg("-HomePath")
+                .arg(&self.home)
+                .stdin(Stdio::null())
+                .stdout(stdout)
+                .stderr(stderr)
+                .status()
+                .map_err(|e| format!("VOICEVOX installer could not start: {e}"))?;
+            if !status.success() {
+                return Err(format!("VOICEVOX installer failed with {status}; inspect voicevox/logs"));
+            }
+            run = find_file(&runtime_dir, "run.exe");
+        }
+        let run = run.ok_or("VOICEVOX run.exe is missing after installation")?;
+        self.start_engine(&run)
+    }
+
+    fn start_engine(&self, run: &Path) -> Result<(), String> {
+        self.set_phase("loading")?;
+        let port = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?.local_addr().map_err(|e| e.to_string())?.port();
+        let logs = self.home.join("logs");
+        fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
+        let stdout = File::create(logs.join("engine.stdout.log")).map_err(|e| e.to_string())?;
+        let stderr = File::create(logs.join("engine.stderr.log")).map_err(|e| e.to_string())?;
+        let mut command = Command::new(run);
+        command
+            .args(["--host", "127.0.0.1", "--port"])
+            .arg(port.to_string())
+            .arg("--use_gpu")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let child = command.spawn().map_err(|e| format!("VOICEVOX engine failed to start: {e}"))?;
+        {
+            let mut state = self.state.lock().map_err(|_| "VOICEVOX runtime lock poisoned")?;
+            state.port = Some(port);
+            state.child = Some(child);
+        }
+
+        for _ in 0..300 {
+            if http_get(port, "/version").is_ok() {
+                let mut state = self.state.lock().map_err(|_| "VOICEVOX runtime lock poisoned")?;
+                state.phase = "ready".into();
+                state.error = None;
+                return Ok(());
+            }
+            {
+                let mut state = self.state.lock().map_err(|_| "VOICEVOX runtime lock poisoned")?;
+                if state.child.as_mut().is_some_and(|child| child.try_wait().ok().flatten().is_some()) {
+                    return Err("VOICEVOX engine exited while loading; inspect voicevox/logs".into());
+                }
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err("VOICEVOX engine load timed out".into())
+    }
+
+    pub fn endpoint(&self) -> Result<String, String> {
+        let state = self.state.lock().map_err(|_| "VOICEVOX runtime lock poisoned")?;
+        if state.phase != "ready" {
+            return Err(format!("VOICEVOX runtime is {}", state.phase));
+        }
+        Ok(format!("http://127.0.0.1:{}", state.port.ok_or("VOICEVOX port is unavailable")?))
+    }
+
+    pub fn phase(&self) -> String {
+        self.state.lock().map(|state| state.phase.clone()).unwrap_or_else(|_| "unavailable".into())
+    }
+
+    pub fn status(&self) -> VoicevoxRuntimeStatus {
+        let state = self.state.lock().ok();
+        VoicevoxRuntimeStatus {
+            phase: state.as_ref().map(|value| value.phase.clone()).unwrap_or_else(|| "unavailable".into()),
+            engine_version: ENGINE_VERSION.into(),
+            backend: "DirectML".into(),
+            error: state.and_then(|value| value.error.clone()),
+        }
+    }
+
+    fn set_phase(&self, phase: &str) -> Result<(), String> {
+        self.state.lock().map_err(|_| "VOICEVOX runtime lock poisoned".to_string()).map(|mut state| state.phase = phase.into())
+    }
+}
+
+impl Drop for VoicevoxRuntime {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(child) = state.child.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
+fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().is_some_and(|value| value.eq_ignore_ascii_case(name)) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file(&path, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn http_get(port: u16, path: &str) -> Result<Vec<u8>, String> {
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().map_err(|e| format!("invalid VOICEVOX address: {e}"))?,
+        Duration::from_secs(2),
+    ).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|e| e.to_string())?;
+    let split = response.windows(4).position(|value| value == b"\r\n\r\n").ok_or("invalid VOICEVOX HTTP response")?;
+    let status = String::from_utf8_lossy(&response[..split]);
+    if !status.lines().next().unwrap_or_default().contains(" 200 ") {
+        return Err(format!("VOICEVOX returned {}", status.lines().next().unwrap_or_default()));
+    }
+    Ok(response[split + 4..].to_vec())
+}
