@@ -1,12 +1,13 @@
 use std::{fs, path::{Path, PathBuf}};
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, params_from_iter, types::{Value as SqlValue, ValueRef}, Connection, OptionalExtension, Transaction};
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    model::{DeckRecord, DeckStats, DeckSummary, EntryDraft, EntryRecord, PitchConfidence, PitchQuestion, StudyMode},
-    study::StudySession,
+    model::{AudioAssetDraft, DeckRecord, DeckStats, DeckSummary, EntryDraft, EntryRecord, ImportResult, PitchConfidence, PitchQuestion, RecallTimeoutByMode, StudyMode},
+    study::{study_ranges, StudySession},
     timers::TypingProfileState,
 };
 
@@ -22,8 +23,16 @@ impl Database {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let db = Self { path, device_id: device_id() };
+        let mut db = Self { path, device_id: String::new() };
         db.migrate()?;
+        db.device_id = match db.setting("device_id")? {
+            Some(value) => value,
+            None => {
+                let value = format!("windows:{}", Uuid::new_v4());
+                db.set_setting("device_id", Some(&value))?;
+                value
+            }
+        };
         Ok(db)
     }
 
@@ -211,6 +220,17 @@ impl Database {
               device_id TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS semantic_embeddings (
+              normalized_text TEXT NOT NULL,
+              purpose TEXT NOT NULL,
+              model_id TEXT NOT NULL,
+              model_version TEXT NOT NULL,
+              dimension INTEGER NOT NULL,
+              embedding BLOB NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(normalized_text, purpose, model_id, model_version, dimension)
+            );
+
             CREATE TABLE IF NOT EXISTS sync_journal (
               op_id TEXT PRIMARY KEY,
               entity_id TEXT NOT NULL,
@@ -242,6 +262,124 @@ impl Database {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?1)",
             [now()],
         ).map_err(|e| e.to_string())?;
+        let phase5_migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !phase5_migrated {
+            tx.execute(
+                "DELETE FROM pitch_patterns WHERE provider='unidic-fugashi' AND confidence!='MANUAL'",
+                [],
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT entry_id FROM japanese_analyses WHERE provider='unidic-fugashi')",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?1)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+        }
+        let voicevox_migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !voicevox_migrated {
+            tx.execute_batch(
+                r#"
+                ALTER TABLE audio_assets ADD COLUMN voice_profile TEXT NOT NULL DEFAULT 'legacy';
+                ALTER TABLE audio_assets ADD COLUMN age_band TEXT NOT NULL DEFAULT 'unknown';
+                ALTER TABLE audio_assets ADD COLUMN gender_presentation TEXT NOT NULL DEFAULT 'unknown';
+                ALTER TABLE audio_assets ADD COLUMN speaker_id INTEGER;
+                ALTER TABLE audio_assets ADD COLUMN speaker_name TEXT;
+                ALTER TABLE audio_assets ADD COLUMN accent_type INTEGER;
+                CREATE TABLE IF NOT EXISTS audio_playback_state (
+                  entry_id TEXT PRIMARY KEY REFERENCES entries(id),
+                  next_index INTEGER NOT NULL DEFAULT 0,
+                  updated_at TEXT NOT NULL
+                );
+                DELETE FROM audio_assets;
+                "#,
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?1)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+        }
+        let voice_pool_v2_migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=4)",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !voice_pool_v2_migrated {
+            tx.execute("DELETE FROM audio_assets", []).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM audio_playback_state", []).map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(4, ?1)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+        }
+        let voice_pool_v3_migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !voice_pool_v3_migrated {
+            tx.execute("DELETE FROM audio_assets", []).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM audio_playback_state", []).map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(5, ?1)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+        }
+        let voice_pool_v4_migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6)",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !voice_pool_v4_migrated {
+            tx.execute("DELETE FROM audio_assets", []).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM audio_playback_state", []).map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(6, ?1)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+        }
+        let voice_pool_v5_migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !voice_pool_v5_migrated {
+            tx.execute("DELETE FROM audio_assets", []).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM audio_playback_state", []).map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(7, ?1)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -257,24 +395,47 @@ impl Database {
         ).map_err(|e| e.to_string())?;
         journal(&tx, &id, "deck", &self.device_id, 1, "insert", &serde_json::json!({"name":name}))?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(DeckSummary { id, name: name.into(), source_language: source_language.into(), target_language: target_language.into(), enabled_modes: vec![StudyMode::Recognition,StudyMode::Listening,StudyMode::Production], entry_count: 0, current_round: 1, active_stage: None })
+        Ok(DeckSummary { id, name: name.into(), source_language: source_language.into(), target_language: target_language.into(), enabled_modes: vec![StudyMode::Recognition,StudyMode::Listening,StudyMode::Production], entry_count: 0, current_round: 1, active_stage: None, study_ranges: Vec::new() })
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>, String> {
+        let conn = self.conn()?;
+        match conn.query_row("SELECT value FROM app_settings WHERE key=?1", [key], |row| row.get(0)) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: Option<&str>) -> Result<(), String> {
+        let conn = self.conn()?;
+        if let Some(value) = value {
+            conn.execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![key, value, now()],
+            ).map_err(|e| e.to_string())?;
+        } else {
+            conn.execute("DELETE FROM app_settings WHERE key=?1", [key]).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn list_decks(&self) -> Result<Vec<DeckSummary>, String> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             r#"SELECT d.id,d.name,d.source_language,d.target_language,d.enabled_modes,d.current_round,
-               COUNT(e.id),s.stage_label
+               COUNT(e.id),s.stage_label,d.increment_size,d.checkpoint_size
                FROM decks d LEFT JOIN entries e ON e.deck_id=d.id AND e.deleted_at IS NULL
                LEFT JOIN stage_states s ON s.deck_id=d.id
                WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.created_at"#,
         ).map_err(|e| e.to_string())?;
         let rows = stmt.query_map([], |row| {
             let modes: String = row.get(4)?;
+            let entry_count = row.get::<_, i64>(6)? as usize;
             Ok(DeckSummary {
                 id: row.get(0)?, name: row.get(1)?, source_language: row.get(2)?, target_language: row.get(3)?,
                 enabled_modes: serde_json::from_str(&modes).unwrap_or_default(), current_round: row.get::<_, i64>(5)? as u32,
-                entry_count: row.get::<_, i64>(6)? as usize, active_stage: row.get(7)?,
+                entry_count, active_stage: row.get(7)?, study_ranges: study_ranges(entry_count, row.get::<_, i64>(8)? as usize, row.get::<_, i64>(9)? as usize),
             })
         }).map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())
@@ -283,16 +444,17 @@ impl Database {
     pub fn deck(&self, id: &str) -> Result<DeckRecord, String> {
         let conn = self.conn()?;
         conn.query_row(
-            "SELECT id,name,source_language,target_language,enabled_modes,increment_size,checkpoint_size,recall_timeout_by_mode,pitch_policy,strict_orthography,current_round FROM decks WHERE id=?1 AND deleted_at IS NULL",
+            "SELECT id,name,source_language,target_language,enabled_modes,increment_size,checkpoint_size,recall_timeout_by_mode,adaptive_completion_timer_enabled,pitch_policy,strict_orthography,current_round FROM decks WHERE id=?1 AND deleted_at IS NULL",
             [id], |row| {
                 let modes: String = row.get(4)?;
                 let timeouts: String = row.get(7)?;
-                let timeout_json: serde_json::Value = serde_json::from_str(&timeouts).unwrap_or_default();
+                let recall_timeout_by_mode = serde_json::from_str::<RecallTimeoutByMode>(&timeouts).unwrap_or_default();
                 Ok(DeckRecord {
                     id: row.get(0)?, name: row.get(1)?, source_language: row.get(2)?, target_language: row.get(3)?,
                     enabled_modes: serde_json::from_str(&modes).unwrap_or_default(), increment_size: row.get::<_,i64>(5)? as usize,
-                    checkpoint_size: row.get::<_,i64>(6)? as usize, recall_timeout_ms: timeout_json.get("recognition").and_then(|v| v.as_u64()).unwrap_or(3000),
-                    pitch_policy: row.get(8)?, strict_orthography: row.get::<_,i64>(9)? != 0, current_round: row.get::<_,i64>(10)? as u32,
+                    checkpoint_size: row.get::<_,i64>(6)? as usize, recall_timeout_by_mode,
+                    adaptive_completion_timer_enabled: row.get::<_,i64>(8)? != 0,
+                    pitch_policy: row.get(9)?, strict_orthography: row.get::<_,i64>(10)? != 0, current_round: row.get::<_,i64>(11)? as u32,
                 })
             },
         ).map_err(|e| e.to_string())
@@ -308,17 +470,24 @@ impl Database {
         rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())
     }
 
-    pub fn import_entries(&self, deck_id: &str, target_language: &str, drafts: &[EntryDraft]) -> Result<usize, String> {
+    pub fn import_entries(&self, deck_id: &str, target_language: &str, drafts: &[EntryDraft]) -> Result<ImportResult, String> {
         let mut conn = self.conn()?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let mut next_pos: i64 = tx.query_row("SELECT COALESCE(MAX(position)+1,0) FROM entries WHERE deck_id=?1", [deck_id], |r| r.get(0)).map_err(|e| e.to_string())?;
         let timestamp = now();
         let mut inserted = 0;
+        let mut duplicates = 0;
         for draft in drafts.iter().filter(|d| !d.term.trim().is_empty() && !d.meanings.is_empty()) {
+            let meanings = serde_json::to_string(&draft.meanings).map_err(|e| e.to_string())?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE deck_id=?1 AND term=?2 AND meanings=?3 AND COALESCE(reading,'')=COALESCE(?4,'') AND deleted_at IS NULL)",
+                params![deck_id, draft.term.trim(), meanings, draft.reading], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if exists { duplicates += 1; continue; }
             let id = Uuid::new_v4().to_string();
             tx.execute(
                 "INSERT INTO entries(id,deck_id,position,term,meanings,reading,language,created_at,updated_at,device_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",
-                params![id, deck_id, next_pos, draft.term.trim(), serde_json::to_string(&draft.meanings).unwrap(), draft.reading, target_language, timestamp, self.device_id],
+                params![id, deck_id, next_pos, draft.term.trim(), meanings, draft.reading, target_language, timestamp, self.device_id],
             ).map_err(|e| e.to_string())?;
             tx.execute("INSERT INTO enrichment_jobs(id,entry_id,status,updated_at) VALUES(?1,?2,'queued',?3)", params![Uuid::new_v4().to_string(),id,timestamp]).map_err(|e| e.to_string())?;
             journal(&tx, &id, "entry", &self.device_id, 1, "insert", &serde_json::json!({"deck_id":deck_id,"term":draft.term,"meanings":draft.meanings}))?;
@@ -326,7 +495,29 @@ impl Database {
             inserted += 1;
         }
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(inserted)
+        Ok(ImportResult { inserted, duplicates })
+    }
+
+    pub fn update_deck(&self, deck_id: &str, name: &str, enabled_modes: &[StudyMode]) -> Result<(), String> {
+        if name.trim().is_empty() { return Err("deck name cannot be empty".into()); }
+        if enabled_modes.is_empty() { return Err("at least one study mode must be enabled".into()); }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let revision: i64 = tx.query_row("SELECT revision+1 FROM decks WHERE id=?1 AND deleted_at IS NULL", [deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        let modes = serde_json::to_string(enabled_modes).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE decks SET name=?1,enabled_modes=?2,updated_at=?3,revision=?4,device_id=?5 WHERE id=?6", params![name.trim(), modes, now(), revision, self.device_id, deck_id]).map_err(|e| e.to_string())?;
+        journal(&tx, deck_id, "deck", &self.device_id, revision, "update", &serde_json::json!({"name":name.trim(),"enabled_modes":enabled_modes}))?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn delete_deck(&self, deck_id: &str) -> Result<(), String> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let revision: i64 = tx.query_row("SELECT revision+1 FROM decks WHERE id=?1 AND deleted_at IS NULL", [deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        let timestamp = now();
+        tx.execute("UPDATE decks SET deleted_at=?1,updated_at=?1,revision=?2,device_id=?3 WHERE id=?4", params![timestamp, revision, self.device_id, deck_id]).map_err(|e| e.to_string())?;
+        journal(&tx, deck_id, "deck", &self.device_id, revision, "delete", &serde_json::json!({"deleted_at":timestamp}))?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn aliases(&self, entry_id: &str) -> Result<(Vec<String>, Vec<String>), String> {
@@ -345,8 +536,9 @@ impl Database {
         let timestamp = now();
         let existing: Option<String> = tx.query_row("SELECT id FROM entry_aliases WHERE entry_id=?1 AND answer=?2", params![entry_id,answer], |r| r.get(0)).optional().map_err(|e|e.to_string())?;
         if let Some(id)=existing {
-            tx.execute("UPDATE entry_aliases SET status=?1,updated_at=?2,revision=revision+1 WHERE id=?3", params![status,timestamp,id]).map_err(|e|e.to_string())?;
-            journal(&tx,&id,"entry_alias",&self.device_id,2,"update",&serde_json::json!({"status":status}))?;
+            tx.execute("UPDATE entry_aliases SET status=?1,updated_at=?2,revision=revision+1,device_id=?3,deleted_at=NULL WHERE id=?4", params![status,timestamp,self.device_id,id]).map_err(|e|e.to_string())?;
+            let revision: i64 = tx.query_row("SELECT revision FROM entry_aliases WHERE id=?1", [&id], |row| row.get(0)).map_err(|e| e.to_string())?;
+            journal(&tx,&id,"entry_alias",&self.device_id,revision,"update",&serde_json::json!({"status":status}))?;
         } else {
             let id=Uuid::new_v4().to_string();
             tx.execute("INSERT INTO entry_aliases(id,entry_id,answer,status,created_at,updated_at,device_id) VALUES(?1,?2,?3,?4,?5,?5,?6)",params![id,entry_id,answer,status,timestamp,self.device_id]).map_err(|e|e.to_string())?;
@@ -355,14 +547,54 @@ impl Database {
         tx.commit().map_err(|e|e.to_string())
     }
 
-    pub fn save_session(&self, session: &StudySession) -> Result<(), String> {
+    pub fn cached_embedding(&self, normalized_text: &str, purpose: &str, model_id: &str, model_version: &str, dimension: usize) -> Result<Option<Vec<f32>>, String> {
         let conn = self.conn()?;
-        let timestamp = now();
+        let bytes: Option<Vec<u8>> = conn.query_row(
+            "SELECT embedding FROM semantic_embeddings WHERE normalized_text=?1 AND purpose=?2 AND model_id=?3 AND model_version=?4 AND dimension=?5",
+            params![normalized_text, purpose, model_id, model_version, dimension as i64],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        bytes.map(|bytes| {
+            if bytes.len() != dimension * 4 { return Err("cached embedding dimension mismatch".into()); }
+            Ok(bytes.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect())
+        }).transpose()
+    }
+
+    pub fn cache_embedding(&self, normalized_text: &str, purpose: &str, model_id: &str, model_version: &str, embedding: &[f32]) -> Result<(), String> {
+        let conn = self.conn()?;
+        let bytes: Vec<u8> = embedding.iter().flat_map(|value| value.to_le_bytes()).collect();
         conn.execute(
+            "INSERT INTO semantic_embeddings(normalized_text,purpose,model_id,model_version,dimension,embedding,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(normalized_text,purpose,model_id,model_version,dimension) DO UPDATE SET embedding=excluded.embedding,updated_at=excluded.updated_at",
+            params![normalized_text, purpose, model_id, model_version, embedding.len() as i64, bytes, now()],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn semantic_candidates(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn()?;
+        let mut values = Vec::new();
+        let mut meanings = conn.prepare("SELECT meanings FROM entries WHERE deleted_at IS NULL").map_err(|e| e.to_string())?;
+        let rows = meanings.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        for row in rows {
+            values.extend(serde_json::from_str::<Vec<String>>(&row.map_err(|e| e.to_string())?).unwrap_or_default());
+        }
+        let mut aliases = conn.prepare("SELECT answer FROM entry_aliases WHERE deleted_at IS NULL").map_err(|e| e.to_string())?;
+        let rows = aliases.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        for row in rows { values.push(row.map_err(|e| e.to_string())?); }
+        Ok(values)
+    }
+
+    pub fn save_session(&self, session: &StudySession) -> Result<(), String> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let timestamp = now();
+        tx.execute(
             "INSERT INTO stage_states(deck_id,round,stage_index,stage_label,state_json,updated_at,device_id) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(deck_id) DO UPDATE SET round=excluded.round,stage_index=excluded.stage_index,stage_label=excluded.stage_label,state_json=excluded.state_json,updated_at=excluded.updated_at,device_id=excluded.device_id",
             params![session.deck_id,session.round,session.stage_index as i64,session.stage().label(),serde_json::to_string(session).map_err(|e|e.to_string())?,timestamp,self.device_id],
         ).map_err(|e|e.to_string())?;
-        Ok(())
+        let revision: i64 = tx.query_row("SELECT COALESCE(MAX(revision),0)+1 FROM sync_journal WHERE entity_id=?1 AND entity_type='stage_state'", [&session.deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        journal(&tx, &session.deck_id, "stage_state", &self.device_id, revision, "upsert", &serde_json::json!({"round":session.round,"stage_index":session.stage_index,"stage_label":session.stage().label()}))?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn load_session(&self, deck_id: &str) -> Result<Option<StudySession>, String> {
@@ -373,26 +605,37 @@ impl Database {
 
     pub fn clear_session_and_advance_round(&self, deck_id: &str) -> Result<(), String> {
         let mut conn=self.conn()?; let tx=conn.transaction().map_err(|e|e.to_string())?;
+        let stage_revision: i64 = tx.query_row("SELECT COALESCE(MAX(revision),0)+1 FROM sync_journal WHERE entity_id=?1 AND entity_type='stage_state'", [deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM stage_states WHERE deck_id=?1",[deck_id]).map_err(|e|e.to_string())?;
         tx.execute("UPDATE decks SET current_round=current_round+1,updated_at=?1,revision=revision+1 WHERE id=?2",params![now(),deck_id]).map_err(|e|e.to_string())?;
+        let deck_revision: i64 = tx.query_row("SELECT revision FROM decks WHERE id=?1", [deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        journal(&tx, deck_id, "stage_state", &self.device_id, stage_revision, "delete", &serde_json::json!({}))?;
+        journal(&tx, deck_id, "deck", &self.device_id, deck_revision, "update", &serde_json::json!({"current_round_increment":1}))?;
         tx.commit().map_err(|e|e.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn insert_attempt(&self, entry_id:&str, deck_id:&str, variant:StudyMode, round:u32, stage:&str, answer:&str, base_correct:bool, pitch_correct:Option<bool>, joint_correct:bool, grading_method:&str, semantic_score:Option<f64>, recall_latency_ms:u64, typing_duration_ms:u64, failure_type:Option<&str>) -> Result<(),String> {
-        let conn=self.conn()?;
-        conn.execute(
+        let mut conn=self.conn()?;
+        let tx=conn.transaction().map_err(|e|e.to_string())?;
+        let id = Uuid::new_v4().to_string();
+        tx.execute(
             "INSERT INTO attempts(id,entry_id,deck_id,variant,round,stage,answer_text,base_correct,pitch_correct,joint_correct,grading_method,semantic_score,recall_latency_ms,typing_duration_ms,total_duration_ms,failure_type,timestamp,device_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-            params![Uuid::new_v4().to_string(),entry_id,deck_id,variant.as_str(),round,stage,answer,base_correct,pitch_correct,joint_correct,grading_method,semantic_score,recall_latency_ms,typing_duration_ms,recall_latency_ms+typing_duration_ms,failure_type,now(),self.device_id],
+            params![id,entry_id,deck_id,variant.as_str(),round,stage,answer,base_correct,pitch_correct,joint_correct,grading_method,semantic_score,recall_latency_ms,typing_duration_ms,recall_latency_ms+typing_duration_ms,failure_type,now(),self.device_id],
         ).map_err(|e|e.to_string())?;
-        Ok(())
+        journal(&tx, &id, "attempt", &self.device_id, 1, "insert", &serde_json::json!({"entry_id":entry_id,"deck_id":deck_id,"variant":variant,"round":round,"stage":stage}))?;
+        tx.commit().map_err(|e|e.to_string())
     }
 
     pub fn update_attempt_pitch(&self, deck_id:&str, entry_id:&str, variant:StudyMode, correct:bool, joint_correct:bool, failure_type:Option<&str>) -> Result<(),String> {
-        let conn=self.conn()?;
-        let id:Option<String>=conn.query_row("SELECT id FROM attempts WHERE deck_id=?1 AND entry_id=?2 AND variant=?3 ORDER BY timestamp DESC LIMIT 1",params![deck_id,entry_id,variant.as_str()],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
-        if let Some(id)=id { conn.execute("UPDATE attempts SET pitch_correct=?1,joint_correct=?2,failure_type=COALESCE(?3,failure_type) WHERE id=?4",params![correct,joint_correct,failure_type,id]).map_err(|e|e.to_string())?; }
-        Ok(())
+        let mut conn=self.conn()?;
+        let tx=conn.transaction().map_err(|e|e.to_string())?;
+        let id:Option<String>=tx.query_row("SELECT id FROM attempts WHERE deck_id=?1 AND entry_id=?2 AND variant=?3 ORDER BY timestamp DESC LIMIT 1",params![deck_id,entry_id,variant.as_str()],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        if let Some(id)=id {
+            tx.execute("UPDATE attempts SET pitch_correct=?1,joint_correct=?2,failure_type=COALESCE(?3,failure_type) WHERE id=?4",params![correct,joint_correct,failure_type,id]).map_err(|e|e.to_string())?;
+            journal(&tx, &id, "attempt", &self.device_id, 2, "update", &serde_json::json!({"pitch_correct":correct,"joint_correct":joint_correct,"failure_type":failure_type}))?;
+        }
+        tx.commit().map_err(|e|e.to_string())
     }
 
     pub fn pitch_question(&self, entry_id:&str, predicted_gate:bool) -> Result<Option<PitchQuestion>,String> {
@@ -405,15 +648,30 @@ impl Database {
         let patterns:Vec<Vec<u8>>=serde_json::from_str(&patterns_json).unwrap_or_default();
         let confidence=match confidence.as_str(){"MANUAL"=>PitchConfidence::Manual,"VERIFIED"=>PitchConfidence::Verified,"CONSENSUS"=>PitchConfidence::Consensus,_=>PitchConfidence::Predicted};
         let gate=confidence.gates_by_default() || predicted_gate;
-        let morae=analysis.get("morae").and_then(|v|v.as_array()).map(|a|a.iter().filter_map(|v|v.as_str().map(String::from)).collect()).unwrap_or_default();
+        let morae:Vec<String>=analysis.get("morae").and_then(|v|v.as_array()).map(|a|a.iter().filter_map(|v|v.as_str().map(String::from)).collect()).unwrap_or_default();
         let kind=analysis.get("scope").and_then(|v|v.as_str()).unwrap_or("lexical").to_string();
+        if kind != "lexical" || morae.is_empty() || patterns.is_empty() || patterns.iter().any(|pattern| pattern.len()!=morae.len() || pattern.iter().any(|level| *level>1)) {
+            return Ok(None);
+        }
         let phrase_count=if kind=="lexical"{1}else{patterns.first().map(|p|p.len()).unwrap_or(1)};
         Ok(Some(PitchQuestion{kind,reading,morae,phrase_count,allowed_patterns:patterns,confidence,gate_enabled:gate}))
     }
 
-    pub fn audio_path(&self, entry_id:&str)->Result<Option<String>,String>{
-        let conn=self.conn()?;
-        conn.query_row("SELECT path FROM audio_assets WHERE entry_id=?1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",[entry_id],|r|r.get(0)).optional().map_err(|e|e.to_string())
+    pub fn next_audio_path(&self, entry_id:&str)->Result<Option<String>,String>{
+        let mut conn=self.conn()?;
+        let tx=conn.transaction().map_err(|e|e.to_string())?;
+        let mut stmt=tx.prepare("SELECT path FROM audio_assets WHERE entry_id=?1 AND deleted_at IS NULL ORDER BY CASE age_band WHEN 'child' THEN 1 WHEN 'adolescent' THEN 2 WHEN 'young_adult' THEN 3 WHEN 'middle_aged' THEN 4 WHEN 'senior' THEN 5 ELSE 6 END, CASE gender_presentation WHEN 'feminine' THEN 1 WHEN 'neutral' THEN 2 WHEN 'masculine' THEN 3 ELSE 4 END, voice_profile, cache_key").map_err(|e|e.to_string())?;
+        let paths=stmt.query_map([entry_id],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+        drop(stmt);
+        if paths.is_empty(){tx.commit().map_err(|e|e.to_string())?;return Ok(None)}
+        let next:i64=tx.query_row("SELECT next_index FROM audio_playback_state WHERE entry_id=?1",[entry_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?.unwrap_or(0);
+        let path=paths[next.rem_euclid(paths.len() as i64) as usize].clone();
+        tx.execute(
+            "INSERT INTO audio_playback_state(entry_id,next_index,updated_at) VALUES(?1,?2,?3) ON CONFLICT(entry_id) DO UPDATE SET next_index=excluded.next_index,updated_at=excluded.updated_at",
+            params![entry_id,next+1,now()],
+        ).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(Some(path))
     }
 
     pub fn stats(&self, deck_id:&str)->Result<Vec<DeckStats>,String>{
@@ -435,18 +693,44 @@ impl Database {
         Ok(output)
     }
 
-    pub fn set_entry_analysis(&self, entry_id:&str, reading:Option<&str>, analysis_json:&serde_json::Value, provider:&str, source:&str, confidence:&str, model_version:Option<&str>, pitch_patterns:Option<&[Vec<u8>]>, scope:&str, audio:Option<(&str,&str)>) -> Result<(),String>{
+    pub fn set_entry_analysis(&self, entry_id:&str, reading:Option<&str>, analysis_json:&serde_json::Value, provider:&str, source:&str, confidence:&str, model_version:Option<&str>, pitch_patterns:Option<&[Vec<u8>]>, scope:&str, audio:&[AudioAssetDraft]) -> Result<(),String>{
         let mut conn=self.conn()?; let tx=conn.transaction().map_err(|e|e.to_string())?; let timestamp=now();
         tx.execute("UPDATE entries SET reading=COALESCE(?1,reading),updated_at=?2,revision=revision+1 WHERE id=?3",params![reading,timestamp,entry_id]).map_err(|e|e.to_string())?;
         let analysis_id:Option<String>=tx.query_row("SELECT id FROM japanese_analyses WHERE entry_id=?1",[entry_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        let analysis_existed = analysis_id.is_some();
         let aid=analysis_id.unwrap_or_else(||Uuid::new_v4().to_string());
         tx.execute("INSERT INTO japanese_analyses(id,entry_id,normalized_text,reading,analysis_json,provider,source,confidence,model_version,created_at,updated_at,device_id) SELECT ?1,?2,term,?3,?4,?5,?6,?7,?8,?9,?9,?10 FROM entries WHERE id=?2 ON CONFLICT(entry_id) DO UPDATE SET reading=excluded.reading,analysis_json=excluded.analysis_json,provider=excluded.provider,source=excluded.source,confidence=excluded.confidence,model_version=excluded.model_version,updated_at=excluded.updated_at,revision=japanese_analyses.revision+1",params![aid,entry_id,reading,analysis_json.to_string(),provider,source,confidence,model_version,timestamp,self.device_id]).map_err(|e|e.to_string())?;
+        let old_pitch: Vec<(String, i64)> = {
+            let mut stmt = tx.prepare("SELECT id,revision FROM pitch_patterns WHERE analysis_id=?1 AND confidence!='MANUAL'").map_err(|e| e.to_string())?;
+            stmt.query_map([&aid], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        tx.execute("DELETE FROM pitch_patterns WHERE analysis_id=?1 AND confidence!='MANUAL'",[&aid]).map_err(|e|e.to_string())?;
+        for (id, revision) in old_pitch { journal(&tx, &id, "pitch_pattern", &self.device_id, revision + 1, "delete", &serde_json::json!({"analysis_id":aid}))?; }
         if let Some(patterns)=pitch_patterns {
-            tx.execute("DELETE FROM pitch_patterns WHERE analysis_id=?1",[&aid]).map_err(|e|e.to_string())?;
-            tx.execute("INSERT INTO pitch_patterns(id,analysis_id,scope,patterns_json,preferred_pattern,provider,source,confidence,created_at,updated_at,device_id) VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?8,?9)",params![Uuid::new_v4().to_string(),aid,scope,serde_json::to_string(patterns).unwrap(),provider,source,confidence,timestamp,self.device_id]).map_err(|e|e.to_string())?;
+            let pitch_id = Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO pitch_patterns(id,analysis_id,scope,patterns_json,preferred_pattern,provider,source,confidence,created_at,updated_at,device_id) VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?8,?9)",params![pitch_id,aid,scope,serde_json::to_string(patterns).unwrap(),provider,source,confidence,timestamp,self.device_id]).map_err(|e|e.to_string())?;
+            journal(&tx, &pitch_id, "pitch_pattern", &self.device_id, 1, "insert", &serde_json::json!({"analysis_id":aid,"scope":scope,"provider":provider,"source":source,"confidence":confidence}))?;
         }
-        if let Some((cache_key,path))=audio { tx.execute("INSERT OR REPLACE INTO audio_assets(id,entry_id,cache_key,path,provider,created_at,updated_at,device_id) VALUES(?1,?2,?3,?4,?5,?6,?6,?7)",params![Uuid::new_v4().to_string(),entry_id,cache_key,path,provider,timestamp,self.device_id]).map_err(|e|e.to_string())?; }
+        let old_audio: Vec<(String, i64)> = {
+            let mut stmt = tx.prepare("SELECT id,revision FROM audio_assets WHERE entry_id=?1").map_err(|e| e.to_string())?;
+            stmt.query_map([entry_id], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        tx.execute("DELETE FROM audio_assets WHERE entry_id=?1",[entry_id]).map_err(|e|e.to_string())?;
+        for (id, revision) in old_audio { journal(&tx, &id, "audio_asset", &self.device_id, revision + 1, "delete", &serde_json::json!({"entry_id":entry_id}))?; }
+        tx.execute("DELETE FROM audio_playback_state WHERE entry_id=?1",[entry_id]).map_err(|e|e.to_string())?;
+        for asset in audio {
+            let audio_id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO audio_assets(id,entry_id,cache_key,path,provider,voice_profile,age_band,gender_presentation,speaker_id,speaker_name,accent_type,created_at,updated_at,device_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,?13)",
+                params![audio_id,entry_id,asset.cache_key,asset.path,asset.provider,asset.voice_profile,asset.age_band,asset.gender_presentation,asset.speaker_id,asset.speaker_name,asset.accent_type.map(|v|v as i64),timestamp,self.device_id],
+            ).map_err(|e|e.to_string())?;
+            journal(&tx, &audio_id, "audio_asset", &self.device_id, 1, "insert", &serde_json::json!({"entry_id":entry_id,"cache_key":asset.cache_key,"provider":asset.provider,"voice_profile":asset.voice_profile}))?;
+        }
         tx.execute("UPDATE enrichment_jobs SET status='done',updated_at=?1,last_error=NULL WHERE entry_id=?2",params![timestamp,entry_id]).map_err(|e|e.to_string())?;
+        let entry_revision: i64 = tx.query_row("SELECT revision FROM entries WHERE id=?1", [entry_id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        let analysis_revision: i64 = tx.query_row("SELECT revision FROM japanese_analyses WHERE id=?1", [&aid], |row| row.get(0)).map_err(|e| e.to_string())?;
+        journal(&tx, entry_id, "entry", &self.device_id, entry_revision, "update", &serde_json::json!({"reading":reading}))?;
+        journal(&tx, &aid, "japanese_analysis", &self.device_id, analysis_revision, if analysis_existed { "update" } else { "insert" }, &serde_json::json!({"entry_id":entry_id,"provider":provider,"source":source,"confidence":confidence,"model_version":model_version}))?;
         tx.commit().map_err(|e|e.to_string())
     }
 
@@ -473,13 +757,109 @@ impl Database {
         let median = profile.median_gap();
         let p90 = profile.p90_gap();
         let p95 = profile.p95_gap();
-        let chars_per_second = None::<f64>;
+        let chars_per_second = profile.median_chars_per_second();
         let ime_latency = if profile.ime_conversion_latencies_ms.is_empty() { None } else { Some(profile.ime_conversion_latencies_ms.iter().sum::<f64>() / profile.ime_conversion_latencies_ms.len() as f64) };
         conn.execute(
             "INSERT INTO typing_profiles(id,deck_id,input_language,study_mode,input_method,sample_count,median_interkey_gap,p90_interkey_gap,p95_interkey_gap,chars_per_second,ime_conversion_latency,completion_distribution,updated_at) VALUES(?1,?2,?3,?4,'default',?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(deck_id,input_language,study_mode,input_method) DO UPDATE SET sample_count=excluded.sample_count,median_interkey_gap=excluded.median_interkey_gap,p90_interkey_gap=excluded.p90_interkey_gap,p95_interkey_gap=excluded.p95_interkey_gap,chars_per_second=excluded.chars_per_second,ime_conversion_latency=excluded.ime_conversion_latency,completion_distribution=excluded.completion_distribution,updated_at=excluded.updated_at",
             params![Uuid::new_v4().to_string(), deck_id, input_language, mode.as_str(), profile.sample_count as i64, median, p90, p95, chars_per_second, ime_latency, serde_json::to_string(profile).map_err(|e|e.to_string())?, timestamp],
         ).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn export_deck(&self, deck_id: &str) -> Result<String, String> {
+        self.deck(deck_id)?;
+        let conn = self.conn()?;
+        let queries = [
+            ("decks", "SELECT * FROM decks WHERE id=?1"),
+            ("entries", "SELECT * FROM entries WHERE deck_id=?1 ORDER BY position"),
+            ("entry_aliases", "SELECT a.* FROM entry_aliases a JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
+            ("japanese_analyses", "SELECT a.* FROM japanese_analyses a JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
+            ("pitch_patterns", "SELECT p.* FROM pitch_patterns p JOIN japanese_analyses a ON a.id=p.analysis_id JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
+            ("audio_assets", "SELECT a.* FROM audio_assets a JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
+            ("audio_playback_state", "SELECT a.* FROM audio_playback_state a JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
+            ("stage_states", "SELECT * FROM stage_states WHERE deck_id=?1"),
+            ("attempts", "SELECT * FROM attempts WHERE deck_id=?1 ORDER BY timestamp"),
+            ("typing_profiles", "SELECT * FROM typing_profiles WHERE deck_id=?1"),
+            ("grading_decisions", "SELECT g.* FROM grading_decisions g JOIN entries e ON e.id=g.entry_id WHERE e.deck_id=?1"),
+            ("enrichment_jobs", "SELECT j.* FROM enrichment_jobs j JOIN entries e ON e.id=j.entry_id WHERE e.deck_id=?1"),
+            ("sync_journal", "SELECT j.* FROM sync_journal j WHERE j.entity_id=?1 OR j.entity_id IN (SELECT id FROM entries WHERE deck_id=?1) OR j.entity_id IN (SELECT id FROM entry_aliases WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1)) OR j.entity_id IN (SELECT id FROM japanese_analyses WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1)) OR j.entity_id IN (SELECT id FROM pitch_patterns WHERE analysis_id IN (SELECT id FROM japanese_analyses WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1))) OR j.entity_id IN (SELECT id FROM audio_assets WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1)) OR j.entity_id IN (SELECT id FROM attempts WHERE deck_id=?1) ORDER BY j.timestamp"),
+        ];
+        let mut tables = Map::new();
+        for (name, sql) in queries { tables.insert(name.into(), Value::Array(query_json(&conn, sql, [deck_id])?)); }
+        serde_json::to_string_pretty(&serde_json::json!({
+            "format": "tanren-portable-deck",
+            "version": 1,
+            "exported_at": now(),
+            "tables": tables,
+        })).map_err(|e| e.to_string())
+    }
+
+    pub fn import_deck_export(&self, payload: &str) -> Result<String, String> {
+        let root: Value = serde_json::from_str(payload.trim_start_matches('\u{feff}')).map_err(|e| format!("invalid TANREN JSON: {e}"))?;
+        if root.get("format").and_then(Value::as_str) != Some("tanren-portable-deck") || root.get("version").and_then(Value::as_i64) != Some(1) {
+            return Err("unsupported TANREN export format/version".into());
+        }
+        let tables = root.get("tables").and_then(Value::as_object).ok_or("export is missing tables")?;
+        let deck_rows = tables.get("decks").and_then(Value::as_array).ok_or("export is missing deck")?;
+        if deck_rows.len() != 1 { return Err("a portable deck export must contain exactly one deck".into()); }
+        let deck_id = deck_rows[0].get("id").and_then(Value::as_str).ok_or("export deck id is missing")?.to_string();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM decks WHERE id=?1)", [&deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        if exists { return Err("this deck already exists; restore into a fresh TANREN database or delete the existing database first".into()); }
+        let order = ["decks", "entries", "entry_aliases", "japanese_analyses", "pitch_patterns", "audio_assets", "audio_playback_state", "stage_states", "attempts", "typing_profiles", "grading_decisions", "enrichment_jobs", "sync_journal"];
+        for table in order {
+            if let Some(rows) = tables.get(table).and_then(Value::as_array) {
+                for row in rows { insert_json_row(&tx, table, row)?; }
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(deck_id)
+    }
+}
+
+fn query_json<'a, const N: usize>(conn: &Connection, sql: &str, values: [&'a str; N]) -> Result<Vec<Value>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let columns: Vec<String> = stmt.column_names().iter().map(|name| (*name).to_string()).collect();
+    let rows = stmt.query_map(params_from_iter(values), |row| {
+        let mut object = Map::new();
+        for (index, name) in columns.iter().enumerate() {
+            let value = match row.get_ref(index)? {
+                ValueRef::Null => Value::Null,
+                ValueRef::Integer(value) => Value::from(value),
+                ValueRef::Real(value) => Value::from(value),
+                ValueRef::Text(value) => Value::String(String::from_utf8_lossy(value).into_owned()),
+                ValueRef::Blob(_) => return Err(rusqlite::Error::InvalidColumnType(index, name.clone(), rusqlite::types::Type::Blob)),
+            };
+            object.insert(name.clone(), value);
+        }
+        Ok(Value::Object(object))
+    }).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+fn insert_json_row(tx: &Transaction<'_>, table: &str, value: &Value) -> Result<(), String> {
+    let object = value.as_object().ok_or_else(|| format!("{table} row is not an object"))?;
+    if object.is_empty() || object.keys().any(|key| !key.chars().all(|ch| ch == '_' || ch.is_ascii_alphanumeric())) {
+        return Err(format!("{table} contains invalid columns"));
+    }
+    let columns: Vec<_> = object.keys().cloned().collect();
+    let placeholders = (1..=columns.len()).map(|index| format!("?{index}")).collect::<Vec<_>>().join(",");
+    let sql = format!("INSERT INTO {table}({}) VALUES({placeholders})", columns.join(","));
+    let values: Result<Vec<SqlValue>, String> = columns.iter().map(|column| json_sql_value(&object[column])).collect();
+    tx.execute(&sql, params_from_iter(values?)).map_err(|e| format!("could not restore {table}: {e}"))?;
+    Ok(())
+}
+
+fn json_sql_value(value: &Value) -> Result<SqlValue, String> {
+    match value {
+        Value::Null => Ok(SqlValue::Null),
+        Value::Bool(value) => Ok(SqlValue::Integer(i64::from(*value))),
+        Value::Number(value) if value.is_i64() => Ok(SqlValue::Integer(value.as_i64().unwrap())),
+        Value::Number(value) if value.is_u64() => i64::try_from(value.as_u64().unwrap()).map(SqlValue::Integer).map_err(|_| "integer is too large".into()),
+        Value::Number(value) => value.as_f64().map(SqlValue::Real).ok_or_else(|| "invalid number".into()),
+        Value::String(value) => Ok(SqlValue::Text(value.clone())),
+        _ => Err("nested JSON values are not valid database columns".into()),
     }
 }
 
@@ -488,7 +868,6 @@ fn journal(tx:&Transaction<'_>, entity_id:&str, entity_type:&str, device_id:&str
 }
 fn ratio(n:usize,d:usize)->Option<f64>{if d==0{None}else{Some(n as f64/d as f64)}}
 fn now()->String{Utc::now().to_rfc3339()}
-fn device_id()->String{format!("windows:{}",std::env::var("COMPUTERNAME").unwrap_or_else(|_|"local".into()))}
 
 #[cfg(test)]
 mod tests{
@@ -502,5 +881,146 @@ mod tests{
         db.import_entries(&deck.id,"ja-JP",&[EntryDraft{term:"見据える".into(),meanings:vec!["내다보다".into()],reading:Some("みすえる".into())}]).unwrap();
         drop(db);
         let reopened=Database::open(&path).unwrap(); assert_eq!(reopened.entries(&deck.id).unwrap().len(),1); assert_eq!(reopened.list_decks().unwrap()[0].entry_count,1);
+    }
+
+    #[test]
+    fn imports_append_after_existing_cards_and_skip_exact_duplicates() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("append", "ko-KR", "ja-JP").unwrap();
+        let first = EntryDraft { term: "先".into(), meanings: vec!["앞".into()], reading: Some("さき".into()) };
+        let second = EntryDraft { term: "後".into(), meanings: vec!["뒤".into()], reading: Some("あと".into()) };
+        assert_eq!(db.import_entries(&deck.id, "ja-JP", &[first.clone()]).unwrap(), ImportResult { inserted: 1, duplicates: 0 });
+        assert_eq!(db.import_entries(&deck.id, "ja-JP", &[first, second]).unwrap(), ImportResult { inserted: 1, duplicates: 1 });
+        assert_eq!(db.entries(&deck.id).unwrap().into_iter().map(|entry| entry.term).collect::<Vec<_>>(), vec!["先", "後"]);
+    }
+
+    #[test]
+    fn portable_export_roundtrips_deck_entries_aliases_progress_attempts_and_enrichment() {
+        let source_dir = tempdir().unwrap();
+        let source = Database::open(source_dir.path().join("source.db")).unwrap();
+        let deck = source.create_deck("portable", "ko-KR", "ja-JP").unwrap();
+        source.import_entries(&deck.id, "ja-JP", &[EntryDraft { term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()) }]).unwrap();
+        let entry = source.entries(&deck.id).unwrap().remove(0);
+        source.set_alias(&entry.id, "냥이", true).unwrap();
+        source.insert_attempt(&entry.id, &deck.id, StudyMode::Recognition, 1, "0~1", "고양이", true, None, true, "exact", None, 500, 200, None).unwrap();
+        let session = StudySession::new(deck.id.clone(), 1, &[entry.clone()], &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        source.save_session(&session).unwrap();
+        source.set_entry_analysis(&entry.id, Some("ねこ"), &serde_json::json!({"scope":"lexical","morae":["ね","こ"]}), "fixture", "fixture", "VERIFIED", Some("1"), Some(&[vec![1,0]]), "lexical", &[]).unwrap();
+
+        let payload = source.export_deck(&deck.id).unwrap();
+        let exported: Value = serde_json::from_str(&payload).unwrap();
+        let journal = exported["tables"]["sync_journal"].as_array().unwrap();
+        assert!(journal.iter().any(|row| row["entity_type"] == "attempt"));
+        assert!(journal.iter().any(|row| row["entity_type"] == "stage_state"));
+        assert!(journal.iter().any(|row| row["entity_type"] == "japanese_analysis"));
+        assert!(journal.iter().any(|row| row["entity_type"] == "pitch_pattern"));
+        let destination_dir = tempdir().unwrap();
+        let destination = Database::open(destination_dir.path().join("destination.db")).unwrap();
+        assert_eq!(destination.import_deck_export(&payload).unwrap(), deck.id);
+        assert_eq!(destination.entries(&deck.id).unwrap().len(), 1);
+        assert_eq!(destination.aliases(&entry.id).unwrap().0, vec!["냥이"]);
+        assert!(destination.load_session(&deck.id).unwrap().is_some());
+        assert_eq!(destination.stats(&deck.id).unwrap()[0].attempts, 1);
+        assert!(destination.pitch_question(&entry.id, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn recall_timeout_and_adaptive_timer_are_loaded_per_mode() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("timers", "ko-KR", "ja-JP").unwrap();
+        db.conn().unwrap().execute(
+            "UPDATE decks SET recall_timeout_by_mode=?1, adaptive_completion_timer_enabled=0 WHERE id=?2",
+            params![r#"{"recognition":2100,"listening":3200,"production":4300}"#, deck.id],
+        ).unwrap();
+        let loaded = db.deck(&deck.id).unwrap();
+        assert_eq!(loaded.recall_timeout_by_mode.for_mode(StudyMode::Recognition), 2_100);
+        assert_eq!(loaded.recall_timeout_by_mode.for_mode(StudyMode::Listening), 3_200);
+        assert_eq!(loaded.recall_timeout_by_mode.for_mode(StudyMode::Production), 4_300);
+        assert!(!loaded.adaptive_completion_timer_enabled);
+    }
+
+    #[test]
+    fn pitch_questions_use_mora_contours_and_confidence_gate_policy() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("pitch", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[
+            EntryDraft { term: "見据える".into(), meanings: vec!["내다보다".into()], reading: Some("みすえる".into()) },
+            EntryDraft { term: "予測".into(), meanings: vec!["예측".into()], reading: Some("よそく".into()) },
+            EntryDraft { term: "東京 大学".into(), meanings: vec!["도쿄 대학".into()], reading: Some("とうきょうだいがく".into()) },
+            EntryDraft { term: "不明".into(), meanings: vec!["불명".into()], reading: Some("ふめい".into()) },
+        ]).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let lexical = serde_json::json!({"scope":"lexical","morae":["み","す","え","る"]});
+        db.set_entry_analysis(
+            &entries[0].id, Some("みすえる"), &lexical, "fixture", "verified fixture", "CONSENSUS", None,
+            Some(&[vec![0,1,1,0], vec![0,1,1,1]]), "lexical", &[],
+        ).unwrap();
+        let question = db.pitch_question(&entries[0].id, false).unwrap().unwrap();
+        assert!(question.gate_enabled);
+        assert_eq!(question.allowed_patterns, vec![vec![0,1,1,0], vec![0,1,1,1]]);
+
+        let predicted = serde_json::json!({"scope":"lexical","morae":["よ","そ","く"]});
+        db.set_entry_analysis(
+            &entries[1].id, Some("よそく"), &predicted, "fixture", "prediction fixture", "PREDICTED", None,
+            Some(&[vec![0,1,0]]), "lexical", &[],
+        ).unwrap();
+        assert!(!db.pitch_question(&entries[1].id, false).unwrap().unwrap().gate_enabled);
+        assert!(db.pitch_question(&entries[1].id, true).unwrap().unwrap().gate_enabled);
+
+        let phrase = serde_json::json!({"scope":"phrase","morae":["と","う","きょ","う","だ","い","が","く"]});
+        db.set_entry_analysis(
+            &entries[2].id, Some("とうきょうだいがく"), &phrase, "fixture", "phrase prediction", "PREDICTED", None,
+            Some(&[vec![0,1,1,1,1,1,1,0]]), "phrase", &[],
+        ).unwrap();
+        assert!(db.pitch_question(&entries[2].id, true).unwrap().is_none());
+
+        let unavailable = serde_json::json!({"scope":"lexical","morae":["ふ","め","い"]});
+        db.set_entry_analysis(
+            &entries[3].id, Some("ふめい"), &unavailable, "fixture", "unavailable", "PREDICTED", None,
+            None, "lexical", &[],
+        ).unwrap();
+        assert!(db.pitch_question(&entries[3].id, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_numeric_pitch_rows_are_not_exposed_as_contours() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("legacy", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "見据える".into(), meanings: vec!["내다보다".into()], reading: Some("みすえる".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+        let analysis = serde_json::json!({"scope":"lexical","morae":["み","す","え","る"]});
+        db.set_entry_analysis(
+            &entry.id, Some("みすえる"), &analysis, "fixture", "legacy fixture", "VERIFIED", None,
+            Some(&[vec![3]]), "lexical", &[],
+        ).unwrap();
+        assert!(db.pitch_question(&entry.id, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn audio_assets_rotate_deterministically_across_voice_profiles() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("audio", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "社会".into(), meanings: vec!["사회".into()], reading: Some("しゃかい".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+        let analysis = serde_json::json!({"scope":"lexical","morae":["しゃ","か","い"]});
+        let assets = [
+            AudioAssetDraft { cache_key:"v1".into(), path:"child.wav".into(), provider:"voicevox".into(), voice_profile:"child_feminine".into(), age_band:"child".into(), gender_presentation:"feminine".into(), speaker_id:Some(1), speaker_name:Some("春歌ナナ".into()), accent_type:Some(1) },
+            AudioAssetDraft { cache_key:"v2".into(), path:"adolescent.wav".into(), provider:"voicevox".into(), voice_profile:"adolescent_masculine".into(), age_band:"adolescent".into(), gender_presentation:"masculine".into(), speaker_id:Some(2), speaker_name:Some("白上虎太郎".into()), accent_type:Some(1) },
+            AudioAssetDraft { cache_key:"v3".into(), path:"young-adult.wav".into(), provider:"voicevox".into(), voice_profile:"young_adult_feminine".into(), age_band:"young_adult".into(), gender_presentation:"feminine".into(), speaker_id:Some(3), speaker_name:Some("No.7".into()), accent_type:Some(1) },
+            AudioAssetDraft { cache_key:"v4".into(), path:"middle-aged.wav".into(), provider:"voicevox".into(), voice_profile:"middle_aged_masculine".into(), age_band:"middle_aged".into(), gender_presentation:"masculine".into(), speaker_id:Some(4), speaker_name:Some("麒ヶ島宗麟".into()), accent_type:Some(1) },
+            AudioAssetDraft { cache_key:"v5".into(), path:"senior.wav".into(), provider:"voicevox".into(), voice_profile:"senior_masculine".into(), age_band:"senior".into(), gender_presentation:"masculine".into(), speaker_id:Some(5), speaker_name:Some("ちび式じい".into()), accent_type:Some(1) },
+        ];
+        db.set_entry_analysis(&entry.id, Some("しゃかい"), &analysis, "fixture", "fixture", "CONSENSUS", None, Some(&[vec![1,0,0]]), "lexical", &assets).unwrap();
+        let sequence = (0..6).map(|_| db.next_audio_path(&entry.id).unwrap().unwrap()).collect::<Vec<_>>();
+        assert_eq!(sequence, vec!["child.wav", "adolescent.wav", "young-adult.wav", "middle-aged.wav", "senior.wav", "child.wav"]);
     }
 }

@@ -20,11 +20,13 @@ Results/sidecar/
 # Frontend/package caches and generated build output
 Results/npm-cache/
 Results/web-dist/
+Results/semantic/
 
 # Local toolchains
 Results/toolchains/
 
 # Local runtime data
+Runtime/
 Data/*.db
 Data/*.db-*
 Data/*.sqlite
@@ -41,4 +43,3 @@ Thumbs.db
 *.log
 *.tmp
 *.temp
-

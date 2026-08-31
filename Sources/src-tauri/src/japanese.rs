@@ -3,13 +3,17 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
 
-use crate::model::EntryRecord;
+use crate::{
+    model::{AudioAssetDraft, EntryRecord},
+    voicevox::VoicevoxRuntime,
+};
 
 const SIDECAR_SOURCE: &str = include_str!("../sidecar/japanese_sidecar.py");
 
@@ -21,11 +25,15 @@ pub struct JapaneseEnrichment {
     pub morae: Vec<String>,
     pub tokens: Vec<serde_json::Value>,
     pub pitch_patterns: Option<Vec<Vec<u8>>>,
+    pub accent_types: Option<Vec<usize>>,
+    pub downstep_after_mora: Option<Vec<Option<usize>>>,
     pub provider: String,
     pub source: String,
     pub confidence: String,
     pub model_version: Option<String>,
     pub audio_written: bool,
+    #[serde(default)]
+    pub audio_assets: Vec<AudioAssetDraft>,
 }
 
 impl JapaneseEnrichment {
@@ -36,36 +44,42 @@ impl JapaneseEnrichment {
             "scope": self.scope,
             "morae": self.morae,
             "tokens": self.tokens,
+            "accent_types": self.accent_types,
+            "downstep_after_mora": self.downstep_after_mora,
         })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JapaneseAnalyzer {
     app: AppHandle,
     script_path: PathBuf,
     audio_dir: PathBuf,
+    voicevox: Arc<VoicevoxRuntime>,
 }
 
 impl JapaneseAnalyzer {
-    pub fn install(app: AppHandle, app_data: &Path) -> Result<Self, String> {
+    pub fn install(app: AppHandle, app_data: &Path, audio_dir: PathBuf, voicevox: Arc<VoicevoxRuntime>) -> Result<Self, String> {
         let runtime_dir = app_data.join("runtime");
-        let audio_dir = app_data.join("audio");
         fs::create_dir_all(&runtime_dir).map_err(|e| e.to_string())?;
         fs::create_dir_all(&audio_dir).map_err(|e| e.to_string())?;
         let script_path = runtime_dir.join("japanese_sidecar.py");
         if fs::read_to_string(&script_path).ok().as_deref() != Some(SIDECAR_SOURCE) {
             fs::write(&script_path, SIDECAR_SOURCE).map_err(|e| e.to_string())?;
         }
-        Ok(Self { app, script_path, audio_dir })
+        Ok(Self { app, script_path, audio_dir, voicevox })
     }
 
-    pub fn analyze(&self, entry: &EntryRecord) -> Result<(JapaneseEnrichment, Option<(String, String)>), String> {
-        let audio_path = self.audio_dir.join(format!("{}.wav", entry.id));
+    pub fn audio_runtime_phase(&self) -> String { self.voicevox.phase() }
+
+    pub fn analyze(&self, entry: &EntryRecord) -> Result<(JapaneseEnrichment, Vec<AudioAssetDraft>), String> {
+        let audio_dir = self.audio_dir.join(&entry.id);
+        let voicevox_url = self.voicevox.endpoint()?;
         let request = serde_json::json!({
             "text": entry.term,
             "reading_hint": entry.reading,
-            "audio_path": audio_path,
+            "audio_dir": audio_dir,
+            "voicevox_url": voicevox_url,
         });
 
         let bundled = self.app.shell().sidecar("tanren-language")
@@ -80,10 +94,7 @@ impl JapaneseAnalyzer {
             }
             let enrichment: JapaneseEnrichment = serde_json::from_slice(&output.stdout)
                 .map_err(|e| format!("invalid bundled sidecar response: {e}; stdout={}", String::from_utf8_lossy(&output.stdout)))?;
-            let audio = if enrichment.audio_written && audio_path.exists() {
-                let key = format!("{}:{}:{}", entry.term, enrichment.reading.as_deref().unwrap_or(""), enrichment.provider);
-                Some((key, audio_path.to_string_lossy().to_string()))
-            } else { None };
+            let audio = enrichment.audio_assets.iter().filter(|asset| Path::new(&asset.path).exists()).cloned().collect();
             return Ok((enrichment, audio));
         }
 
@@ -101,10 +112,7 @@ impl JapaneseAnalyzer {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
         let enrichment: JapaneseEnrichment = serde_json::from_slice(&output.stdout).map_err(|e| format!("invalid sidecar response: {e}"))?;
-        let audio = if enrichment.audio_written && audio_path.exists() {
-            let key = format!("{}:{}:{}", entry.term, enrichment.reading.as_deref().unwrap_or(""), enrichment.provider);
-            Some((key, audio_path.to_string_lossy().to_string()))
-        } else { None };
+        let audio = enrichment.audio_assets.iter().filter(|asset| Path::new(&asset.path).exists()).cloned().collect();
         Ok((enrichment, audio))
     }
 }
@@ -112,7 +120,7 @@ impl JapaneseAnalyzer {
 pub fn split_morae(reading: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for c in reading.chars() {
-        if "ゃゅょぁぃぅぇぉャュョァィゥェォ".contains(c) {
+        if "ゃゅょぁぃぅぇぉゎャュョァィゥェォヮ".contains(c) {
             if let Some(last) = out.last_mut() { last.push(c); } else { out.push(c.to_string()); }
         } else if !c.is_whitespace() {
             out.push(c.to_string());
@@ -127,5 +135,10 @@ mod tests {
     #[test]
     fn mora_codec_keeps_small_kana_with_previous_mora() {
         assert_eq!(split_morae("きょう"), vec!["きょ", "う"]);
+        assert_eq!(split_morae("きゃく"), vec!["きゃ", "く"]);
+        assert_eq!(split_morae("がっこう"), vec!["が", "っ", "こ", "う"]);
+        assert_eq!(split_morae("しんぶん"), vec!["し", "ん", "ぶ", "ん"]);
+        assert_eq!(split_morae("スーパー"), vec!["ス", "ー", "パ", "ー"]);
+        assert_eq!(split_morae("コーヒー"), vec!["コ", "ー", "ヒ", "ー"]);
     }
 }
