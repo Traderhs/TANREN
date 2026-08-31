@@ -34,11 +34,17 @@ function Invoke-Sidecar {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $psi.StandardOutputEncoding = $utf8
+    $psi.StandardErrorEncoding = $utf8
     if (-not $AsArgument) {
         $psi.RedirectStandardInput = $true
     }
     if ($AsArgument) {
-        $psi.ArgumentList.Add($Payload)
+        # Windows PowerShell 5 / .NET Framework has no ProcessStartInfo.ArgumentList.
+        # These argument-mode smoke payloads contain no literal backslashes, so
+        # quoting JSON quotes is sufficient and mirrors the Tauri sidecar call.
+        $psi.Arguments = '"' + $Payload.Replace('"', '\"') + '"'
     }
 
     $process = [System.Diagnostics.Process]::new()
@@ -92,7 +98,7 @@ Write-Host "PASS 3/5 kana-only + UTF-8 BOM"
 $audioPath = Join-Path ([System.IO.Path]::GetTempPath()) ("tanren-sidecar-smoke-{0}.wav" -f [guid]::NewGuid().ToString("N"))
 try {
     $audioJson = @{ text = "かな"; audio_path = $audioPath } | ConvertTo-Json -Compress
-    $case4 = Assert-JsonSuccess "audio_path" (Invoke-Sidecar -AsArgument -Payload $audioJson)
+    $case4 = Assert-JsonSuccess "audio_path" (Invoke-Sidecar -Payload $audioJson)
     if (-not $case4.audio_written -or !(Test-Path $audioPath) -or (Get-Item $audioPath).Length -le 44) {
         throw "audio_path did not produce a valid WAV file"
     }
