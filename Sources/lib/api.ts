@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DeckStats, DeckSummary, EntryDraft, StudyCard, SubmitResult } from "./types";
+import type { DeckStats, DeckSummary, EntryDraft, ImportResult, SemanticRuntimeStatus, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
 
 export const api = {
   listDecks: () => invoke<DeckSummary[]>("list_decks"),
@@ -10,8 +10,13 @@ export const api = {
       targetLanguage: "ja-JP",
     }),
   importEntries: (deckId: string, entries: EntryDraft[]) =>
-    invoke<number>("import_entries", { deckId, entries }),
-  startStudy: (deckId: string) => invoke<StudyCard>("start_study", { deckId }),
+    invoke<ImportResult>("import_entries", { deckId, entries }),
+  startStudy: (deckId: string, stageIndex?: number) => invoke<SubmitResult>("start_study", { deckId, stageIndex }),
+  updateDeck: (deckId: string, name: string, enabledModes: StudyMode[]) =>
+    invoke<DeckSummary>("update_deck", { deckId, name, enabledModes }),
+  deleteDeck: (deckId: string) => invoke<void>("delete_deck", { deckId }),
+  exportDeck: (deckId: string) => invoke<string>("export_deck", { deckId }),
+  importDeckExport: (payload: string) => invoke<DeckSummary>("import_deck_export", { payload }),
   submitAnswer: (
     variantId: string,
     answer: string,
@@ -22,13 +27,20 @@ export const api = {
   ) => invoke<SubmitResult>("submit_answer", {
     variantId, answer, recallLatencyMs, typingDurationMs, interkeyGapsMs, imeCompositionMs,
   }),
-  timeoutCurrent: (kind: "recall" | "completion", answer: string, elapsedMs: number, typingDurationMs: number) =>
-    invoke<SubmitResult>("timeout_current", { kind, answer, elapsedMs, typingDurationMs }),
+  timeoutCurrent: (variantId: string, kind: "recall" | "completion", answer: string, elapsedMs: number, typingDurationMs: number) =>
+    invoke<SubmitResult>("timeout_current", { variantId, kind, answer, elapsedMs, typingDurationMs }),
   submitPitch: (variantId: string, patterns: number[]) =>
     invoke<SubmitResult>("submit_pitch", { variantId, patterns }),
   continueReview: () => invoke<SubmitResult>("continue_review"),
-  adjudicate: (variantId: string, answer: string, accept: boolean) =>
-    invoke<SubmitResult>("adjudicate_answer", { variantId, answer, accept }),
+  continueStage: () => invoke<SubmitResult>("continue_stage"),
+  adjudicate: (variantId: string, accept: boolean) =>
+    invoke<SubmitResult>("adjudicate_answer", { variantId, accept }),
   stats: (deckId: string) => invoke<DeckStats[]>("deck_stats", { deckId }),
+  semanticStatus: () => invoke<SemanticRuntimeStatus>("semantic_status"),
+  voicevoxStatus: () => invoke<VoicevoxRuntimeStatus>("voicevox_status"),
+  storageSettings: () => invoke<StorageSettings>("storage_settings"),
+  pickStorageDirectory: () => invoke<string | null>("pick_storage_directory"),
+  setStorageDirectory: (path: string | null) => invoke<StorageSettings>("set_storage_directory", { path }),
+  activateInputProfile: (language: string) => invoke<string | null>("activate_input_profile", { language }),
   exitStudy: () => invoke<void>("exit_study"),
 };
