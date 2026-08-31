@@ -9,6 +9,20 @@ export interface DeckSummary {
   entry_count: number;
   current_round: number;
   active_stage?: string | null;
+  study_ranges: StudyRange[];
+}
+
+export interface StudyRange {
+  stage_index: number;
+  label: string;
+  start: number;
+  end: number;
+  cumulative: boolean;
+}
+
+export interface ImportResult {
+  inserted: number;
+  duplicates: number;
 }
 
 export interface StudyCard {
@@ -23,6 +37,7 @@ export interface StudyCard {
   audio_path?: string | null;
   recall_timeout_ms: number;
   completion_idle_ms?: number | null;
+  input_warning?: string | null;
 }
 
 export interface PitchQuestion {
@@ -58,4 +73,30 @@ export interface EntryDraft {
   term: string;
   meanings: string[];
   reading?: string;
+}
+
+export interface SemanticRuntimeStatus {
+  phase: "starting" | "downloading" | "loading" | "ready" | "unavailable" | string;
+  model_id: string;
+  model_version: string;
+  dimension: number;
+  backend: string;
+  gpu_requested: boolean;
+  load_time_ms?: number | null;
+  last_embedding_ms?: number | null;
+  error?: string | null;
+}
+
+export interface VoicevoxRuntimeStatus {
+  phase: "starting" | "downloading" | "loading" | "ready" | "unavailable" | string;
+  engine_version: string;
+  backend: string;
+  error?: string | null;
+}
+
+export interface StorageSettings {
+  selected_path?: string | null;
+  active_path: string;
+  default_path: string;
+  restart_required: boolean;
 }

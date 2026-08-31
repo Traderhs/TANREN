@@ -4,15 +4,19 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "tauri dev",
+    "web:dev": "vite",
     "build": "tsc && vite build",
     "test": "vitest run",
+    "sidecar:build": "powershell -ExecutionPolicy Bypass -File tools/build_sidecar.ps1",
+    "sidecar:test": "powershell -ExecutionPolicy Bypass -File tools/test_sidecar.ps1",
     "tauri": "tauri",
     "desktop": "tauri dev",
-    "package": "tauri build"
+    "package": "npm run sidecar:build && tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
+    "motion": "^13.1.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
