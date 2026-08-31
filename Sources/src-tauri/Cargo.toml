@@ -1,0 +1,37 @@
+[package]
+name = "tanren"
+version = "0.1.0"
+description = "TANREN active-recall language trainer"
+authors = ["TANREN"]
+edition = "2024"
+
+[lib]
+name = "tanren_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.4.1", features = [] }
+
+[dependencies]
+tauri = { version = "2.8.5", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rusqlite = { version = "0.37", features = ["bundled"] }
+uuid = { version = "1.18", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+rand = "0.9"
+rand_chacha = "0.9"
+thiserror = "2.0"
+unicode-normalization = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Input_Ime",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3.21"

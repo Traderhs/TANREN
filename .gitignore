@@ -1,0 +1,44 @@
+# JavaScript / Vite
+Sources/node_modules/
+Sources/dist/
+
+# Rust / Tauri generated output
+Sources/src-tauri/target/
+Sources/src-tauri/gen/
+Results/cargo-target/
+
+# Python / PyInstaller generated output
+**/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+Results/python-sidecar-env/
+Results/pyinstaller-work/
+Results/pyinstaller-spec/
+Results/sidecar/
+
+# Frontend/package caches and generated build output
+Results/npm-cache/
+Results/web-dist/
+
+# Local toolchains
+Results/toolchains/
+
+# Local runtime data
+Data/*.db
+Data/*.db-*
+Data/*.sqlite
+Data/*.sqlite3
+Data/*.sqlite-*
+Data/*.sqlite3-*
+
+# IDE / OS / temporary files
+.idea/
+.vscode/
+.vs/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.temp
+
