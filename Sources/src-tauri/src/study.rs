@@ -4,7 +4,24 @@ use rand::{RngCore, SeedableRng, seq::SliceRandom};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{EntryRecord, StageKind, StudyMode, VariantKey};
+use crate::model::{EntryRecord, PitchQuestion, StageKind, StudyMode, StudyRange, SubmitResult, VariantKey};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PendingState {
+    Review { variant: VariantKey, result: SubmitResult },
+    StageTransition,
+    Ambiguous {
+        variant: VariantKey,
+        answer: String,
+        recall_latency_ms: u64,
+        typing_duration_ms: u64,
+        interkey_gaps_ms: Vec<u64>,
+        ime_composition_ms: u64,
+        method: String,
+        score: Option<f64>,
+    },
+    Pitch { variant: VariantKey, question: PitchQuestion },
+}
 
 pub fn generate_stage_sequence(deck_size: usize, increment: usize, checkpoint: usize) -> Vec<StageKind> {
     if deck_size == 0 || increment == 0 || checkpoint == 0 { return Vec::new(); }
@@ -32,6 +49,19 @@ pub fn variants_for_stage(entries: &[EntryRecord], modes: &[StudyMode], stage: &
         .iter()
         .flat_map(|entry| modes.iter().map(move |mode| VariantKey { entry_id: entry.id.clone(), mode: *mode }))
         .collect()
+}
+
+pub fn study_ranges(deck_size: usize, increment: usize, checkpoint: usize) -> Vec<StudyRange> {
+    generate_stage_sequence(deck_size, increment, checkpoint).into_iter().enumerate().map(|(stage_index, stage)| {
+        let (start, end) = stage.range();
+        StudyRange {
+            stage_index,
+            label: stage.label(),
+            start,
+            end,
+            cumulative: matches!(stage, StageKind::Cumulative { .. }),
+        }
+    }).collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,31 +138,51 @@ pub struct StudySession {
     pub queue: QueueState,
     pub current: Option<VariantKey>,
     pub stage_total: usize,
+    #[serde(default)]
+    pub pending: Option<PendingState>,
 }
 
 impl StudySession {
     pub fn new(deck_id: String, round: u32, entries: &[EntryRecord], modes: &[StudyMode], increment: usize, checkpoint: usize, seed: u64) -> Option<Self> {
+        Self::new_at_stage(deck_id, round, entries, modes, increment, checkpoint, 0, seed)
+    }
+
+    pub fn new_at_stage(deck_id: String, round: u32, entries: &[EntryRecord], modes: &[StudyMode], increment: usize, checkpoint: usize, stage_index: usize, seed: u64) -> Option<Self> {
         let stage_sequence = generate_stage_sequence(entries.len(), increment, checkpoint);
-        let stage = stage_sequence.first()?.clone();
+        let stage = stage_sequence.get(stage_index)?.clone();
         let variants = variants_for_stage(entries, modes, &stage);
         let total = variants.len();
         Some(Self {
             deck_id,
             round,
-            stage_index: 0,
+            stage_index,
             stage_sequence,
             queue: QueueState::new(variants, seed),
             current: None,
             stage_total: total,
+            pending: None,
         })
     }
 
     pub fn stage(&self) -> &StageKind { &self.stage_sequence[self.stage_index] }
 
     pub fn next_variant(&mut self, gap: usize) -> Option<VariantKey> {
+        if self.current.is_some() { return None; }
         let next = self.queue.pop_next(gap)?;
         self.current = Some(next.clone());
         Some(next)
+    }
+
+    pub fn resolve_current(&mut self, variant: &VariantKey, passed: bool) -> Result<(), String> {
+        if self.current.as_ref() != Some(variant) { return Err("variant is not the active card".into()); }
+        if passed { self.queue.mark_pass(variant); } else { self.queue.mark_fail(variant); }
+        self.current = None;
+        Ok(())
+    }
+
+    pub fn recover_interrupted_card(&mut self) {
+        if let Some(current) = self.current.take() { self.queue.mark_fail(&current); }
+        self.pending = None;
     }
 
     pub fn advance_stage(&mut self, entries: &[EntryRecord], modes: &[StudyMode], seed: u64) -> bool {
@@ -153,6 +203,7 @@ pub fn entry_map(entries: &[EntryRecord]) -> HashMap<String, EntryRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{PitchConfidence, SubmitStatus};
 
     fn labels(size: usize) -> Vec<String> {
         generate_stage_sequence(size, 50, 300).into_iter().map(|s| s.label()).collect()
@@ -174,6 +225,24 @@ mod tests {
         assert_eq!(labels(301).last().unwrap(), "0~301 · cumulative");
         assert_eq!(labels(601).last().unwrap(), "0~601 · cumulative");
         assert_eq!(labels(3042).last().unwrap(), "0~3042 · cumulative");
+    }
+
+    #[test]
+    fn selectable_ranges_match_cardbook_progression() {
+        let labels: Vec<_> = study_ranges(600, 50, 300).into_iter().map(|range| range.label).collect();
+        assert_eq!(labels, vec![
+            "0~50", "0~100", "0~150", "0~200", "0~250", "0~300",
+            "300~350", "300~400", "300~450", "300~500", "300~550", "300~600",
+            "0~600 · cumulative",
+        ]);
+    }
+
+    #[test]
+    fn session_can_start_from_an_explicit_range() {
+        let values = entries(600);
+        let session = StudySession::new_at_stage("deck".into(), 1, &values, &[StudyMode::Recognition], 50, 300, 7, 1).unwrap();
+        assert_eq!(session.stage().label(), "300~400");
+        assert_eq!(session.stage_total, 100);
     }
 
     #[test]
@@ -202,5 +271,132 @@ mod tests {
             if let Some(p) = &prev { assert_ne!(p, &v.entry_id); }
             prev = Some(v.entry_id);
         }
+    }
+
+    fn entries(count: usize) -> Vec<EntryRecord> {
+        (0..count).map(|i| EntryRecord {
+            id: format!("e{i}"), term: format!("term{i}"), meanings: vec![format!("meaning{i}")], reading: None,
+        }).collect()
+    }
+
+    #[test]
+    fn pass_review_then_exit_does_not_restore_variant() {
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let variant = session.next_variant(10).unwrap();
+        session.resolve_current(&variant, true).unwrap();
+        session.recover_interrupted_card();
+        assert!(session.current.is_none());
+        assert_eq!(session.queue.remaining_count(), 0);
+    }
+
+    #[test]
+    fn fail_review_then_exit_keeps_variant_required() {
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let variant = session.next_variant(10).unwrap();
+        session.resolve_current(&variant, false).unwrap();
+        session.recover_interrupted_card();
+        assert!(session.current.is_none());
+        assert_eq!(session.queue.remaining_count(), 1);
+        assert!(session.queue.queue.contains(&variant));
+    }
+
+    #[test]
+    fn unresolved_exit_and_restart_do_not_lose_variant() {
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let variant = session.next_variant(10).unwrap();
+        let persisted = serde_json::to_string(&session).unwrap();
+        let mut restarted: StudySession = serde_json::from_str(&persisted).unwrap();
+        restarted.recover_interrupted_card();
+        assert!(restarted.current.is_none());
+        assert_eq!(restarted.next_variant(10), Some(variant));
+    }
+
+    #[test]
+    fn stage_advance_does_not_consume_next_stage_card() {
+        let values = entries(51);
+        let mut session = StudySession::new("deck".into(), 1, &values, &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        while let Some(variant) = session.next_variant(10) {
+            session.resolve_current(&variant, true).unwrap();
+        }
+        assert!(session.advance_stage(&values, &[StudyMode::Recognition], 2));
+        assert!(session.current.is_none());
+        assert_eq!(session.queue.queue.len(), session.stage_total);
+        assert_eq!(session.queue.remaining_count(), session.stage_total);
+    }
+
+    #[test]
+    fn completed_round_has_no_active_card() {
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let variant = session.next_variant(10).unwrap();
+        session.resolve_current(&variant, true).unwrap();
+        assert!(session.current.is_none());
+        assert_eq!(session.queue.remaining_count(), 0);
+    }
+
+    #[test]
+    fn pitch_review_then_exit_preserves_the_pitch_outcome() {
+        for passed in [true, false] {
+            let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+            let variant = session.next_variant(10).unwrap();
+            session.resolve_current(&variant, passed).unwrap();
+            session.recover_interrupted_card();
+            assert!(session.current.is_none());
+            assert_eq!(session.queue.remaining_count(), usize::from(!passed), "passed={passed}");
+        }
+    }
+
+    #[test]
+    fn pitch_failure_reappears_from_the_base_question_not_pitch_pending_state() {
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let variant = session.next_variant(10).unwrap();
+        session.resolve_current(&variant, false).unwrap();
+        session.pending = Some(PendingState::Review {
+            variant: variant.clone(),
+            result: SubmitResult::simple(SubmitStatus::Review),
+        });
+
+        session.pending = None;
+        let repeated = session.next_variant(10).unwrap();
+        assert_eq!(repeated, variant);
+        assert!(session.pending.is_none());
+        assert_eq!(session.current, Some(variant));
+    }
+
+    #[test]
+    fn restart_roundtrips_each_non_terminal_pending_state() {
+        let mut active = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let variant = active.next_variant(10).unwrap();
+
+        active.pending = Some(PendingState::Ambiguous {
+            variant: variant.clone(), answer: "pending".into(), recall_latency_ms: 10,
+            typing_duration_ms: 20, interkey_gaps_ms: vec![5], ime_composition_ms: 0,
+            method: "semantic".into(), score: Some(0.5),
+        });
+        let resumed: StudySession = serde_json::from_str(&serde_json::to_string(&active).unwrap()).unwrap();
+        assert!(matches!(resumed.pending, Some(PendingState::Ambiguous { ref answer, .. }) if answer == "pending"));
+        assert_eq!(resumed.current, Some(variant.clone()));
+
+        active.pending = Some(PendingState::Pitch {
+            variant: variant.clone(),
+            question: PitchQuestion {
+                kind: "lexical".into(), reading: "よみ".into(), morae: vec!["よ".into(), "み".into()],
+                phrase_count: 1, allowed_patterns: vec![vec![1]], confidence: PitchConfidence::Verified,
+                gate_enabled: true,
+            },
+        });
+        let resumed: StudySession = serde_json::from_str(&serde_json::to_string(&active).unwrap()).unwrap();
+        assert!(matches!(resumed.pending, Some(PendingState::Pitch { .. })));
+        assert_eq!(resumed.current, Some(variant.clone()));
+
+        active.resolve_current(&variant, true).unwrap();
+        active.pending = Some(PendingState::Review { variant: variant.clone(), result: SubmitResult::simple(SubmitStatus::Review) });
+        let resumed: StudySession = serde_json::from_str(&serde_json::to_string(&active).unwrap()).unwrap();
+        assert!(matches!(resumed.pending, Some(PendingState::Review { .. })));
+        assert!(resumed.current.is_none());
+
+        active.pending = Some(PendingState::StageTransition);
+        let resumed: StudySession = serde_json::from_str(&serde_json::to_string(&active).unwrap()).unwrap();
+        assert!(matches!(resumed.pending, Some(PendingState::StageTransition)));
+        assert!(resumed.current.is_none());
     }
 }

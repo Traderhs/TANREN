@@ -25,6 +25,30 @@ impl StudyMode {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RecallTimeoutByMode {
+    pub recognition: u64,
+    pub listening: u64,
+    pub production: u64,
+}
+
+impl Default for RecallTimeoutByMode {
+    fn default() -> Self {
+        Self { recognition: 3_000, listening: 3_000, production: 3_000 }
+    }
+}
+
+impl RecallTimeoutByMode {
+    pub fn for_mode(&self, mode: StudyMode) -> u64 {
+        match mode {
+            StudyMode::Recognition => self.recognition,
+            StudyMode::Listening => self.listening,
+            StudyMode::Production => self.production,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeckSummary {
     pub id: String,
@@ -35,6 +59,16 @@ pub struct DeckSummary {
     pub entry_count: usize,
     pub current_round: u32,
     pub active_stage: Option<String>,
+    pub study_ranges: Vec<StudyRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StudyRange {
+    pub stage_index: usize,
+    pub label: String,
+    pub start: usize,
+    pub end: usize,
+    pub cumulative: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +80,8 @@ pub struct DeckRecord {
     pub enabled_modes: Vec<StudyMode>,
     pub increment_size: usize,
     pub checkpoint_size: usize,
-    pub recall_timeout_ms: u64,
+    pub recall_timeout_by_mode: RecallTimeoutByMode,
+    pub adaptive_completion_timer_enabled: bool,
     pub pitch_policy: String,
     pub strict_orthography: bool,
     pub current_round: u32,
@@ -59,12 +94,31 @@ pub struct EntryDraft {
     pub reading: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportResult {
+    pub inserted: usize,
+    pub duplicates: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct EntryRecord {
     pub id: String,
     pub term: String,
     pub meanings: Vec<String>,
     pub reading: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioAssetDraft {
+    pub cache_key: String,
+    pub path: String,
+    pub provider: String,
+    pub voice_profile: String,
+    pub age_band: String,
+    pub gender_presentation: String,
+    pub speaker_id: Option<i64>,
+    pub speaker_name: Option<String>,
+    pub accent_type: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -114,6 +168,7 @@ pub struct StudyCard {
     pub audio_path: Option<String>,
     pub recall_timeout_ms: u64,
     pub completion_idle_ms: Option<u64>,
+    pub input_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

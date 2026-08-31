@@ -2,58 +2,60 @@ mod db;
 mod grading;
 mod japanese;
 mod model;
+mod semantic;
+mod semantic_llama;
 mod study;
 mod timers;
+mod voicevox;
 mod windows_input;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::{path::{Path, PathBuf}, process::Command};
 
 use db::Database;
-use grading::grade;
+use grading::grade_form;
 use japanese::JapaneseAnalyzer;
 use model::{
-    DeckStats, DeckSummary, EntryDraft, EntryRecord, FailureType, GradeDecision, PitchQuestion,
+    DeckStats, DeckSummary, EntryDraft, EntryRecord, FailureType, GradeDecision, ImportResult,
     StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
 };
 use rand::random;
-use study::StudySession;
+use study::{PendingState, StudySession};
+use semantic::{SemanticGrader, SemanticRuntimeStatus, SemanticThresholds};
+use semantic_llama::LlamaCppEmbeddingBackend;
+use serde::Serialize;
 use tauri::{Manager, State};
+use voicevox::{VoicevoxRuntime, VoicevoxRuntimeStatus};
 use windows_input::WindowsInputAdapter;
-
-#[derive(Debug)]
-enum Pending {
-    Review,
-    Ambiguous {
-        variant: VariantKey,
-        answer: String,
-        recall_latency_ms: u64,
-        typing_duration_ms: u64,
-        interkey_gaps_ms: Vec<u64>,
-        ime_composition_ms: u64,
-        method: &'static str,
-        score: Option<f64>,
-    },
-    Pitch {
-        variant: VariantKey,
-        question: PitchQuestion,
-    },
-}
 
 #[derive(Default)]
 struct Engine {
     session: Option<StudySession>,
-    pending: Option<Pending>,
 }
 
 struct AppState {
     db: Database,
     analyzer: JapaneseAnalyzer,
+    semantic: Arc<SemanticGrader>,
+    voicevox: Arc<VoicevoxRuntime>,
+    semantic_home: PathBuf,
+    default_semantic_home: PathBuf,
     engine: Mutex<Engine>,
     input: Mutex<WindowsInputAdapter>,
     enrichment_running: Arc<AtomicBool>,
+}
+
+const SEMANTIC_STORAGE_SETTING: &str = "semantic_storage_dir";
+
+#[derive(Serialize)]
+struct StorageSettings {
+    selected_path: Option<String>,
+    active_path: String,
+    default_path: String,
+    restart_required: bool,
 }
 
 #[tauri::command]
@@ -73,19 +75,51 @@ fn create_deck(
 }
 
 #[tauri::command]
-fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<EntryDraft>) -> Result<usize, String> {
+fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<EntryDraft>) -> Result<ImportResult, String> {
     let deck = state.db.deck(&deck_id)?;
-    let count = state.db.import_entries(&deck_id, &deck.target_language, &entries)?;
+    let result = state.db.import_entries(&deck_id, &deck.target_language, &entries)?;
     start_enrichment_worker(
         state.db.clone(),
         state.analyzer.clone(),
         Arc::clone(&state.enrichment_running),
     );
-    Ok(count)
+    let candidates = state.db.entries(&deck_id)?.into_iter().flat_map(|entry| entry.meanings).collect();
+    start_semantic_precompute(Arc::clone(&state.semantic), candidates);
+    Ok(result)
+}
+
+fn deck_summary(db: &Database, deck_id: &str) -> Result<DeckSummary, String> {
+    db.list_decks()?.into_iter().find(|deck| deck.id == deck_id).ok_or_else(|| "deck not found".into())
 }
 
 #[tauri::command]
-fn start_study(state: State<'_, AppState>, deck_id: String) -> Result<StudyCard, String> {
+fn update_deck(state: State<'_, AppState>, deck_id: String, name: String, enabled_modes: Vec<StudyMode>) -> Result<DeckSummary, String> {
+    state.db.update_deck(&deck_id, &name, &enabled_modes)?;
+    deck_summary(&state.db, &deck_id)
+}
+
+#[tauri::command]
+fn delete_deck(state: State<'_, AppState>, deck_id: String) -> Result<(), String> {
+    if state.engine.lock().map_err(|_| "study engine lock poisoned")?.session.as_ref().is_some_and(|session| session.deck_id == deck_id) {
+        return Err("exit the active study session before deleting this deck".into());
+    }
+    state.db.delete_deck(&deck_id)
+}
+
+#[tauri::command]
+fn export_deck(state: State<'_, AppState>, deck_id: String) -> Result<String, String> {
+    state.db.export_deck(&deck_id)
+}
+
+#[tauri::command]
+fn import_deck_export(state: State<'_, AppState>, payload: String) -> Result<DeckSummary, String> {
+    let deck_id = state.db.import_deck_export(&payload)?;
+    start_enrichment_worker(state.db.clone(), state.analyzer.clone(), Arc::clone(&state.enrichment_running));
+    deck_summary(&state.db, &deck_id)
+}
+
+#[tauri::command]
+fn start_study(state: State<'_, AppState>, deck_id: String, stage_index: Option<usize>) -> Result<SubmitResult, String> {
     let deck = state.db.deck(&deck_id)?;
     let entries = state.db.entries(&deck_id)?;
     if entries.is_empty() { return Err("deck has no entries".into()); }
@@ -94,11 +128,13 @@ fn start_study(state: State<'_, AppState>, deck_id: String) -> Result<StudyCard,
     if engine.session.as_ref().is_some_and(|s| s.deck_id != deck_id) {
         return Err("another deck is already active; exit it first".into());
     }
-    if engine.session.is_none() {
-        let mut session = if let Some(mut persisted) = state.db.load_session(&deck_id)? {
-            if let Some(current) = persisted.current.take() {
-                persisted.queue.mark_fail(&current);
-            }
+    if let Some(stage_index) = stage_index {
+        engine.session = Some(StudySession::new_at_stage(
+            deck_id.clone(), deck.current_round, &entries, &deck.enabled_modes,
+            deck.increment_size, deck.checkpoint_size, stage_index, random(),
+        ).ok_or("selected study range is not available")?);
+    } else if engine.session.is_none() {
+        let session = if let Some(persisted) = state.db.load_session(&deck_id)? {
             persisted
         } else {
             StudySession::new(
@@ -106,14 +142,11 @@ fn start_study(state: State<'_, AppState>, deck_id: String) -> Result<StudyCard,
                 deck.increment_size, deck.checkpoint_size, random(),
             ).ok_or("could not create study session")?
         };
-        session.current = None;
-        state.db.save_session(&session)?;
         engine.session = Some(session);
-        engine.pending = None;
         let mut input = state.input.lock().map_err(|_| "input adapter lock poisoned")?;
         let _ = input.remember_current();
     }
-    next_card(&state, &mut engine, SubmitStatus::Pass)?.card.ok_or_else(|| "no card available".into())
+    resume_session(&state, &mut engine)
 }
 
 #[tauri::command]
@@ -128,8 +161,8 @@ fn submit_answer(
     ime_composition_ms: u64,
 ) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "study engine lock poisoned")?;
-    if engine.pending.is_some() { return Err("current card is awaiting review, pitch, or adjudication".into()); }
     let session = engine.session.as_mut().ok_or("no active study session")?;
+    if session.pending.is_some() { return Err("current card is awaiting review, pitch, or adjudication".into()); }
     let variant = session.current.clone().ok_or("no active card")?;
     if variant.id() != variant_id { return Err("stale study card submission".into()); }
     let deck = state.db.deck(&session.deck_id)?;
@@ -140,7 +173,7 @@ fn submit_answer(
     if answer_trimmed.is_empty() {
         return fail_base(&state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms, "manual_unknown", FailureType::ManualUnknown, None);
     }
-    if recall_latency_ms > deck.recall_timeout_ms {
+    if recall_latency_ms > deck.recall_timeout_by_mode.for_mode(variant.mode) {
         return fail_base(&state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms, "recall_timeout", FailureType::RecallTimeout, None);
     }
 
@@ -152,23 +185,27 @@ fn submit_answer(
     }
 
     let (accepted, rejected) = state.db.aliases(&entry.id)?;
-    let outcome = grade(variant.mode, &entry, &answer, &accepted, &rejected, deck.strict_orthography);
+    let outcome = match variant.mode {
+        StudyMode::Recognition => state.semantic.grade_recognition(&entry, &answer, &accepted, &rejected),
+        StudyMode::Listening | StudyMode::Production => grade_form(&entry, &answer, deck.strict_orthography),
+    };
     match outcome.decision {
         GradeDecision::Fail => fail_base(
             &state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms,
             outcome.method, FailureType::WrongAnswer, outcome.score,
         ),
         GradeDecision::Ambiguous => {
-            engine.pending = Some(Pending::Ambiguous {
+            session.pending = Some(PendingState::Ambiguous {
                 variant,
                 answer,
                 recall_latency_ms,
                 typing_duration_ms,
                 interkey_gaps_ms,
                 ime_composition_ms,
-                method: outcome.method,
+                method: outcome.method.into(),
                 score: outcome.score,
             });
+            state.db.save_session(session)?;
             Ok(SubmitResult {
                 status: SubmitStatus::Ambiguous,
                 message: Some("의미 판정이 애매해서 사용자 판정이 필요해.".into()),
@@ -180,24 +217,26 @@ fn submit_answer(
             })
         }
         GradeDecision::Pass => {
-            record_successful_typing(&state.db, &deck, &variant, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
+            record_successful_typing(&state.db, &deck, &variant, &answer, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
             let pitch = state.db.pitch_question(&entry.id, deck.pitch_policy == "include_predicted")?;
             state.db.insert_attempt(
                 &entry.id, &deck.id, variant.mode, session.round, &stage_label, &answer, true, None,
                 pitch.is_none(), outcome.method, outcome.score, recall_latency_ms, typing_duration_ms, None,
             )?;
             if let Some(question) = pitch {
-                engine.pending = Some(Pending::Pitch { variant, question: question.clone() });
+                session.pending = Some(PendingState::Pitch { variant, question: question.clone() });
+                state.db.save_session(session)?;
                 Ok(SubmitResult {
                     status: SubmitStatus::Pitch, message: None, failure_type: None,
                     canonical_answer: Some(entry.meanings.join(" / ")), reading: entry.reading,
                     pitch: Some(question), card: None,
                 })
             } else {
-                session.queue.mark_pass(&variant);
+                session.resolve_current(&variant, true)?;
+                let result = review_result(&entry, None, "정답");
+                session.pending = Some(PendingState::Review { variant, result: result.clone() });
                 state.db.save_session(session)?;
-                engine.pending = Some(Pending::Review);
-                Ok(review_result(&entry, None, "정답"))
+                Ok(result)
             }
         }
     }
@@ -206,15 +245,17 @@ fn submit_answer(
 #[tauri::command]
 fn timeout_current(
     state: State<'_, AppState>,
+    variant_id: String,
     kind: String,
     answer: String,
     elapsed_ms: u64,
     typing_duration_ms: u64,
 ) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "study engine lock poisoned")?;
-    if engine.pending.is_some() { return Err("current card already resolved".into()); }
     let session = engine.session.as_ref().ok_or("no active study session")?;
+    if session.pending.is_some() { return Err("current card already resolved".into()); }
     let variant = session.current.clone().ok_or("no active card")?;
+    validate_timeout_variant(&variant, &variant_id)?;
     let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
     let failure = match kind.as_str() {
         "recall" => FailureType::RecallTimeout,
@@ -226,81 +267,99 @@ fn timeout_current(
 }
 
 #[tauri::command]
-fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, answer: String, accept: bool) -> Result<SubmitResult, String> {
+fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: bool) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "study engine lock poisoned")?;
-    let pending = engine.pending.take().ok_or("no ambiguous grading is pending")?;
-    let Pending::Ambiguous { variant, answer: pending_answer, recall_latency_ms, typing_duration_ms, interkey_gaps_ms, ime_composition_ms, method, score } = pending else {
-        engine.pending = Some(pending);
-        return Err("current state is not ambiguous grading".into());
-    };
-    if variant.id() != variant_id || answer != pending_answer { return Err("stale adjudication".into()); }
     let session = engine.session.as_mut().ok_or("no active study session")?;
+    let pending = ambiguous_for_adjudication(&session.pending, &variant_id)?;
+    let PendingState::Ambiguous { variant, answer: pending_answer, recall_latency_ms, typing_duration_ms, interkey_gaps_ms, ime_composition_ms, method, score } = pending else {
+        unreachable!();
+    };
+    let answer = pending_answer;
     let deck = state.db.deck(&session.deck_id)?;
     let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
     state.db.set_alias(&entry.id, &answer, accept)?;
+    start_semantic_precompute(Arc::clone(&state.semantic), vec![answer.clone()]);
     if !accept {
-        return fail_base(&state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms, method, FailureType::GradingRejected, score);
+        return fail_base(&state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms, &method, FailureType::GradingRejected, score);
     }
 
-    record_successful_typing(&state.db, &deck, &variant, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
+    record_successful_typing(&state.db, &deck, &variant, &answer, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
     let pitch = state.db.pitch_question(&entry.id, deck.pitch_policy == "include_predicted")?;
     state.db.insert_attempt(
         &entry.id, &deck.id, variant.mode, session.round, &session.stage().label(), &answer, true, None,
         pitch.is_none(), "manual_adjudication_accept", score, recall_latency_ms, typing_duration_ms, None,
     )?;
     if let Some(question) = pitch {
-        engine.pending = Some(Pending::Pitch { variant, question: question.clone() });
+        session.pending = Some(PendingState::Pitch { variant, question: question.clone() });
+        state.db.save_session(session)?;
         Ok(SubmitResult { status: SubmitStatus::Pitch, message: None, failure_type: None, canonical_answer: Some(entry.meanings.join(" / ")), reading: entry.reading, pitch: Some(question), card: None })
     } else {
-        session.queue.mark_pass(&variant);
+        session.resolve_current(&variant, true)?;
+        let result = review_result(&entry, None, "정답으로 기억했어");
+        session.pending = Some(PendingState::Review { variant, result: result.clone() });
         state.db.save_session(session)?;
-        engine.pending = Some(Pending::Review);
-        Ok(review_result(&entry, None, "정답으로 기억했어"))
+        Ok(result)
+    }
+}
+
+fn ambiguous_for_adjudication(pending: &Option<PendingState>, variant_id: &str) -> Result<PendingState, String> {
+    let value = pending.clone().ok_or("no ambiguous grading is pending")?;
+    match &value {
+        PendingState::Ambiguous { variant, .. } if variant.id() == variant_id => Ok(value),
+        PendingState::Ambiguous { .. } => Err("stale adjudication".into()),
+        _ => Err("current state is not ambiguous grading".into()),
     }
 }
 
 #[tauri::command]
 fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8>) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "study engine lock poisoned")?;
-    let pending = engine.pending.take().ok_or("no pitch question is pending")?;
-    let Pending::Pitch { variant, question } = pending else {
-        engine.pending = Some(pending);
+    let session = engine.session.as_mut().ok_or("no active study session")?;
+    let pending = session.pending.clone().ok_or("no pitch question is pending")?;
+    let PendingState::Pitch { variant, question } = pending else {
         return Err("current state is not pitch grading".into());
     };
-    if variant.id() != variant_id { return Err("stale pitch submission".into()); }
-    let session = engine.session.as_mut().ok_or("no active study session")?;
+    if variant.id() != variant_id {
+        return Err("stale pitch submission".into());
+    }
     let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
-    let correct = question.allowed_patterns.iter().any(|p| p.as_slice() == patterns.as_slice());
-    let failed_gate = question.gate_enabled && !correct;
-    if failed_gate { session.queue.mark_fail(&variant); } else { session.queue.mark_pass(&variant); }
+    let (correct, failed_gate) = grade_pitch_contour(&question, &patterns);
+    session.resolve_current(&variant, !failed_gate)?;
     state.db.update_attempt_pitch(
         &session.deck_id, &entry.id, variant.mode, correct, !failed_gate,
         failed_gate.then_some(FailureType::PitchWrong.as_str()),
     )?;
-    state.db.save_session(session)?;
-    engine.pending = Some(Pending::Review);
-    Ok(review_result(
+    let result = review_result(
         &entry,
         failed_gate.then_some(FailureType::PitchWrong.as_str()),
         if correct { "Pitch 정답" } else if question.gate_enabled { "Pitch 오답 · 이 Variant는 다시 나와" } else { "Predicted pitch 참고값과 달라. Base PASS는 유지해" },
-    ))
+    );
+    session.pending = Some(PendingState::Review { variant, result: result.clone() });
+    state.db.save_session(session)?;
+    Ok(result)
+}
+
+fn grade_pitch_contour(question: &model::PitchQuestion, contour: &[u8]) -> (bool, bool) {
+    let correct = question.allowed_patterns.iter().any(|allowed| allowed.as_slice() == contour);
+    (correct, question.gate_enabled && !correct)
 }
 
 #[tauri::command]
 fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "study engine lock poisoned")?;
-    match engine.pending.take() {
-        Some(Pending::Review) => {}
-        Some(other) => { engine.pending = Some(other); return Err("review is not ready to continue".into()); }
+    let session = engine.session.as_mut().ok_or("no active study session")?;
+    match session.pending.take() {
+        Some(PendingState::Review { .. }) => {}
+        Some(other) => { session.pending = Some(other); return Err("review is not ready to continue".into()); }
         None => return Err("no review is active".into()),
     }
-    let session = engine.session.as_mut().ok_or("no active study session")?;
     if session.queue.remaining_count() == 0 {
         let deck = state.db.deck(&session.deck_id)?;
         let entries = state.db.entries(&session.deck_id)?;
         if session.advance_stage(&entries, &deck.enabled_modes, random()) {
+            session.pending = Some(PendingState::StageTransition);
             state.db.save_session(session)?;
-            return next_card(&state, &mut engine, SubmitStatus::StageClear);
+            return Ok(SubmitResult::simple(SubmitStatus::StageClear));
         }
         let deck_id = session.deck_id.clone();
         state.db.clear_session_and_advance_round(&deck_id)?;
@@ -312,21 +371,94 @@ fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
 }
 
 #[tauri::command]
+fn continue_stage(state: State<'_, AppState>) -> Result<SubmitResult, String> {
+    let mut engine = state.engine.lock().map_err(|_| "study engine lock poisoned")?;
+    let session = engine.session.as_mut().ok_or("no active study session")?;
+    match session.pending.take() {
+        Some(PendingState::StageTransition) => next_card(&state, &mut engine, SubmitStatus::Pass),
+        Some(other) => { session.pending = Some(other); Err("stage transition is not ready to continue".into()) }
+        None => Err("no stage transition is active".into()),
+    }
+}
+
+#[tauri::command]
 fn deck_stats(state: State<'_, AppState>, deck_id: String) -> Result<Vec<DeckStats>, String> {
     state.db.stats(&deck_id)
+}
+
+#[tauri::command]
+fn semantic_status(state: State<'_, AppState>) -> SemanticRuntimeStatus {
+    state.semantic.status()
+}
+
+#[tauri::command]
+fn voicevox_status(state: State<'_, AppState>) -> VoicevoxRuntimeStatus {
+    state.voicevox.status()
+}
+
+#[tauri::command]
+fn storage_settings(state: State<'_, AppState>) -> Result<StorageSettings, String> {
+    storage_settings_snapshot(&state)
+}
+
+#[tauri::command]
+fn pick_storage_directory() -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        let script = r#"[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); $shell = New-Object -ComObject Shell.Application; $folder = $shell.BrowseForFolder(0, 'TANREN semantic data folder', 0, 0); if ($folder) { $folder.Self.Path }"#;
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-STA", "-Command", script])
+            .output()
+            .map_err(|e| format!("folder picker could not start: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        let path = String::from_utf8(output.stdout).map_err(|e| format!("folder picker returned invalid UTF-8: {e}"))?;
+        let path = path.trim();
+        return Ok((!path.is_empty()).then(|| path.to_string()));
+    }
+    #[cfg(not(windows))]
+    {
+        Err("folder picker is currently supported on Windows only".into())
+    }
+}
+
+#[tauri::command]
+fn set_storage_directory(state: State<'_, AppState>, path: Option<String>) -> Result<StorageSettings, String> {
+    let selected = path.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    if let Some(value) = selected {
+        let candidate = Path::new(value);
+        if !candidate.is_absolute() { return Err("storage folder must be an absolute path".into()); }
+        std::fs::create_dir_all(candidate).map_err(|e| format!("storage folder is not writable: {e}"))?;
+    }
+    state.db.set_setting(SEMANTIC_STORAGE_SETTING, selected)?;
+    storage_settings_snapshot(&state)
 }
 
 #[tauri::command]
 fn exit_study(state: State<'_, AppState>) -> Result<(), String> {
     let mut engine = state.engine.lock().map_err(|_| "study engine lock poisoned")?;
     if let Some(session) = engine.session.as_mut() {
-        if let Some(current) = session.current.take() { session.queue.mark_fail(&current); }
+        session.recover_interrupted_card();
         state.db.save_session(session)?;
     }
     engine.session = None;
-    engine.pending = None;
     state.input.lock().map_err(|_| "input adapter lock poisoned")?.restore()?;
     Ok(())
+}
+
+#[tauri::command]
+fn activate_input_profile(window: tauri::WebviewWindow, state: State<'_, AppState>, language: String) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        let hwnd = window.hwnd().map_err(|e| format!("could not resolve TANREN window: {e}"))?;
+        return state.input.lock().map_err(|_| "input adapter lock poisoned")?.activate_for_language(&language, hwnd);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        state.input.lock().map_err(|_| "input adapter lock poisoned")?.activate_for_language(&language, ())
+    }
 }
 
 fn fail_base(
@@ -347,10 +479,11 @@ fn fail_base(
         &entry.id, &session.deck_id, variant.mode, session.round, &stage, &answer,
         false, None, false, grading_method, score, recall_latency_ms, typing_duration_ms, Some(failure.as_str()),
     )?;
-    session.queue.mark_fail(&variant);
+    session.resolve_current(&variant, false)?;
+    let result = review_result(entry, Some(failure.as_str()), "오답 · 정답을 확인하고 Enter");
+    session.pending = Some(PendingState::Review { variant, result: result.clone() });
     db.save_session(session)?;
-    engine.pending = Some(Pending::Review);
-    Ok(review_result(entry, Some(failure.as_str()), "오답 · 정답을 확인하고 Enter"))
+    Ok(result)
 }
 
 fn review_result(entry: &EntryRecord, failure: Option<&str>, message: &str) -> SubmitResult {
@@ -367,9 +500,17 @@ fn review_result(entry: &EntryRecord, failure: Option<&str>, message: &str) -> S
 
 fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Result<SubmitResult, String> {
     let session = engine.session.as_mut().ok_or("no active study session")?;
+    if session.current.is_some() { return Err("an unresolved active card already exists".into()); }
+    let variant = session.next_variant(10).ok_or("stage queue is empty")?;
+    session.pending = None;
+    let card = build_card(state, session, &variant)?;
+    state.db.save_session(session)?;
+    Ok(SubmitResult { status, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, card: Some(card) })
+}
+
+fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) -> Result<StudyCard, String> {
     let deck = state.db.deck(&session.deck_id)?;
     let entries = state.db.entries(&session.deck_id)?;
-    let variant = session.next_variant(10).ok_or("stage queue is empty")?;
     let entry = entries.iter().find(|e| e.id == variant.entry_id).ok_or("entry not found")?;
     let question = match variant.mode {
         StudyMode::Recognition => entry.term.clone(),
@@ -377,13 +518,12 @@ fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Res
         StudyMode::Production => entry.meanings.join(" / "),
     };
     let answer_language = variant.mode.answer_language(&deck.source_language, &deck.target_language).to_string();
-    if let Ok(mut input) = state.input.lock() {
-        if let Err(error) = input.activate_for_language(&answer_language) {
-            eprintln!("TANREN input-profile warning: {error}");
-        }
-    }
     let profile = state.db.typing_profile(&deck.id, &answer_language, variant.mode)?;
-    let card = StudyCard {
+    let audio_path = state.db.next_audio_path(&entry.id)?;
+    if matches!(variant.mode, StudyMode::Listening) && audio_path.is_none() {
+        return Err("VOICEVOX audio is not ready for this entry yet".into());
+    }
+    Ok(StudyCard {
         entry_id: entry.id.clone(),
         variant_id: variant.id(),
         mode: variant.mode,
@@ -392,30 +532,85 @@ fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Res
         remaining: session.queue.remaining_count(),
         total: session.stage_total,
         stage_label: session.stage().label(),
-        audio_path: state.db.audio_path(&entry.id)?,
-        recall_timeout_ms: deck.recall_timeout_ms,
-        completion_idle_ms: profile.allowed_idle_ms(),
-    };
-    state.db.save_session(session)?;
-    engine.pending = None;
-    Ok(SubmitResult { status, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, card: Some(card) })
+        audio_path,
+        recall_timeout_ms: deck.recall_timeout_by_mode.for_mode(variant.mode),
+        completion_idle_ms: deck.adaptive_completion_timer_enabled.then(|| profile.allowed_idle_ms()).flatten(),
+        input_warning: None,
+    })
+}
+
+fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult, String> {
+    let session = engine.session.as_mut().ok_or("no active study session")?;
+    match session.pending.clone() {
+        Some(PendingState::StageTransition) => Ok(SubmitResult::simple(SubmitStatus::StageClear)),
+        Some(PendingState::Ambiguous { variant, .. }) => {
+            let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
+            let card = build_card(state, session, &variant)?;
+            Ok(SubmitResult {
+                status: SubmitStatus::Ambiguous,
+                message: Some("의미 판정이 애매해서 사용자 판정이 필요해.".into()),
+                failure_type: None,
+                canonical_answer: Some(entry.meanings.join(" / ")),
+                reading: entry.reading,
+                pitch: None,
+                card: Some(card),
+            })
+        }
+        Some(PendingState::Pitch { variant, question }) => {
+            let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
+            let card = build_card(state, session, &variant)?;
+            Ok(SubmitResult {
+                status: SubmitStatus::Pitch,
+                message: None,
+                failure_type: None,
+                canonical_answer: Some(entry.meanings.join(" / ")),
+                reading: entry.reading,
+                pitch: Some(question),
+                card: Some(card),
+            })
+        }
+        Some(PendingState::Review { variant, mut result }) => {
+            result.card = Some(build_card(state, session, &variant)?);
+            Ok(result)
+        }
+        None => {
+            if let Some(variant) = session.current.clone() {
+                let card = build_card(state, session, &variant)?;
+                Ok(SubmitResult { status: SubmitStatus::Pass, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, card: Some(card) })
+            } else {
+                next_card(state, engine, SubmitStatus::Pass)
+            }
+        }
+    }
 }
 
 fn find_entry(db: &Database, deck_id: &str, entry_id: &str) -> Result<EntryRecord, String> {
     db.entries(deck_id)?.into_iter().find(|e| e.id == entry_id).ok_or_else(|| "entry not found".into())
 }
 
-fn record_successful_typing(db: &Database, deck: &model::DeckRecord, variant: &VariantKey, gaps: &[u64], duration_ms: u64, ime_ms: u64) -> Result<(), String> {
+fn record_successful_typing(db: &Database, deck: &model::DeckRecord, variant: &VariantKey, answer: &str, gaps: &[u64], duration_ms: u64, ime_ms: u64) -> Result<(), String> {
     let language = variant.mode.answer_language(&deck.source_language, &deck.target_language);
     let mut profile = db.typing_profile(&deck.id, language, variant.mode)?;
-    profile.observe(gaps, duration_ms, ime_ms);
+    profile.observe(gaps, duration_ms, ime_ms, answer.chars().filter(|c| !c.is_whitespace()).count());
     db.update_typing_profile(&deck.id, language, variant.mode, &profile)
+}
+
+fn validate_timeout_variant(current: &VariantKey, variant_id: &str) -> Result<(), String> {
+    if current.id() == variant_id { Ok(()) } else { Err("stale study card timeout".into()) }
 }
 
 fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Arc<AtomicBool>) {
     if running.swap(true, Ordering::AcqRel) { return; }
     tauri::async_runtime::spawn_blocking(move || {
         loop {
+            match analyzer.audio_runtime_phase().as_str() {
+                "ready" => {}
+                "unavailable" => break,
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+            }
             let jobs = match db.queued_enrichment(24) {
                 Ok(jobs) => jobs,
                 Err(error) => { eprintln!("TANREN enrichment queue error: {error}"); break; }
@@ -424,7 +619,6 @@ fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Ar
             for entry in jobs {
                 match analyzer.analyze(&entry) {
                     Ok((analysis, audio)) => {
-                        let audio_ref = audio.as_ref().map(|(k,p)|(k.as_str(),p.as_str()));
                         if let Err(error) = db.set_entry_analysis(
                             &entry.id,
                             analysis.reading.as_deref(),
@@ -435,7 +629,7 @@ fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Ar
                             analysis.model_version.as_deref(),
                             analysis.pitch_patterns.as_deref(),
                             &analysis.scope,
-                            audio_ref,
+                            &audio,
                         ) {
                             let _ = db.fail_enrichment(&entry.id, &error);
                         }
@@ -448,37 +642,176 @@ fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Ar
     });
 }
 
+fn start_semantic_precompute(semantic: Arc<SemanticGrader>, candidates: Vec<String>) {
+    tauri::async_runtime::spawn_blocking(move || {
+        for _ in 0..600 {
+            if semantic.status().phase == "ready" {
+                let _ = semantic.precompute_documents(&candidates);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
+}
+
+fn configured_semantic_home(db: &Database, app_data: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = db.setting(SEMANTIC_STORAGE_SETTING)?.filter(|value| !value.trim().is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(std::env::var_os("TANREN_SEMANTIC_HOME").map(PathBuf::from).unwrap_or_else(|| app_data.join("semantic")))
+}
+
+fn storage_settings_snapshot(state: &AppState) -> Result<StorageSettings, String> {
+    let selected = state.db.setting(SEMANTIC_STORAGE_SETTING)?.filter(|value| !value.trim().is_empty());
+    let requested = selected.as_ref().map(PathBuf::from)
+        .or_else(|| std::env::var_os("TANREN_SEMANTIC_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| state.default_semantic_home.clone());
+    Ok(StorageSettings {
+        selected_path: selected,
+        active_path: state.semantic_home.to_string_lossy().to_string(),
+        default_path: state.default_semantic_home.to_string_lossy().to_string(),
+        restart_required: requested != state.semantic_home,
+    })
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed) {
+                if let Some(state) = window.try_state::<AppState>() {
+                    if let Ok(mut input) = state.input.lock() {
+                        let _ = input.restore();
+                    }
+                }
+            }
+        })
         .setup(|app| {
-            let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+            let app_data = std::env::var_os("TANREN_APP_DATA_HOME").map(PathBuf::from)
+                .unwrap_or(app.path().app_data_dir().map_err(|e| e.to_string())?);
             let db = Database::open(app_data.join("tanren.db"))?;
-            let analyzer = JapaneseAnalyzer::install(app.handle().clone(), &app_data)?;
+            let default_semantic_home = app_data.join("semantic");
+            let semantic_home = configured_semantic_home(&db, &app_data)?;
+            let voicevox = VoicevoxRuntime::install(semantic_home.join("voicevox"));
+            let analyzer = JapaneseAnalyzer::install(app.handle().clone(), &app_data, app_data.join("audio"), Arc::clone(&voicevox))?;
+            let semantic_backend = LlamaCppEmbeddingBackend::install(semantic_home.clone());
+            let semantic = Arc::new(SemanticGrader::new(semantic_backend, db.clone(), SemanticThresholds::configured()));
             let enrichment_running = Arc::new(AtomicBool::new(false));
             app.manage(AppState {
                 db: db.clone(),
                 analyzer: analyzer.clone(),
+                semantic: Arc::clone(&semantic),
+                voicevox,
+                semantic_home,
+                default_semantic_home,
                 engine: Mutex::new(Engine::default()),
                 input: Mutex::new(WindowsInputAdapter::default()),
                 enrichment_running: Arc::clone(&enrichment_running),
             });
             start_enrichment_worker(db, analyzer, enrichment_running);
+            if let Ok(candidates) = app.state::<AppState>().db.semantic_candidates() {
+                start_semantic_precompute(semantic, candidates);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_decks,
             create_deck,
             import_entries,
+            update_deck,
+            delete_deck,
+            export_deck,
+            import_deck_export,
             start_study,
             submit_answer,
             timeout_current,
             adjudicate_answer,
             submit_pitch,
             continue_review,
+            continue_stage,
             deck_stats,
+            semantic_status,
+            voicevox_status,
+            storage_settings,
+            pick_storage_directory,
+            set_storage_directory,
+            activate_input_profile,
             exit_study,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TANREN");
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    fn ambiguous(answer: &str) -> PendingState {
+        PendingState::Ambiguous {
+            variant: VariantKey { entry_id: "entry".into(), mode: StudyMode::Recognition },
+            answer: answer.into(),
+            recall_latency_ms: 100,
+            typing_duration_ms: 200,
+            interkey_gaps_ms: vec![50],
+            ime_composition_ms: 0,
+            method: "semantic".into(),
+            score: Some(0.5),
+        }
+    }
+
+    #[test]
+    fn ambiguous_accept_and_reject_use_backend_pending_answer() {
+        for accept in [true, false] {
+            let pending = Some(ambiguous("실제 제출 답"));
+            let taken = ambiguous_for_adjudication(&pending, "entry:recognition").unwrap();
+            let PendingState::Ambiguous { answer, .. } = taken else { unreachable!() };
+            assert_eq!(answer, "실제 제출 답", "accept={accept}");
+            assert!(matches!(pending, Some(PendingState::Ambiguous { .. })));
+        }
+    }
+
+    #[test]
+    fn stale_adjudication_does_not_discard_pending_answer() {
+        let pending = Some(ambiguous("보존할 답"));
+        assert_eq!(ambiguous_for_adjudication(&pending, "other:recognition").unwrap_err(), "stale adjudication");
+        assert!(matches!(pending, Some(PendingState::Ambiguous { ref answer, .. }) if answer == "보존할 답"));
+    }
+
+    #[test]
+    fn stale_timeout_cannot_resolve_the_next_variant() {
+        let current = VariantKey { entry_id: "next".into(), mode: StudyMode::Listening };
+        assert_eq!(validate_timeout_variant(&current, "previous:listening").unwrap_err(), "stale study card timeout");
+        assert!(validate_timeout_variant(&current, "next:listening").is_ok());
+    }
+
+    #[test]
+    fn pitch_grading_is_exact_and_accepts_any_allowed_contour() {
+        let question = model::PitchQuestion {
+            kind: "lexical".into(),
+            reading: "みすえる".into(),
+            morae: vec!["み".into(), "す".into(), "え".into(), "る".into()],
+            phrase_count: 1,
+            allowed_patterns: vec![vec![0, 1, 1, 0], vec![0, 1, 1, 1]],
+            confidence: model::PitchConfidence::Verified,
+            gate_enabled: true,
+        };
+        assert_eq!(grade_pitch_contour(&question, &[0, 1, 1, 0]), (true, false));
+        assert_eq!(grade_pitch_contour(&question, &[0, 1, 1, 1]), (true, false));
+        assert_eq!(grade_pitch_contour(&question, &[0, 1, 0, 0]), (false, true));
+        assert_eq!(grade_pitch_contour(&question, &[0, 1, 1]), (false, true));
+    }
+
+    #[test]
+    fn predicted_reference_only_pitch_cannot_fail_the_base_answer() {
+        let question = model::PitchQuestion {
+            kind: "lexical".into(),
+            reading: "よそく".into(),
+            morae: vec!["よ".into(), "そ".into(), "く".into()],
+            phrase_count: 1,
+            allowed_patterns: vec![vec![0, 1, 0]],
+            confidence: model::PitchConfidence::Predicted,
+            gate_enabled: false,
+        };
+        assert_eq!(grade_pitch_contour(&question, &[1, 0, 0]), (false, false));
+    }
 }

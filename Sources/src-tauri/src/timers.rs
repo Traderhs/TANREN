@@ -6,27 +6,41 @@ pub struct TypingProfileState {
     pub interkey_gaps_ms: Vec<f64>,
     pub completion_durations_ms: Vec<f64>,
     pub ime_conversion_latencies_ms: Vec<f64>,
+    #[serde(default)]
+    pub chars_per_second_samples: Vec<f64>,
 }
 
 impl TypingProfileState {
     const WINDOW: usize = 400;
+    const MAX_VALID_INTERKEY_GAP_MS: u64 = 3_000;
+    const MAX_VALID_COMPLETION_MS: u64 = 60_000;
+    const MAX_VALID_IME_MS: u64 = 30_000;
 
-    pub fn observe(&mut self, gaps: &[u64], completion_ms: u64, ime_ms: u64) {
-        if completion_ms == 0 || gaps.iter().any(|&g| g > 8_000) {
+    pub fn observe(&mut self, gaps: &[u64], completion_ms: u64, ime_ms: u64, answer_chars: usize) {
+        if gaps.is_empty()
+            || answer_chars == 0
+            || completion_ms == 0
+            || completion_ms > Self::MAX_VALID_COMPLETION_MS
+            || ime_ms > Self::MAX_VALID_IME_MS
+            || gaps.iter().any(|&g| g > Self::MAX_VALID_INTERKEY_GAP_MS)
+        {
             return;
         }
         self.sample_count += 1;
         self.interkey_gaps_ms.extend(gaps.iter().copied().map(|v| v as f64));
         self.completion_durations_ms.push(completion_ms as f64);
         if ime_ms > 0 { self.ime_conversion_latencies_ms.push(ime_ms as f64); }
+        self.chars_per_second_samples.push(answer_chars as f64 * 1_000.0 / completion_ms as f64);
         trim(&mut self.interkey_gaps_ms, Self::WINDOW * 8);
         trim(&mut self.completion_durations_ms, Self::WINDOW);
         trim(&mut self.ime_conversion_latencies_ms, Self::WINDOW);
+        trim(&mut self.chars_per_second_samples, Self::WINDOW);
     }
 
     pub fn median_gap(&self) -> Option<f64> { percentile(&self.interkey_gaps_ms, 0.50) }
     pub fn p90_gap(&self) -> Option<f64> { percentile(&self.interkey_gaps_ms, 0.90) }
     pub fn p95_gap(&self) -> Option<f64> { percentile(&self.interkey_gaps_ms, 0.95) }
+    pub fn median_chars_per_second(&self) -> Option<f64> { percentile(&self.chars_per_second_samples, 0.50) }
 
     pub fn allowed_idle_ms(&self) -> Option<u64> {
         match self.sample_count {
@@ -60,16 +74,16 @@ mod tests {
     #[test]
     fn warmup_keeps_completion_timer_off() {
         let mut profile = TypingProfileState::default();
-        for _ in 0..99 { profile.observe(&[180, 220], 900, 0); }
+        for _ in 0..99 { profile.observe(&[180, 220], 900, 0, 4); }
         assert_eq!(profile.allowed_idle_ms(), None);
-        profile.observe(&[180, 220], 900, 0);
+        profile.observe(&[180, 220], 900, 0, 4);
         assert!(profile.allowed_idle_ms().unwrap() > 2_000);
     }
 
     #[test]
     fn mature_profile_detects_thinking_pause() {
         let mut profile = TypingProfileState::default();
-        for _ in 0..320 { profile.observe(&[160, 220, 240, 190], 900, 0); }
+        for _ in 0..320 { profile.observe(&[160, 220, 240, 190], 900, 0, 4); }
         assert!(!profile.completion_timed_out(600));
         assert!(profile.completion_timed_out(5_500));
     }
@@ -77,7 +91,22 @@ mod tests {
     #[test]
     fn timeout_samples_do_not_contaminate_profile() {
         let mut profile = TypingProfileState::default();
-        profile.observe(&[200, 9_000], 10_000, 0);
+        profile.observe(&[200, 5_500], 10_000, 0, 4);
+        assert_eq!(profile.sample_count, 0);
+    }
+
+    #[test]
+    fn successful_samples_calculate_chars_per_second() {
+        let mut profile = TypingProfileState::default();
+        profile.observe(&[200, 200, 200], 2_000, 0, 4);
+        assert_eq!(profile.median_chars_per_second(), Some(2.0));
+    }
+
+    #[test]
+    fn abnormal_ime_and_missing_activity_do_not_count_as_samples() {
+        let mut profile = TypingProfileState::default();
+        profile.observe(&[], 1_000, 0, 1);
+        profile.observe(&[200], 31_000, 31_000, 2);
         assert_eq!(profile.sample_count, 0);
     }
 }

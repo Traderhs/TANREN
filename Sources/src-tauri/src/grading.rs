@@ -50,35 +50,31 @@ pub fn grade_recognition(
     accepted: &[String],
     rejected: &[String],
 ) -> GradeOutcome {
+    grade_recognition_deterministic(entry, answer, accepted, rejected).unwrap_or(GradeOutcome {
+        decision: GradeDecision::Ambiguous,
+        method: "semantic_unavailable",
+        score: None,
+    })
+}
+
+pub fn grade_recognition_deterministic(
+    entry: &EntryRecord,
+    answer: &str,
+    accepted: &[String],
+    rejected: &[String],
+) -> Option<GradeOutcome> {
     let norm = normalize_generic(answer);
     let canonical: HashSet<_> = entry.meanings.iter().map(|v| normalize_generic(v)).collect();
     if canonical.contains(&norm) {
-        return GradeOutcome { decision: GradeDecision::Pass, method: "exact_meaning", score: Some(1.0) };
+        return Some(GradeOutcome { decision: GradeDecision::Pass, method: "exact_meaning", score: Some(1.0) });
     }
     if accepted.iter().any(|v| normalize_generic(v) == norm) {
-        return GradeOutcome { decision: GradeDecision::Pass, method: "accepted_alias", score: Some(1.0) };
+        return Some(GradeOutcome { decision: GradeDecision::Pass, method: "accepted_alias", score: Some(1.0) });
     }
     if rejected.iter().any(|v| normalize_generic(v) == norm) {
-        return GradeOutcome { decision: GradeDecision::Fail, method: "rejected_alias", score: Some(0.0) };
+        return Some(GradeOutcome { decision: GradeDecision::Fail, method: "rejected_alias", score: Some(0.0) });
     }
-
-    // Deterministic lexical-overlap candidate path. It intentionally never auto-passes;
-    // ambiguous cases converge into the user's accepted/rejected alias dictionary.
-    let answer_tokens: HashSet<_> = norm.split_whitespace().collect();
-    let mut best: f64 = 0.0;
-    for meaning in &entry.meanings {
-        let normalized = normalize_generic(meaning);
-        let tokens: HashSet<_> = normalized.split_whitespace().collect();
-        if tokens.is_empty() || answer_tokens.is_empty() { continue; }
-        let inter = tokens.intersection(&answer_tokens).count() as f64;
-        let union = tokens.union(&answer_tokens).count() as f64;
-        best = best.max(inter / union);
-    }
-    if best > 0.0 {
-        GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_candidate", score: Some(best) }
-    } else {
-        GradeOutcome { decision: GradeDecision::Fail, method: "meaning_mismatch", score: Some(0.0) }
-    }
+    None
 }
 
 pub fn grade(mode: StudyMode, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String], strict_orthography: bool) -> GradeOutcome {
