@@ -53,6 +53,6 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($TargetTriple)) {
 
 $TauriSidecar = Join-Path $Output "tanren-language-$TargetTriple.exe"
 Copy-Item $Built $TauriSidecar -Force
+Remove-Item $Built -Force
 
-Write-Host "Built: $Built"
 Write-Host "Tauri sidecar: $TauriSidecar"
