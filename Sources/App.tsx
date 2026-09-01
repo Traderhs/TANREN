@@ -1,12 +1,14 @@
-import { FormEvent, KeyboardEvent, forwardRef, useEffect, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, forwardRef, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import HTMLFlipBook from "react-pageflip";
 import { Canvas } from "@react-three/fiber";
 import { ContactShadows, RoundedBox } from "@react-three/drei";
+import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api } from "./lib/api";
 import { parseEntryText } from "./lib/importParser";
-import type { DeckStats, DeckSummary, PitchQuestion, SemanticRuntimeStatus, StorageSettings, StudyCard, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./lib/types";
+import type { DeckStats, DeckSummary, LibraryStats, PitchQuestion, SemanticRuntimeStatus, StorageSettings, StudyCard, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./lib/types";
 import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, setPitchLevel, shouldAutoPlayAfterWrittenAnswer, type PitchLevel, type PitchSelection } from "./lib/studyFlow";
 import { completionDelayMs, firstMeaningfulInputAt, isMeaningfulInput, recallHasTimedOut } from "./lib/studyTimers";
 
@@ -15,6 +17,26 @@ type View = "decks" | "editor" | "study" | "stats" | "settings";
 const BOOK_FLUTTER_LEAF_COUNT = 8;
 const BOOK_CONTENT_PAGE = BOOK_FLUTTER_LEAF_COUNT + 1;
 const MAX_DECK_NAME_LENGTH = 20;
+const STUDY_MODE_LABELS: Record<StudyMode, string> = {
+  reading: "Reading",
+  listening: "Listening",
+  writing: "Writing",
+};
+const VIEW_LABELS: Record<Exclude<View, "decks" | "study">, string> = {
+  editor: "책 편집",
+  stats: "통계",
+  settings: "설정",
+};
+
+function runtimePhaseLabel(phase: string) {
+  switch (phase) {
+    case "starting": return "준비 중이에요";
+    case "downloading": return "필요한 파일을 받고 있어요";
+    case "loading": return "불러오고 있어요";
+    case "ready": return "사용할 수 있어요";
+    default: return "지금은 사용할 수 없어요";
+  }
+}
 
 function OpenBook3D() {
   return <div className="book-3d book-3d-open" aria-hidden="true">
@@ -63,7 +85,7 @@ function App() {
   const [card, setCard] = useState<StudyCard | null>(null);
   const [result, setResult] = useState<SubmitResult | null>(null);
   const [stats, setStats] = useState<DeckStats[]>([]);
-  const [homeStats, setHomeStats] = useState<DeckStats[]>([]);
+  const [libraryStats, setLibraryStats] = useState<LibraryStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [semanticStatus, setSemanticStatus] = useState<SemanticRuntimeStatus | null>(null);
   const [voicevoxStatus, setVoicevoxStatus] = useState<VoicevoxRuntimeStatus | null>(null);
@@ -72,8 +94,6 @@ function App() {
   const homeShelfWheelAtRef = useRef(0);
   const homeShelfScrollTargetRef = useRef<number | null>(null);
   const homeShelfScrollFrameRef = useRef<number | null>(null);
-
-  const homeStatsDeck = selected && decks.some((item) => item.id === selected.id) ? selected : decks[0] ?? null;
 
   const refresh = async () => {
     try {
@@ -86,12 +106,14 @@ function App() {
 
   useEffect(() => void refresh(), []);
   useEffect(() => {
-    if (view !== "decks" || !homeStatsDeck) {
-      setHomeStats([]);
-      return;
-    }
-    void api.stats(homeStatsDeck.id).then(setHomeStats).catch(() => setHomeStats([]));
-  }, [view, homeStatsDeck?.id]);
+    if (view !== "decks") return;
+    let active = true;
+    setLibraryStats(null);
+    void api.libraryStats()
+      .then((nextStats) => { if (active) setLibraryStats(nextStats); })
+      .catch(() => { if (active) setLibraryStats(null); });
+    return () => { active = false; };
+  }, [view, decks]);
   useEffect(() => {
     if (view !== "decks") return;
     const scroller = homeScrollRef.current;
@@ -159,14 +181,31 @@ function App() {
     };
 
     const onWheel = (event: WheelEvent) => {
+      const target = event.target as HTMLElement | null;
+
+      // The growth plot owns wheel input anywhere inside its bounds.
+      // Do not let the home section snap handler turn the same gesture into
+      // navigation to the shelf/settings before the chart handles the zoom.
+      if (target?.closest(".stats-growth-chart")) {
+        event.preventDefault();
+        return;
+      }
+
       if (homeWheelLockRef.current) {
         event.preventDefault();
         return;
       }
 
-      const target = event.target as HTMLElement | null;
       if (target?.closest(".deck-create-backdrop")) return;
       if (target?.closest(".open-book-stage")) return;
+
+      const statsScroller = target?.closest<HTMLElement>(".home-stats-section > .stats-dashboard");
+      if (statsScroller && statsScroller.scrollHeight > statsScroller.clientHeight) {
+        const deltaY = normalizeWheelDelta(event, statsScroller.clientHeight);
+        const canScrollUp = deltaY < 0 && statsScroller.scrollTop > 2;
+        const canScrollDown = deltaY > 0 && statsScroller.scrollHeight - statsScroller.clientHeight - statsScroller.scrollTop > 2;
+        if (canScrollUp || canScrollDown) return;
+      }
 
       const sections = Array.from(scroller.querySelectorAll<HTMLElement>(".home-snap-section"));
       if (sections.length === 0) return;
@@ -297,9 +336,9 @@ function App() {
           <span className="brand-mark">鍛</span>
           <strong>TANREN</strong>
         </button>
-        <div className="topbar-context">{view.toUpperCase()}</div>
+        <div className="topbar-context">{view === "editor" || view === "stats" || view === "settings" ? VIEW_LABELS[view] : ""}</div>
         <div className="topbar-actions">
-          <button className="ghost" onClick={() => void openDecks()}>← Library</button>
+          <button className="ghost" onClick={() => void openDecks()}>← 책장</button>
         </div>
       </header>}
 
@@ -319,9 +358,7 @@ function App() {
             />
           </section>
           <section className="home-snap-section home-stats-section">
-            {homeStatsDeck
-              ? <StatsView deck={homeStatsDeck} stats={homeStats} />
-              : <div className="home-empty-section"><strong>Statistics</strong><span>책을 추가하면 통계가 여기에 보여.</span></div>}
+            <LibraryStatsView stats={libraryStats} />
           </section>
           <section className="home-snap-section home-settings-section">
             <SettingsView voicevoxStatus={voicevoxStatus} />
@@ -331,6 +368,7 @@ function App() {
       {view === "editor" && selected && <DeckEditor deck={selected} onDone={refresh} />}
       {view === "study" && (card || result) && (
         <StudyView
+          deckId={selected?.id ?? ""}
           card={card}
           result={result}
           setCard={setCard}
@@ -338,7 +376,7 @@ function App() {
           onExit={openDecks}
         />
       )}
-      {view === "stats" && selected && <StatsView deck={selected} stats={stats} />}
+      {view === "stats" && selected && <DeckStatsView deck={selected} stats={stats} />}
       {view === "settings" && <SettingsView voicevoxStatus={voicevoxStatus} />}
     </main>
   );
@@ -367,48 +405,48 @@ function SettingsView({ voicevoxStatus }: { voicevoxStatus: VoicevoxRuntimeStatu
     const value = await api.setStorageDirectory(path.trim() || null);
     setSettings(value);
     setPath(value.selected_path ?? value.default_path);
-    setMessage(value.restart_required ? "저장했어. TANREN을 재시작하면 새 폴더를 사용해." : "저장했어.");
+    setMessage(value.restart_required ? "저장했어요. TANREN을 재시작하면 적용돼요." : "저장했어요.");
   };
 
   const reset = async () => {
     const value = await api.setStorageDirectory(null);
     setSettings(value);
     setPath(value.default_path);
-    setMessage(value.restart_required ? "기본 경로로 복원했어. 재시작 후 적용돼." : "기본 경로를 사용 중이야.");
+    setMessage(value.restart_required ? "기본 위치로 바꿨어요. 재시작하면 적용돼요." : "기본 위치를 사용하고 있어요.");
   };
 
   const restore = async () => {
     const restored = await api.importDeckExport(restoreText);
     setRestoreText("");
-    setRestoreMessage(`${restored.name} 복원 완료`);
+    setRestoreMessage(`${restored.name}을 복원했어요.`);
   };
 
   return <section className="content narrow">
-    <div className="section-heading"><div><h1>Settings</h1><p>로컬 런타임과 백업.</p></div></div>
+    <div className="section-heading"><div><h1>설정</h1><p>TANREN의 저장 위치와 백업을 관리해요.</p></div></div>
     <div className="settings-card">
-      <label htmlFor="semantic-storage">Model & voice data</label>
-      <p className="setting-help">임베딩 모델과 음성 런타임 저장 위치.</p>
-      {voicevoxStatus?.phase !== "ready" && voicevoxStatus && <p className="setting-help runtime-inline">Voice · {voicevoxStatus.phase}{voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}</p>}
+      <label htmlFor="semantic-storage">모델·음성 데이터</label>
+      <p className="setting-help">모델과 음성 파일을 저장할 위치를 정해요.</p>
+      {voicevoxStatus?.phase !== "ready" && voicevoxStatus && <p className="setting-help runtime-inline">음성 · {runtimePhaseLabel(voicevoxStatus.phase)}{voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}</p>}
       <div className="path-row">
         <input id="semantic-storage" value={path} onChange={(e) => setPath(e.target.value)} placeholder={settings?.default_path ?? ""} />
-        <button className="secondary" onClick={() => void browse()}>Browse</button>
+        <button className="secondary" onClick={() => void browse()}>폴더 선택</button>
       </div>
       {settings && <div className="storage-meta">
-        <span>현재 사용 중: <code>{settings.active_path}</code></span>
-        <span>기본값: <code>{settings.default_path}</code></span>
+        <span>현재 위치 <code>{settings.active_path}</code></span>
+        <span>기본 위치 <code>{settings.default_path}</code></span>
       </div>}
       <div className="actions">
-        <button onClick={() => void save()}>Save</button>
-        <button className="ghost" onClick={() => void reset()}>Use default</button>
+        <button onClick={() => void save()}>저장하기</button>
+        <button className="ghost" onClick={() => void reset()}>기본값 사용</button>
       </div>
       {message && <p className="success">{message}</p>}
-      {settings?.restart_required && <p className="setting-warning">경로 변경은 재시작 후 적용돼. 기존 폴더의 파일은 자동 삭제하지 않아.</p>}
+      {settings?.restart_required && <p className="setting-warning">재시작하면 새 위치가 적용돼요. 기존 파일은 그대로 남아 있어요.</p>}
     </div>
     <details className="advanced-panel">
-      <summary>Backup restore</summary>
-      <p className="setting-help">TANREN portable JSON 백업을 복원할 때만 사용해.</p>
-      <textarea value={restoreText} onChange={(event) => setRestoreText(event.target.value)} placeholder="Portable deck JSON" />
-      <button disabled={!restoreText.trim()} onClick={() => void restore()}>Restore deck</button>
+      <summary>백업 복원</summary>
+      <p className="setting-help">백업한 책 데이터를 다시 불러올 수 있어요.</p>
+      <textarea value={restoreText} onChange={(event) => setRestoreText(event.target.value)} placeholder="백업 JSON을 붙여넣어주세요" />
+      <button disabled={!restoreText.trim()} onClick={() => void restore()}>복원하기</button>
       {restoreMessage && <p className="success">{restoreMessage}</p>}
     </details>
   </section>;
@@ -446,8 +484,8 @@ function DeckList({ decks, semanticStatus, voicevoxStatus, onRefresh, onEdit, on
     }
   };
   const runtimeIssues = [
-    semanticStatus && semanticStatus.phase !== "ready" ? `Semantic ${semanticStatus.phase}${semanticStatus.error ? ` · ${semanticStatus.error}` : ""}` : null,
-    voicevoxStatus && voicevoxStatus.phase !== "ready" ? `Voice ${voicevoxStatus.phase}${voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}` : null,
+    semanticStatus && semanticStatus.phase !== "ready" ? `의미 모델 · ${runtimePhaseLabel(semanticStatus.phase)}${semanticStatus.error ? ` · ${semanticStatus.error}` : ""}` : null,
+    voicevoxStatus && voicevoxStatus.phase !== "ready" ? `음성 · ${runtimePhaseLabel(voicevoxStatus.phase)}${voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}` : null,
   ].filter(Boolean) as string[];
   const openedDeck = openedDeckId ? decks.find((deck) => deck.id === openedDeckId) ?? null : null;
   useEffect(() => {
@@ -558,8 +596,8 @@ function DeckList({ decks, semanticStatus, voicevoxStatus, onRefresh, onEdit, on
                 <div><dt>RANGES</dt><dd>{openedDeck.study_ranges.length}</dd></div>
               </dl>
               <div className="book-tools">
-                <button className="ghost" onClick={() => onEdit(openedDeck)}>Edit</button>
-                <button className="ghost" onClick={() => onStats(openedDeck)}>Stats</button>
+                <button className="ghost" onClick={() => onEdit(openedDeck)}>편집</button>
+                <button className="ghost" onClick={() => onStats(openedDeck)}>통계</button>
               </div>
             </div>
           </FlipPage>
@@ -586,9 +624,9 @@ function DeckList({ decks, semanticStatus, voicevoxStatus, onRefresh, onEdit, on
                     <span className="book-range-arrow" aria-hidden="true">↗</span>
                   </button>;
                 })}
-                {openedDeck.study_ranges.length === 0 && <div className="book-range-empty">학습할 단어를 먼저 추가해.</div>}
+                {openedDeck.study_ranges.length === 0 && <div className="book-range-empty">단어를 먼저 추가해주세요.</div>}
               </div>
-              <span className="book-page-foot">SELECT A RANGE TO BEGIN</span>
+              <span className="book-page-foot">학습할 구간을 골라주세요</span>
             </div>
           </FlipPage>
 
@@ -647,7 +685,7 @@ function DeckList({ decks, semanticStatus, voicevoxStatus, onRefresh, onEdit, on
             })}
           </div>
         ))}
-        {decks.length === 0 && <div className="empty"><strong>아직 덱이 없어.</strong><span>오른쪽 위 + 버튼으로 첫 덱을 추가해.</span></div>}
+        {decks.length === 0 && <div className="empty"><strong>아직 책이 없어요.</strong></div>}
       </motion.div>}
     </AnimatePresence>
   </section>;
@@ -661,18 +699,18 @@ function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise
   const importText = async () => {
     const parsed = parseEntryText(text);
     const result = await api.importEntries(deck.id, parsed.entries);
-    const issueText = parsed.issues.length ? ` · ${parsed.issues.length}개 malformed/입력 중복: ${parsed.issues.map((issue) => `${issue.row}행 ${issue.message}`).join("; ")}` : "";
-    setMessage(`${result.inserted}개 저장 · DB 중복 ${result.duplicates}개 건너뜀${issueText} · enrichment는 백그라운드에서 진행돼.`);
+    const issueText = parsed.issues.length ? ` 확인이 필요한 항목이 ${parsed.issues.length}개 있어요: ${parsed.issues.map((issue) => `${issue.row}행 ${issue.message}`).join("; ")}` : "";
+    setMessage(`${result.inserted}개를 추가했어요.${result.duplicates ? ` 중복 ${result.duplicates}개는 건너뛰었어요.` : ""}${issueText}`);
     await onDone();
   };
   const toggleMode = (mode: StudyMode) => setModes((current) => current.includes(mode) ? current.filter((value) => value !== mode) : [...current, mode]);
   const save = async () => {
     await api.updateDeck(deck.id, name, modes);
-    setMessage("덱 설정을 저장했습니다.");
+    setMessage("책 설정을 저장했어요.");
     await onDone();
   };
   const remove = async () => {
-    if (!window.confirm(`'${name}' 덱을 삭제할까요? 데이터는 sync 복구를 위해 soft-delete 됩니다.`)) return;
+    if (!window.confirm(`'${name}' 책을 삭제할까요?\n책장에서 바로 사라져요.`)) return;
     await api.deleteDeck(deck.id);
     await onDone();
     window.location.reload();
@@ -687,20 +725,24 @@ function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise
     URL.revokeObjectURL(link.href);
   };
   return <section className="content narrow">
-    <div className="section-heading"><div><h1>{name}</h1><p><code>일본어[TAB]한국어 뜻</code> 또는 CSV.</p></div></div>
+    <div className="section-heading"><div><h1>{name}</h1><p>단어를 붙여넣거나 CSV로 추가할 수 있어요.</p></div></div>
     <div className="deck-settings">
-      <input value={name} maxLength={MAX_DECK_NAME_LENGTH} onChange={(event) => setName(event.target.value)} aria-label="Deck name" />
-      <div className="mode-options">{(["recognition", "listening", "production"] as StudyMode[]).map((mode) => <label key={mode}><input type="checkbox" checked={modes.includes(mode)} onChange={() => toggleMode(mode)} /> {mode}</label>)}</div>
-      <div className="actions"><button disabled={!name.trim() || modes.length === 0} onClick={() => void save()}>Save settings</button><button className="ghost danger" onClick={() => void remove()}>Delete deck</button></div>
+      <input value={name} maxLength={MAX_DECK_NAME_LENGTH} onChange={(event) => setName(event.target.value)} aria-label="책 이름" />
+      <div className="mode-options">
+        {(["reading", "listening", "writing"] as StudyMode[]).map((mode) => <label key={mode}><input type="checkbox" checked={modes.includes(mode)} onChange={() => toggleMode(mode)} /> {STUDY_MODE_LABELS[mode]}</label>)}
+        <label title="추가 예정"><input type="checkbox" disabled /> Speaking <span>(추가 예정)</span></label>
+      </div>
+      <div className="actions"><button disabled={!name.trim() || modes.length === 0} onClick={() => void save()}>저장하기</button><button className="ghost danger" onClick={() => void remove()}>삭제하기</button></div>
     </div>
     <DeckEntryInput value={text} onChange={setText} />
-    <button onClick={importText}>Import / Add</button>
+    <button onClick={importText}>단어 추가</button>
     {message && <p className="success">{message}</p>}
-    <div className="editor-footer"><button className="ghost" onClick={() => void exportDeck()}>Backup export</button></div>
+    <div className="editor-footer"><button className="ghost" onClick={() => void exportDeck()}>백업하기</button></div>
   </section>;
 }
 
-function StudyView({ card, result, setCard, setResult, onExit }: {
+function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
+  deckId: string;
   card: StudyCard | null;
   result: SubmitResult | null;
   setCard: (c: StudyCard | null) => void;
@@ -726,11 +768,75 @@ function StudyView({ card, result, setCard, setResult, onExit }: {
   const completionTimer = useRef<number | null>(null);
   const completionDeadlineAt = useRef<number | null>(null);
   const timeoutSent = useRef(false);
+  const studyActivityStartedAt = useRef<number | null>(null);
+  const studyActivityMode = useRef<StudyMode | null>(card?.mode ?? null);
+  const pendingStudyActivity = useRef(new Map<StudyMode | "all", number>());
   const inputRef = useRef<HTMLInputElement>(null);
   const pitchButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const pitchQuestion = result?.pitch ?? null;
   const timerActive = activeCardTimerRuns(card, result);
   const reduceMotion = useReducedMotion();
+
+  const studyViewIsActive = () => document.visibilityState === "visible" && document.hasFocus();
+
+  const collectStudyActivity = (stop = false) => {
+    const now = performance.now();
+    if (studyActivityStartedAt.current != null) {
+      const elapsed = Math.max(0, now - studyActivityStartedAt.current);
+      const key = studyActivityMode.current ?? "all";
+      pendingStudyActivity.current.set(key, (pendingStudyActivity.current.get(key) ?? 0) + elapsed);
+    }
+    studyActivityStartedAt.current = !stop && studyViewIsActive() ? now : null;
+  };
+
+  const flushStudyActivity = async (stop = false) => {
+    collectStudyActivity(stop);
+    const pending = [...pendingStudyActivity.current.entries()];
+    pendingStudyActivity.current.clear();
+    await Promise.all(pending.map(async ([mode, duration]) => {
+      const durationMs = Math.round(duration);
+      if (durationMs <= 0) return;
+      try {
+        await api.recordStudyActivity(deckId, mode === "all" ? null : mode, durationMs);
+      } catch {
+        pendingStudyActivity.current.set(mode, (pendingStudyActivity.current.get(mode) ?? 0) + duration);
+      }
+    }));
+  };
+
+  useEffect(() => {
+    if (studyViewIsActive()) studyActivityStartedAt.current = performance.now();
+    const syncActiveState = () => {
+      if (studyViewIsActive()) {
+        if (studyActivityStartedAt.current == null) studyActivityStartedAt.current = performance.now();
+      } else {
+        void flushStudyActivity(true);
+      }
+    };
+    const interval = window.setInterval(() => void flushStudyActivity(false), 5_000);
+    window.addEventListener("focus", syncActiveState);
+    window.addEventListener("blur", syncActiveState);
+    document.addEventListener("visibilitychange", syncActiveState);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", syncActiveState);
+      window.removeEventListener("blur", syncActiveState);
+      document.removeEventListener("visibilitychange", syncActiveState);
+      void flushStudyActivity(true);
+    };
+  }, []);
+
+  useEffect(() => {
+    const nextMode = card?.mode ?? studyActivityMode.current;
+    if (nextMode === studyActivityMode.current) return;
+    collectStudyActivity(false);
+    studyActivityMode.current = nextMode;
+  }, [card?.mode]);
+
+  const exitStudy = async () => {
+    await flushStudyActivity(true);
+    await onExit();
+  };
 
   useEffect(() => {
     if (!timerActive) return;
@@ -759,11 +865,11 @@ function StudyView({ card, result, setCard, setResult, onExit }: {
           nativeModeRetry = window.setTimeout(() => {
             void api.activateInputProfile(card.answer_language)
               .then((retryWarning) => { if (current) setInputWarning(retryWarning); })
-              .catch((error) => { if (current) setInputWarning(`Input profile switch failed: ${String(error)}`); });
+              .catch(() => { if (current) setInputWarning("입력 언어를 자동으로 바꾸지 못했어요."); });
           }, 100);
         })
         .catch((error) => {
-          if (current) setInputWarning(`Input profile switch failed: ${String(error)}`);
+          if (current) setInputWarning("입력 언어를 자동으로 바꾸지 못했어요.");
         });
     });
     return () => {
@@ -967,7 +1073,7 @@ function StudyView({ card, result, setCard, setResult, onExit }: {
       : pitchQuestion
         ? "correct"
         : "neutral";
-  const feedbackLabel = feedbackTone === "correct" ? (pitchQuestion ? "✓ MEANING OK" : "✓ CORRECT") : feedbackTone === "incorrect" ? "× WRONG" : feedbackTone === "check" ? "? CHECK" : null;
+  const feedbackLabel = feedbackTone === "correct" ? (pitchQuestion ? "✓ 뜻 정답" : "✓ 정답") : feedbackTone === "incorrect" ? "× 다시 확인" : feedbackTone === "check" ? "? 확인" : null;
   const recallTotalMs = card?.recall_timeout_ms ?? 0;
   const recallElapsedMs = card ? Math.max(0, (firstInputAt.current ?? timerNow) - shownAt.current) : 0;
   const recallRemainingMs = timerActive && firstInputAt.current == null ? Math.max(0, recallTotalMs - recallElapsedMs) : 0;
@@ -980,14 +1086,14 @@ function StudyView({ card, result, setCard, setResult, onExit }: {
   if (!card) {
     const stageClear = result?.status === "stage_clear";
     return <section className="study">
-      <div className="study-top"><div className="study-wordmark">TANREN</div><div>{stageClear ? "STAGE COMPLETE" : "ROUND COMPLETE"}</div><button className="ghost" onClick={onExit}>Exit</button></div>
+      <div className="study-top"><div className="study-wordmark">TANREN</div><div>{stageClear ? "구간 완료" : "회독 완료"}</div><button className="ghost" onClick={() => void exitStudy()}>나가기</button></div>
       <div className="study-center complete-center">
         <motion.div className="completion-card" initial={reduceMotion ? false : { opacity: 0, y: 18, scale: .985 }} animate={{ opacity: 1, y: 0, scale: 1 }}>
-          <span className="completion-kicker">{stageClear ? "STAGE CLEAR" : "ROUND CLEAR"}</span>
-          <div className="completion-title">{stageClear ? "다음 구간으로 갈 준비 완료." : "이번 회독 끝."}</div>
+          <span className="completion-kicker">{stageClear ? "구간 완료" : "회독 완료"}</span>
+          <div className="completion-title">{stageClear ? "이 구간을 끝냈어요." : "이번 회독을 끝냈어요."}</div>
           {stageClear
-            ? <button autoFocus onClick={nextFromStage}>다음 Stage <span aria-hidden="true">→</span></button>
-            : <button autoFocus onClick={onExit}>Decks로 돌아가기</button>}
+            ? <button autoFocus onClick={nextFromStage}>다음 구간 <span aria-hidden="true">→</span></button>
+            : <button autoFocus onClick={() => void exitStudy()}>책장으로</button>}
         </motion.div>
       </div>
     </section>;
@@ -997,7 +1103,7 @@ function StudyView({ card, result, setCard, setResult, onExit }: {
     <div className="study-top">
       <div className="mode"><strong>TANREN</strong><span>{card.mode.toUpperCase()} / {card.answer_language}</span></div>
       <div className="study-stage">{card.stage_label}</div>
-      <div className="study-top-right"><span className="remaining"><strong>{card.total - card.remaining}</strong><i>/</i>{card.total}</span><button className="ghost" onClick={onExit}>ESC</button></div>
+      <div className="study-top-right"><span className="remaining"><strong>{card.total - card.remaining}</strong><i>/</i>{card.total}</span><button className="ghost" onClick={() => void exitStudy()}>ESC</button></div>
     </div>
     <div className="progress"><div style={{ width: `${100 * (1 - card.remaining / Math.max(card.total, 1))}%` }} /></div>
     {(inputWarning ?? card.input_warning) && <div className="study-warning">{inputWarning ?? card.input_warning}</div>}
@@ -1017,20 +1123,20 @@ function StudyView({ card, result, setCard, setResult, onExit }: {
               {feedbackLabel && <span className={`feedback-state ${feedbackTone}`}>{feedbackLabel}</span>}
               <div className="timer-rack" aria-label="answer timers">
                 <div className={`timer-unit ${firstInputAt.current == null && timerActive ? "active" : "locked"}`}>
-                  <div className="timer-copy"><span>RECALL</span><strong>{firstInputAt.current == null && timerActive ? `${(recallRemainingMs / 1000).toFixed(1)}s` : `${(recallElapsedMs / 1000).toFixed(2)}s`}</strong></div>
+                  <div className="timer-copy"><span>회상</span><strong>{firstInputAt.current == null && timerActive ? `${(recallRemainingMs / 1000).toFixed(1)}s` : `${(recallElapsedMs / 1000).toFixed(2)}s`}</strong></div>
                   <div className="timer-track"><i style={{ transform: `scaleX(${firstInputAt.current == null ? recallRatio : 0})` }} /></div>
                 </div>
                 <div className={`timer-unit ${completionDeadlineAt.current != null && timerActive ? "active" : "waiting"}`}>
-                  <div className="timer-copy"><span>INPUT</span><strong>{inputTotalMs <= 0 ? "OFF" : completionDeadlineAt.current != null && timerActive ? `${(inputRemainingMs / 1000).toFixed(1)}s` : "—"}</strong></div>
+                  <div className="timer-copy"><span>입력</span><strong>{inputTotalMs <= 0 ? "꺼짐" : completionDeadlineAt.current != null && timerActive ? `${(inputRemainingMs / 1000).toFixed(1)}s` : "—"}</strong></div>
                   <div className="timer-track"><i style={{ transform: `scaleX(${inputRatio})` }} /></div>
                 </div>
               </div>
             </div>
 
-            <div className={card.mode === "listening" ? "question listening-question" : "question"}>{card.mode === "listening" ? <><span className="audio-orb" aria-hidden="true">▶</span><span>한 번 듣고 입력</span></> : card.question}</div>
+            <div className={card.mode === "listening" ? "question listening-question" : "question"}>{card.mode === "listening" ? <><span className="audio-orb" aria-hidden="true">▶</span><span>듣고 답을 입력해주세요</span></> : card.question}</div>
 
             {pitchQuestion && <div className="pitch-panel">
-              <div className="pitch-panel-head"><span>PITCH</span><small>{pitchQuestion.confidence} · {pitchQuestion.gate_enabled ? "GRADED" : "REFERENCE"}</small></div>
+              <div className="pitch-panel-head"><span>PITCH</span><small>{pitchQuestion.confidence} · {pitchQuestion.gate_enabled ? "채점" : "참고"}</small></div>
               <PitchTrace morae={pitchQuestion.morae} levels={pitchLevels} tone="neutral" />
               <div className="pitch-contour" role="group" aria-label="mora pitch contour">
                 {pitchQuestion.morae.map((mora, index) => {
@@ -1054,12 +1160,12 @@ function StudyView({ card, result, setCard, setResult, onExit }: {
             </div>}
 
             {review && submittedPitch && submittedPitchQuestion && expectedPitch && <motion.div className="pitch-review" initial={reduceMotion ? false : { opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
-              <div><span>EXPECTED</span><PitchTrace morae={submittedPitchQuestion.morae} levels={expectedPitch} tone="correct" /></div>
-              <div><span>YOURS</span><PitchTrace morae={submittedPitchQuestion.morae} levels={submittedPitch} tone={submittedPitchCorrect ? "correct" : "incorrect"} /></div>
+              <div><span>정답</span><PitchTrace morae={submittedPitchQuestion.morae} levels={expectedPitch} tone="correct" /></div>
+              <div><span>내 답</span><PitchTrace morae={submittedPitchQuestion.morae} levels={submittedPitch} tone={submittedPitchCorrect ? "correct" : "incorrect"} /></div>
             </motion.div>}
 
-            {review && <motion.div className={`review-card ${feedbackTone}`} initial={reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><span className="feedback-label">ANSWER</span><strong>{result?.canonical_answer}</strong>{result?.reading && <span>{result.reading}</span>}<p>{result?.message}</p>{card.audio_path && <button className="compact-button" type="button" onClick={playCachedAnswer}>▶ 정답 듣기</button>}</motion.div>}
-            {ambiguous && <motion.div className="review-card ambiguous-card" initial={reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><span className="feedback-label">CHECK</span><p>이 답을 이 항목의 정답으로 기억할까?</p><div className="actions"><button onClick={async () => advance(await api.adjudicate(card.variant_id, true))}>A · Accept</button><button className="secondary" onClick={async () => advance(await api.adjudicate(card.variant_id, false))}>R · Reject</button></div></motion.div>}
+            {review && <motion.div className={`review-card ${feedbackTone}`} initial={reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><span className="feedback-label">정답</span><strong>{result?.canonical_answer}</strong>{result?.reading && <span>{result.reading}</span>}<p>{result?.message}</p>{card.audio_path && <button className="compact-button" type="button" onClick={playCachedAnswer}>▶ 정답 듣기</button>}</motion.div>}
+            {ambiguous && <motion.div className="review-card ambiguous-card" initial={reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><span className="feedback-label">확인</span><p>이 답을 정답으로 기억할까요?</p><div className="actions"><button onClick={async () => advance(await api.adjudicate(card.variant_id, true))}>정답이에요</button><button className="secondary" onClick={async () => advance(await api.adjudicate(card.variant_id, false))}>오답이에요</button></div></motion.div>}
 
             {!pitchQuestion && <input
               ref={inputRef}
@@ -1083,13 +1189,13 @@ function StudyView({ card, result, setCard, setResult, onExit }: {
                 lastActivityAt.current = now;
                 scheduleCompletionTimeout(e.currentTarget.value);
               }}
-              placeholder={review ? "Enter → next" : "답 입력"}
+              placeholder={review ? "Enter로 다음 문제" : "답을 입력해주세요"}
               disabled={ambiguous}
               autoComplete="off"
               spellCheck={false}
             />}
-            {!review && !ambiguous && !pitchQuestion && <div className="study-hint"><span><kbd>↵</kbd> 확인</span><span><kbd>빈 ↵</kbd> 모름</span></div>}
-            {review && <div className="review-next"><kbd>ENTER</kbd><span>다음 카드</span><b>→</b></div>}
+            {!review && !ambiguous && !pitchQuestion && <div className="study-hint"><span><kbd>↵</kbd> 확인</span><span><kbd>빈 ↵</kbd> 모르면 넘어가기</span></div>}
+            {review && <div className="review-next"><kbd>ENTER</kbd><span>다음 문제</span><b>→</b></div>}
           </motion.div>
         </AnimatePresence>
       </div>
@@ -1120,10 +1226,716 @@ function PitchTrace({ morae, levels, tone }: { morae: string[]; levels: Array<nu
   </div>;
 }
 
-function StatsView({ deck, stats }: { deck: DeckSummary; stats: DeckStats[] }) {
-  const pct = (v: number | null) => v == null ? "—" : `${(v * 100).toFixed(1)}%`;
-  return <section className="content"><div className="section-heading"><div><h1>{deck.name} Statistics</h1><p>통계는 스케줄링에 영향을 주지 않아.</p></div></div>
-    <div className="stats-grid">{stats.map((s) => <article className="stat-card" key={s.mode}><h2>{s.mode}</h2><dl><dt>Base</dt><dd>{pct(s.base_accuracy)}</dd><dt>Pitch</dt><dd>{pct(s.pitch_accuracy)}</dd><dt>Joint</dt><dd>{pct(s.joint_accuracy)}</dd><dt>Median recall</dt><dd>{s.median_recall_latency_ms == null ? "—" : `${s.median_recall_latency_ms} ms`}</dd><dt>Attempts</dt><dd>{s.attempts}</dd></dl></article>)}</div>
+const MODE_DETAILS: Record<StudyMode, { label: string; description: string; mark: string }> = {
+  reading: { label: "Reading", description: "외국어를 보고 뜻을 떠올려요", mark: "読" },
+  listening: { label: "Listening", description: "소리를 듣고 뜻을 떠올려요", mark: "聴" },
+  writing: { label: "Writing", description: "뜻을 보고 외국어를 떠올려요", mark: "書" },
+};
+
+const numberFormat = new Intl.NumberFormat("ko-KR");
+const compactNumberFormat = new Intl.NumberFormat("ko-KR", { notation: "compact", maximumFractionDigits: 1 });
+
+function formatPercent(value: number | null) {
+  return value == null ? "—" : `${(value * 100).toFixed(1)}%`;
+}
+
+function formatLatency(value: number | null) {
+  if (value == null) return "—";
+  return value < 1_000 ? `${numberFormat.format(value)} ms` : `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)} s`;
+}
+
+function formatStudyTime(value: number | null) {
+  if (value == null) return "—";
+  const totalSeconds = Math.round(value / 1_000);
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return minutes > 0 ? `${hours}시간 ${minutes}분` : `${hours}시간`;
+  if (minutes > 0) return seconds > 0 ? `${minutes}분 ${seconds}초` : `${minutes}분`;
+  return `${seconds}초`;
+}
+
+function formatLastPracticed(value: string | null) {
+  if (!value) return "시작 전";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("ko-KR", { month: "short", day: "numeric" }).format(date);
+}
+
+function StatsMetric({ label, value, help, featured = false }: { label: string; value: string; help: string; featured?: boolean }) {
+  const helpRef = useRef<HTMLSpanElement>(null);
+  const helpTipRef = useRef<HTMLSpanElement>(null);
+  const valueRef = useRef<HTMLElement>(null);
+  const [showHelp, setShowHelp] = useState(false);
+  const [helpPosition, setHelpPosition] = useState<{ left: number; top: number } | null>(null);
+
+  const positionHelp = () => {
+    const trigger = helpRef.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const tooltip = helpTipRef.current;
+    const tooltipWidth = tooltip?.offsetWidth ?? 260;
+    const tooltipHeight = tooltip?.offsetHeight ?? 0;
+    const viewportPadding = 12;
+    const preferredLeft = rect.right + 10;
+    const left = Math.min(preferredLeft, window.innerWidth - tooltipWidth - viewportPadding);
+    const preferredTop = rect.top + rect.height / 2;
+    const minTop = viewportPadding + tooltipHeight / 2;
+    const maxTop = window.innerHeight - viewportPadding - tooltipHeight / 2;
+    setHelpPosition({
+      left: Math.max(viewportPadding, left),
+      top: tooltipHeight > 0 ? Math.min(Math.max(preferredTop, minTop), maxTop) : preferredTop,
+    });
+  };
+
+  const openHelp = () => {
+    setHelpPosition(null);
+    setShowHelp(true);
+  };
+
+  const closeHelp = () => {
+    setShowHelp(false);
+    setHelpPosition(null);
+  };
+
+  useEffect(() => {
+    if (!showHelp) return;
+    const frame = window.requestAnimationFrame(positionHelp);
+    const reposition = () => positionHelp();
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [showHelp]);
+
+  useLayoutEffect(() => {
+    const element = valueRef.current;
+    if (!element) return;
+
+    const fitValue = () => {
+      element.style.fontSize = "";
+      const baseSize = Number.parseFloat(window.getComputedStyle(element).fontSize);
+      if (!Number.isFinite(baseSize) || element.scrollWidth <= element.clientWidth) return;
+
+      const ratio = element.clientWidth / element.scrollWidth;
+      element.style.fontSize = `${Math.max(20, Math.floor(baseSize * ratio * 100) / 100)}px`;
+    };
+
+    fitValue();
+    const observer = new ResizeObserver(fitValue);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [value]);
+
+  return <article className={`stats-metric ${featured ? "is-featured" : ""}`}>
+    <div className="stats-metric-label">
+      <span>{label}</span>
+      <span
+        ref={helpRef}
+        className="stats-help"
+        tabIndex={0}
+        aria-label={`${label} 설명`}
+        aria-expanded={showHelp}
+        onMouseEnter={openHelp}
+        onMouseLeave={closeHelp}
+        onFocus={openHelp}
+        onBlur={closeHelp}
+      >?</span>
+      {showHelp && createPortal(
+        <span
+          ref={helpTipRef}
+          className="stats-help-tip stats-help-tip-portal"
+          role="tooltip"
+          style={{
+            left: helpPosition?.left ?? 0,
+            top: helpPosition?.top ?? 0,
+            visibility: helpPosition ? "visible" : "hidden",
+          }}
+        >{help}</span>,
+        document.body,
+      )}
+    </div>
+    <strong ref={valueRef}>{value}</strong>
+  </article>;
+}
+
+type GrowthMetric = "attempts" | "seen_entry_count" | "base_accuracy" | "pitch_accuracy" | "median_recall_latency_ms" | "study_time_ms";
+type GrowthScope = "all" | "reading" | "writing" | "listening" | "speaking";
+
+const GROWTH_SCOPES: Record<GrowthScope, string> = {
+  all: "전체",
+  reading: "Reading",
+  writing: "Writing",
+  listening: "Listening",
+  speaking: "Speaking",
+};
+
+const GROWTH_METRICS: Record<GrowthMetric, { label: string; format: (value: number | null) => string; value: (point: LibraryStats["history"][number]) => number | null }> = {
+  attempts: { label: "누적 시도", format: (value) => value == null ? "—" : `${numberFormat.format(value)}회`, value: (point) => point.attempts },
+  seen_entry_count: { label: "누적 단어 수", format: (value) => value == null ? "—" : `${numberFormat.format(value)}개`, value: (point) => point.seen_entry_count },
+  base_accuracy: { label: "문제 정확도", format: (value) => value == null ? "—" : `${(value * 100).toFixed(1)}%`, value: (point) => point.base_accuracy },
+  pitch_accuracy: { label: "피치 정확도", format: (value) => value == null ? "—" : `${(value * 100).toFixed(1)}%`, value: (point) => point.pitch_accuracy },
+  median_recall_latency_ms: { label: "중앙 응답시간", format: (value) => value == null ? "—" : formatLatency(value), value: (point) => point.median_recall_latency_ms },
+  study_time_ms: { label: "공부 시간", format: (value) => formatStudyTime(value), value: (point) => point.study_time_ms },
+};
+
+function GrowthSelect<T extends string | number>({ label, value, options, onChange }: {
+  label: string;
+  value: T;
+  options: Array<{ value: T; label: string }>;
+  onChange: (value: T) => void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const selectRef = useRef<HTMLLabelElement>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const closeOutside = (event: MouseEvent) => {
+      if (!selectRef.current?.contains(event.target as Node)) setIsOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setIsOpen(false);
+    };
+    document.addEventListener("mousedown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [isOpen]);
+
+  return <label ref={selectRef} className={`stats-growth-select ${label === "지표" ? "stats-growth-select--metric " : ""}${isOpen ? "is-open" : ""}`}>
+    <span>{label}</span>
+    <select
+      value={String(value)}
+      aria-expanded={isOpen}
+      onMouseDown={(event) => {
+        event.preventDefault();
+        setIsOpen((open) => !open);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
+          event.preventDefault();
+          setIsOpen(true);
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          setIsOpen(false);
+        }
+      }}
+      onChange={(event) => {
+        const option = options.find((item) => String(item.value) === event.target.value);
+        if (option) onChange(option.value);
+      }}
+    >
+      {options.map((option) => <option key={String(option.value)} value={String(option.value)}>{option.label}</option>)}
+    </select>
+    <i aria-hidden="true" />
+    <AnimatePresence>
+      {isOpen && <motion.div
+        className="stats-growth-select-menu"
+        role="listbox"
+        initial={{ opacity: 0, y: -8 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={{ opacity: 0, y: -8 }}
+        transition={{ duration: .3, ease: [.4, 0, .2, 1] }}
+      >
+        {options.map((option) => {
+          const isSelected = String(option.value) === String(value);
+          return <button
+            key={String(option.value)}
+            type="button"
+            role="option"
+            aria-selected={isSelected}
+            className={isSelected ? "is-selected" : ""}
+            onClick={() => {
+              onChange(option.value);
+              setIsOpen(false);
+            }}
+          >
+            {option.label}
+          </button>;
+        })}
+      </motion.div>}
+    </AnimatePresence>
+  </label>;
+}
+
+function formatGrowthDate(value: string) {
+  const day = new Date(`${value}T00:00:00`).getDay();
+  return `${value} (${["일", "월", "화", "수", "목", "금", "토"][day]})`;
+}
+
+type GrowthAxisGranularity = "year" | "month" | "day";
+
+function formatGrowthAxisDate(value: number, granularity: GrowthAxisGranularity) {
+  const date = new Date(value);
+  if (granularity === "year") return `${date.getUTCFullYear()}년`;
+  if (granularity === "month") return `${date.getUTCMonth() + 1}월`;
+  return `${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
+}
+
+function GrowthAxisTick({ x = 0, y = 0, payload, chartWidth, plotLeft, plotRight, granularity }: any) {
+  const rightEdge = Math.max(plotLeft, chartWidth - plotRight);
+  if (x < plotLeft - 1 || x > rightEdge + 1) return null;
+
+  let safeX = x;
+  let textAnchor: "start" | "middle" | "end" = "middle";
+  const edgeGuard = granularity === "year" ? 34 : 28;
+  if (x <= plotLeft + edgeGuard) {
+    safeX = plotLeft + 2;
+    textAnchor = "start";
+  } else if (x >= rightEdge - edgeGuard) {
+    safeX = rightEdge - 2;
+    textAnchor = "end";
+  }
+
+  return <text
+    x={safeX}
+    y={y}
+    dy={14}
+    textAnchor={textAnchor}
+    fill="#f3f1eb"
+    fontSize={13}
+    fontFamily="var(--font-ui)"
+    pointerEvents="none"
+  >
+    {formatGrowthAxisDate(Number(payload?.value), granularity)}
+  </text>;
+}
+
+function GrowthTooltip({ active, payload, metricInfo }: any) {
+  const value = payload?.[0]?.value as number | null | undefined;
+  const date = payload?.[0]?.payload?.date as string | undefined;
+  if (!active || !payload?.length || value == null) return null;
+  return <div className="stats-growth-tooltip">
+    <strong>{date ? formatGrowthDate(date) : ""}</strong>
+    <b>{metricInfo.format(value)}</b>
+  </div>;
+}
+
+function GrowthChart({ stats }: { stats: LibraryStats }) {
+  const [metric, setMetric] = useState<GrowthMetric>("base_accuracy");
+  const [scope, setScope] = useState<GrowthScope>("all");
+  const [zoomWindow, setZoomWindow] = useState({ start: 0, end: Math.max(0, stats.history.length - 1) });
+  const [chartWidth, setChartWidth] = useState(0);
+  const growthChartRef = useRef<HTMLDivElement>(null);
+  const tooltipMotionFrameRef = useRef<number | null>(null);
+  const panRef = useRef<{ pointerId: number; clientX: number; start: number; end: number } | null>(null);
+
+  const resetTooltipMotion = () => {
+    if (tooltipMotionFrameRef.current != null) {
+      window.cancelAnimationFrame(tooltipMotionFrameRef.current);
+      tooltipMotionFrameRef.current = null;
+    }
+    growthChartRef.current?.classList.remove("is-tooltip-following");
+  };
+
+  useEffect(() => {
+    resetTooltipMotion();
+    return resetTooltipMotion;
+  }, [metric, scope, zoomWindow.start, zoomWindow.end]);
+
+  useEffect(() => {
+    const container = growthChartRef.current;
+    if (!container) return;
+
+    const armFollowMotion = () => {
+      if (container.classList.contains("is-tooltip-following") || tooltipMotionFrameRef.current != null) return;
+      const wrapper = container.querySelector<HTMLElement>(".recharts-tooltip-wrapper");
+      if (!wrapper) return;
+      const transform = wrapper.style.transform;
+      const isVisible = wrapper.style.visibility !== "hidden" && wrapper.style.opacity !== "0";
+      const hasRealPosition = transform.includes("translate") && !/translate(?:3d)?\(\s*0(?:px)?\s*,\s*0(?:px)?/i.test(transform);
+      if (!isVisible || !hasRealPosition) return;
+
+      tooltipMotionFrameRef.current = window.requestAnimationFrame(() => {
+        tooltipMotionFrameRef.current = window.requestAnimationFrame(() => {
+          container.classList.add("is-tooltip-following");
+          tooltipMotionFrameRef.current = null;
+        });
+      });
+    };
+
+    const observer = new MutationObserver(armFollowMotion);
+    observer.observe(container, { subtree: true, childList: true, attributes: true, attributeFilter: ["style"] });
+    armFollowMotion();
+
+    return () => {
+      observer.disconnect();
+      if (tooltipMotionFrameRef.current != null) {
+        window.cancelAnimationFrame(tooltipMotionFrameRef.current);
+        tooltipMotionFrameRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const container = growthChartRef.current;
+    if (!container) return;
+    const updateWidth = () => setChartWidth(container.clientWidth);
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setZoomWindow({ start: 0, end: Math.max(0, stats.history.length - 1) });
+  }, [stats.history.length, stats.history.at(-1)?.date]);
+
+  const metricInfo = GROWTH_METRICS[metric];
+  const chartData = stats.history.map((point, index) => {
+    const modePoint = scope === "all" || scope === "speaking" ? null : point.modes[scope];
+    const value = scope === "all" ? metricInfo.value(point) : modePoint?.[metric] ?? null;
+    return {
+      index,
+      date: point.date,
+      timestamp: Date.parse(`${point.date}T00:00:00Z`),
+      value,
+    };
+  });
+  const visibleStart = Math.max(0, Math.floor(zoomWindow.start) - 1);
+  const visibleEnd = Math.min(chartData.length - 1, Math.ceil(zoomWindow.end) + 1);
+  const visibleChartData = chartData.slice(visibleStart, visibleEnd + 1);
+  const values = visibleChartData.map((point) => point.value);
+  const validValues = values.filter((value): value is number => value != null);
+  const isPercent = metric === "base_accuracy" || metric === "pitch_accuracy";
+  const yDomain: [number, number | "auto"] = isPercent ? [0, 1] : [0, "auto"];
+  const yTick = (value: number) => {
+    if (isPercent) return `${Math.round(value * 100)}%`;
+    if (metric === "median_recall_latency_ms") return value < 1_000 ? `${Math.round(value)}ms` : `${(value / 1_000).toFixed(1)}s`;
+    if (metric === "study_time_ms") return formatStudyTime(value);
+    if (metric === "attempts") return `${numberFormat.format(value)}회`;
+    if (metric === "seen_entry_count") return `${numberFormat.format(value)}개`;
+    return numberFormat.format(value);
+  };
+  const scopeOptions = (Object.keys(GROWTH_SCOPES) as GrowthScope[]).map((key) => ({ value: key, label: GROWTH_SCOPES[key] }));
+  const metricOptions = (Object.keys(GROWTH_METRICS) as GrowthMetric[]).map((key) => ({ value: key, label: GROWTH_METRICS[key].label }));
+
+  const timestampAtIndex = (index: number) => {
+    if (chartData.length === 0) return 0;
+    const clamped = Math.max(0, Math.min(chartData.length - 1, index));
+    const lowerIndex = Math.floor(clamped);
+    const upperIndex = Math.ceil(clamped);
+    if (lowerIndex === upperIndex) return chartData[lowerIndex].timestamp;
+    const lower = chartData[lowerIndex].timestamp;
+    const upper = chartData[upperIndex].timestamp;
+    return lower + (upper - lower) * (clamped - lowerIndex);
+  };
+  const DAY_MS = 86_400_000;
+  const rawXDomain: [number, number] = [timestampAtIndex(zoomWindow.start), timestampAtIndex(zoomWindow.end)];
+  const xDomain: [number, number] = chartData.length === 1
+    ? [rawXDomain[0] - DAY_MS / 2, rawXDomain[1] + DAY_MS / 2]
+    : rawXDomain;
+  const visibleDays = Math.max(1, (xDomain[1] - xDomain[0]) / DAY_MS);
+  const xGranularity: GrowthAxisGranularity = visibleDays > 540 ? "year" : visibleDays > 60 ? "month" : "day";
+  const targetTickCount = Math.max(2, Math.min(8, Math.floor((chartWidth || 900) / 115)));
+  const xTicks: number[] = [];
+
+  if (xGranularity === "year") {
+    const firstYear = new Date(xDomain[0]).getUTCFullYear();
+    const lastYear = new Date(xDomain[1]).getUTCFullYear();
+    const visibleYears = Math.max(1, lastYear - firstYear + 1);
+    const rawStep = visibleYears / targetTickCount;
+    const step = [1, 2, 5, 10, 20, 50].find((candidate) => candidate >= rawStep) ?? Math.ceil(rawStep);
+    const startYear = Math.ceil(firstYear / step) * step;
+    for (let year = startYear; year <= lastYear; year += step) {
+      const tick = Date.UTC(year, 0, 1);
+      if (tick >= xDomain[0] && tick <= xDomain[1]) xTicks.push(tick);
+    }
+  } else if (xGranularity === "month") {
+    const startDate = new Date(xDomain[0]);
+    const endDate = new Date(xDomain[1]);
+    const firstMonthIndex = startDate.getUTCFullYear() * 12 + startDate.getUTCMonth();
+    const lastMonthIndex = endDate.getUTCFullYear() * 12 + endDate.getUTCMonth();
+    const visibleMonths = Math.max(1, lastMonthIndex - firstMonthIndex + 1);
+    const rawStep = visibleMonths / targetTickCount;
+    const step = [1, 2, 3, 6, 12, 24].find((candidate) => candidate >= rawStep) ?? Math.ceil(rawStep);
+    const startMonthIndex = Math.ceil(firstMonthIndex / step) * step;
+    for (let monthIndex = startMonthIndex; monthIndex <= lastMonthIndex; monthIndex += step) {
+      const year = Math.floor(monthIndex / 12);
+      const month = monthIndex % 12;
+      const tick = Date.UTC(year, month, 1);
+      if (tick >= xDomain[0] && tick <= xDomain[1]) xTicks.push(tick);
+    }
+  } else {
+    const rawStep = visibleDays / targetTickCount;
+    const step = [1, 2, 3, 5, 7, 10, 14, 21, 30].find((candidate) => candidate >= rawStep) ?? Math.ceil(rawStep);
+    const firstDayIndex = Math.ceil(xDomain[0] / DAY_MS);
+    const lastDayIndex = Math.floor(xDomain[1] / DAY_MS);
+    const startDayIndex = Math.ceil(firstDayIndex / step) * step;
+    for (let dayIndex = startDayIndex; dayIndex <= lastDayIndex; dayIndex += step) {
+      xTicks.push(dayIndex * DAY_MS);
+    }
+  }
+
+  if (xTicks.length === 0) {
+    xTicks.push((xDomain[0] + xDomain[1]) / 2);
+  }
+
+  const yearBoundaries: number[] = [];
+  if (chartData.length > 0) {
+    const firstDataYear = new Date(chartData[0].timestamp).getUTCFullYear();
+    const lastDataYear = new Date(chartData[chartData.length - 1].timestamp).getUTCFullYear();
+    for (let year = firstDataYear + 1; year <= lastDataYear; year += 1) {
+      const boundary = Date.UTC(year, 0, 1);
+      if (boundary > xDomain[0] && boundary < xDomain[1]) yearBoundaries.push(boundary);
+    }
+  }
+
+  const zoomByWheel = (deltaY: number, anchorRatio: number) => {
+    const total = chartData.length;
+    if (total <= 1) return;
+    const maxIndex = total - 1;
+    const minSpan = Math.min(6, maxIndex);
+    const normalizedDelta = Math.max(-120, Math.min(120, deltaY));
+    const factor = Math.exp(normalizedDelta * .0012);
+
+    setZoomWindow((current) => {
+      const currentSpan = current.end - current.start;
+      const nextSpan = Math.max(minSpan, Math.min(maxIndex, currentSpan * factor));
+      if (Math.abs(nextSpan - currentSpan) < .001) return current;
+      if (nextSpan >= maxIndex - .001) return { start: 0, end: maxIndex };
+
+      const anchor = current.start + currentSpan * anchorRatio;
+      let start = anchor - nextSpan * anchorRatio;
+      let end = start + nextSpan;
+
+      if (start < 0) {
+        end -= start;
+        start = 0;
+      }
+      if (end > maxIndex) {
+        start -= end - maxIndex;
+        end = maxIndex;
+      }
+
+      return { start: Math.max(0, start), end: Math.min(maxIndex, end) };
+    });
+  };
+
+  const panByPointer = (clientX: number) => {
+    const pan = panRef.current;
+    const container = growthChartRef.current;
+    if (!pan || !container) return;
+    const rect = container.getBoundingClientRect();
+    const plotLeft = 66;
+    const plotRight = 24;
+    const plotWidth = Math.max(1, rect.width - plotLeft - plotRight);
+    const span = pan.end - pan.start;
+    const maxIndex = Math.max(0, chartData.length - 1);
+    if (span >= maxIndex) return;
+
+    const shift = -((clientX - pan.clientX) / plotWidth) * span;
+    let start = pan.start + shift;
+    let end = pan.end + shift;
+    if (start < 0) {
+      end -= start;
+      start = 0;
+    }
+    if (end > maxIndex) {
+      start -= end - maxIndex;
+      end = maxIndex;
+    }
+    setZoomWindow({ start: Math.max(0, start), end: Math.min(maxIndex, end) });
+  };
+
+  const isZoomed = zoomWindow.start > .001 || zoomWindow.end < chartData.length - 1 - .001;
+
+  return <section className="stats-growth">
+    {stats.attempts > 0 && <div className="stats-growth-toolbar">
+      <GrowthSelect label="훈련" value={scope} options={scopeOptions} onChange={setScope} />
+      <GrowthSelect label="지표" value={metric} options={metricOptions} onChange={setMetric} />
+    </div>}
+    <div
+      ref={growthChartRef}
+      className={`stats-growth-chart ${isZoomed ? "is-pannable" : ""}`}
+      onPointerDown={(event) => {
+        event.preventDefault();
+        if (!isZoomed || event.button !== 0) return;
+        panRef.current = {
+          pointerId: event.pointerId,
+          clientX: event.clientX,
+          start: zoomWindow.start,
+          end: zoomWindow.end,
+        };
+        event.currentTarget.setPointerCapture(event.pointerId);
+        event.currentTarget.classList.add("is-panning");
+      }}
+      onPointerMove={(event) => {
+        if (panRef.current?.pointerId !== event.pointerId) return;
+        panByPointer(event.clientX);
+      }}
+      onPointerUp={(event) => {
+        if (panRef.current?.pointerId !== event.pointerId) return;
+        panRef.current = null;
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        event.currentTarget.classList.remove("is-panning");
+      }}
+      onPointerCancel={(event) => {
+        if (panRef.current?.pointerId !== event.pointerId) return;
+        panRef.current = null;
+        event.currentTarget.classList.remove("is-panning");
+      }}
+      onWheel={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const rect = event.currentTarget.getBoundingClientRect();
+        const plotLeft = 66;
+        const plotRight = 24;
+        const plotWidth = Math.max(1, rect.width - plotLeft - plotRight);
+        const anchorRatio = Math.max(0, Math.min(1, (event.clientX - rect.left - plotLeft) / plotWidth));
+        const deltaY = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? event.deltaY * 16 : event.deltaY;
+        zoomByWheel(deltaY, anchorRatio);
+      }}
+      onMouseLeave={resetTooltipMotion}
+    >
+      {validValues.length === 0 ? <div className="stats-growth-empty">학습 기록이 쌓이면 성장 곡선이 보여요.</div> :
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart accessibilityLayer={false} data={visibleChartData} margin={{ top: 68, right: 24, bottom: 4, left: 8 }}>
+            <defs>
+              <linearGradient id="tanrenGrowthFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#d8ad5c" stopOpacity={0.22} />
+                <stop offset="100%" stopColor="#d8ad5c" stopOpacity={0.015} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid vertical={false} stroke="rgba(255,255,255,.055)" />
+            {yearBoundaries.map((boundary) => <ReferenceLine
+              key={boundary}
+              x={boundary}
+              stroke="rgba(216,173,92,.15)"
+              strokeWidth={1}
+              ifOverflow="hidden"
+            />)}
+            <XAxis
+              dataKey="timestamp"
+              type="number"
+              scale="time"
+              domain={xDomain}
+              ticks={xTicks}
+              allowDataOverflow
+              axisLine={{ stroke: "rgba(255,255,255,.16)" }}
+              tickLine={false}
+              interval={0}
+              tick={(props) => <GrowthAxisTick
+                {...props}
+                chartWidth={chartWidth}
+                plotLeft={66}
+                plotRight={24}
+                granularity={xGranularity}
+              />}
+            />
+            <YAxis
+              domain={yDomain}
+              axisLine={{ stroke: "rgba(255,255,255,.16)" }}
+              tickLine={false}
+              tick={{ fill: "#f3f1eb", fontSize: 13 }}
+              tickFormatter={yTick}
+              width={58}
+            />
+            <Tooltip
+              content={<GrowthTooltip metricInfo={metricInfo} />}
+              cursor={{ stroke: "rgba(216,173,92,.22)", strokeWidth: 1 }}
+              isAnimationActive={false}
+              offset={28}
+            />
+            <Area
+              type="monotone"
+              dataKey="value"
+              stroke="#d8ad5c"
+              strokeWidth={2.2}
+              fill="url(#tanrenGrowthFill)"
+              connectNulls
+              dot={false}
+              activeDot={{ r: 4.5, fill: "#e6c578", stroke: "#151616", strokeWidth: 2 }}
+              isAnimationActive={false}
+            />
+          </AreaChart>
+        </ResponsiveContainer>}
+    </div>
+  </section>;
+}
+
+function ModeStatsGrid({ stats }: { stats: DeckStats[] }) {
+  const orderedStats = (["reading", "writing", "listening"] as StudyMode[])
+    .map((mode) => stats.find((item) => item.mode === mode))
+    .filter((mode): mode is DeckStats => mode != null);
+
+  return <div className="stats-mode-grid">
+    {orderedStats.map((mode) => {
+      const details = MODE_DETAILS[mode.mode];
+      return <article className="stats-mode-card" key={mode.mode}>
+        <header>
+          <span className="stats-mode-mark" aria-hidden="true">{details.mark}</span>
+          <div><h3>{details.label}</h3><p>{details.description}</p></div>
+          <strong>{formatPercent(mode.base_accuracy)}</strong>
+        </header>
+        <dl>
+          <div><dt>시도</dt><dd>{numberFormat.format(mode.attempts)}</dd></div>
+          <div><dt>억양 정확도</dt><dd>{formatPercent(mode.pitch_accuracy)}</dd></div>
+          <div><dt>통합 정확도</dt><dd>{formatPercent(mode.joint_accuracy)}</dd></div>
+          <div><dt>중앙 응답시간</dt><dd>{formatLatency(mode.median_recall_latency_ms)}</dd></div>
+        </dl>
+      </article>;
+    })}
+    <article className="stats-mode-card is-placeholder">
+      <header>
+        <span className="stats-mode-mark" aria-hidden="true">話</span>
+        <div><h3>Speaking</h3><p>말하기 훈련 준비 중</p></div>
+        <strong>—</strong>
+      </header>
+      <dl>
+        <div><dt>시도</dt><dd>—</dd></div>
+        <div><dt>억양 정확도</dt><dd>—</dd></div>
+        <div><dt>통합 정확도</dt><dd>—</dd></div>
+        <div><dt>중앙 응답시간</dt><dd>—</dd></div>
+      </dl>
+    </article>
+  </div>;
+}
+
+function LibraryStatsView({ stats }: { stats: LibraryStats | null }) {
+  return <section className="content stats-dashboard stats-dashboard-global">
+    {!stats ? <div className="stats-loading" aria-live="polite"><span />통계를 불러오고 있어요.</div>
+      : stats.deck_count === 0 ? <div className="stats-empty"><span>統</span><strong>아직 보여드릴 통계가 없어요.</strong><p>학습을 시작하면 기록이 여기에 쌓여요.</p></div>
+      : <>
+        <div className="stats-summary-grid">
+          <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="정답 여부와 관계없이 한 문제를 넘길 때마다 1회로 계산해요." />
+          <StatsMetric label="누적 단어 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help={"처음 본 단어만 1개로 계산해요.\n같은 단어를 다시 학습해도 중복되지 않아요."} />
+          <StatsMetric label="문제 정확도" value={formatPercent(stats.base_accuracy)} help={"Reading, Writing, Listening, Speaking의\n문제 정답률이에요. 피치 채점은 포함하지 않아요."} />
+          <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help={"피치 문제가 실제로 채점된 시도만 모아 계산한\n정확도예요."} />
+          <StatsMetric label="중앙 응답시간" value={formatLatency(stats.median_recall_latency_ms)} help="모든 문제 응답시간의 중앙값이에요." />
+          <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="0-50 같은 학습 구간 화면이 활성화되어 있던 시간을 모두 더해요." />
+          <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요." />
+        </div>
+
+        <GrowthChart stats={stats} />
+      </>}
+  </section>;
+}
+
+function DeckStatsView({ deck, stats }: { deck: DeckSummary; stats: DeckStats[] }) {
+  const attempts = stats.reduce((sum, mode) => sum + mode.attempts, 0);
+  const weightedAccuracy = attempts === 0 ? null : stats.reduce((sum, mode) => sum + (mode.base_accuracy ?? 0) * mode.attempts, 0) / attempts;
+  const weightedJointAccuracy = attempts === 0 ? null : stats.reduce((sum, mode) => sum + (mode.joint_accuracy ?? 0) * mode.attempts, 0) / attempts;
+  return <section className="content stats-dashboard stats-dashboard-deck">
+    <header className="stats-dashboard-header">
+      <div><span className="stats-kicker">BOOK PERFORMANCE</span><h1>{deck.name}</h1><p>이 책에서 쌓인 학습 기록을 보여드려요.</p></div>
+      <div className="stats-scope"><strong>{numberFormat.format(deck.entry_count)}</strong><span>WORDS</span></div>
+    </header>
+    <div className="stats-summary-grid">
+      <StatsMetric featured label="전체 정확도" value={formatPercent(weightedAccuracy)} help={`통합 정답률 ${formatPercent(weightedJointAccuracy)}`} />
+      <StatsMetric label="누적 시도" value={compactNumberFormat.format(attempts)} help={`${numberFormat.format(attempts)}회 학습 기록`} />
+      <StatsMetric label="수록 단어" value={numberFormat.format(deck.entry_count)} help={`${deck.completed_range_count}개 구간 완료`} />
+      <StatsMetric label="현재 회차" value={`Round ${deck.current_round}`} help={deck.active_stage ?? "새 회차 준비"} />
+    </div>
+    <section className="stats-dashboard-section">
+      <div className="stats-section-title"><div><span>TRAINING MODES</span><h2>훈련별 성과</h2></div><p>모드별 정확도와 응답 속도를 비교해요.</p></div>
+      <ModeStatsGrid stats={stats} />
+    </section>
   </section>;
 }
 
