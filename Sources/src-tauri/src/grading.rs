@@ -42,27 +42,27 @@ pub fn grade_form(entry: &EntryRecord, answer: &str, strict_orthography: bool) -
     GradeOutcome { decision: GradeDecision::Fail, method: "form_mismatch", score: None }
 }
 
-pub fn grade_recognition(
+pub fn grade_reading(
     entry: &EntryRecord,
     answer: &str,
     accepted: &[String],
     rejected: &[String],
 ) -> GradeOutcome {
-    grade_recognition_deterministic(entry, answer, accepted, rejected).unwrap_or(GradeOutcome {
+    grade_reading_deterministic(entry, answer, accepted, rejected).unwrap_or(GradeOutcome {
         decision: GradeDecision::Ambiguous,
         method: "semantic_unavailable",
         score: None,
     })
 }
 
-pub fn grade_recognition_deterministic(
+pub fn grade_reading_deterministic(
     entry: &EntryRecord,
     answer: &str,
     accepted: &[String],
     rejected: &[String],
 ) -> Option<GradeOutcome> {
     let norm = normalize_generic(answer);
-    let parts = split_recognition_answer(answer, entry.meanings.len());
+    let parts = split_reading_answer(answer, entry.meanings.len());
     if parts.len() != entry.meanings.len() {
         return Some(GradeOutcome { decision: GradeDecision::Fail, method: "meaning_count_mismatch", score: Some(0.0) });
     }
@@ -82,7 +82,7 @@ pub fn grade_recognition_deterministic(
     None
 }
 
-pub fn split_recognition_answer(answer: &str, expected_count: usize) -> Vec<String> {
+pub fn split_reading_answer(answer: &str, expected_count: usize) -> Vec<String> {
     let trimmed = answer.trim_matches(|c: char| c.is_whitespace() || c == '\u{3000}');
     if trimmed.is_empty() {
         return Vec::new();
@@ -110,8 +110,8 @@ pub fn split_recognition_answer(answer: &str, expected_count: usize) -> Vec<Stri
 
 pub fn grade(mode: StudyMode, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String], strict_orthography: bool) -> GradeOutcome {
     match mode {
-        StudyMode::Recognition => grade_recognition(entry, answer, accepted, rejected),
-        StudyMode::Listening | StudyMode::Production => grade_form(entry, answer, strict_orthography),
+        StudyMode::Reading => grade_reading(entry, answer, accepted, rejected),
+        StudyMode::Listening | StudyMode::Writing => grade_form(entry, answer, strict_orthography),
     }
 }
 
@@ -130,29 +130,29 @@ mod tests {
 
     #[test]
     fn exact_and_alias_grading() {
-        assert_eq!(grade_recognition(&entry(), "내다보다", &[], &[]).decision, GradeDecision::Pass);
-        assert_eq!(grade_recognition(&entry(), "앞날을 내다보다", &["앞날을 내다보다".into()], &[]).decision, GradeDecision::Pass);
-        assert_eq!(grade_recognition(&entry(), "예상하다", &[], &["예상하다".into()]).decision, GradeDecision::Fail);
+        assert_eq!(grade_reading(&entry(), "내다보다", &[], &[]).decision, GradeDecision::Pass);
+        assert_eq!(grade_reading(&entry(), "앞날을 내다보다", &["앞날을 내다보다".into()], &[]).decision, GradeDecision::Pass);
+        assert_eq!(grade_reading(&entry(), "예상하다", &[], &["예상하다".into()]).decision, GradeDecision::Fail);
     }
 
     #[test]
     fn multiple_meanings_require_all_answers_but_ignore_order() {
         let mut value = entry();
         value.meanings = vec!["걸다".into(), "전화하다".into(), "시간을 들이다".into()];
-        assert_eq!(grade_recognition_deterministic(&value, "시간을 들이다 / 걸다 / 전화하다", &[], &[]).unwrap().decision, GradeDecision::Pass);
-        assert_eq!(grade_recognition_deterministic(&value, "걸다 / 전화하다", &[], &[]).unwrap().decision, GradeDecision::Fail);
+        assert_eq!(grade_reading_deterministic(&value, "시간을 들이다 / 걸다 / 전화하다", &[], &[]).unwrap().decision, GradeDecision::Pass);
+        assert_eq!(grade_reading_deterministic(&value, "걸다 / 전화하다", &[], &[]).unwrap().decision, GradeDecision::Fail);
     }
 
     #[test]
-    fn recognition_answer_separator_supports_safe_space_fallback() {
-        assert_eq!(split_recognition_answer("걸다, 전화하다", 2), vec!["걸다", "전화하다"]);
-        assert_eq!(split_recognition_answer("걸다　전화하다", 2), vec!["걸다", "전화하다"]);
-        assert_eq!(split_recognition_answer("걸다 전화하다", 2), vec!["걸다", "전화하다"]);
-        assert_eq!(split_recognition_answer("전화를 걸다 시간을 들이다", 2), vec!["전화를 걸다 시간을 들이다"]);
+    fn reading_answer_separator_supports_safe_space_fallback() {
+        assert_eq!(split_reading_answer("걸다, 전화하다", 2), vec!["걸다", "전화하다"]);
+        assert_eq!(split_reading_answer("걸다　전화하다", 2), vec!["걸다", "전화하다"]);
+        assert_eq!(split_reading_answer("걸다 전화하다", 2), vec!["걸다", "전화하다"]);
+        assert_eq!(split_reading_answer("전화를 걸다 시간을 들이다", 2), vec!["전화를 걸다 시간을 들이다"]);
     }
 
     #[test]
-    fn production_is_target_form_not_semantic_equivalent() {
+    fn writing_is_target_form_not_semantic_equivalent() {
         assert_eq!(grade_form(&entry(), "予想する", false).decision, GradeDecision::Fail);
         assert_eq!(grade_form(&entry(), "みすえる", false).decision, GradeDecision::Pass);
         assert_eq!(grade_form(&entry(), "ミスエル", false).decision, GradeDecision::Pass);

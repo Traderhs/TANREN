@@ -2,15 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import type { StudyCard, SubmitResult } from "./types";
 import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, setPitchLevel, shouldAutoPlayAfterWrittenAnswer } from "./studyFlow";
 
-const card = (id = "entry:recognition"): StudyCard => ({
-  entry_id: "entry", variant_id: id, mode: "recognition", question: "問",
+const card = (id = "entry:reading"): StudyCard => ({
+  entry_id: "entry", variant_id: id, mode: "reading", question: "問",
   answer_language: "ko-KR", remaining: 1, total: 1, stage_label: "0~1",
   recall_timeout_ms: 3000,
 });
 
 const result = (status: SubmitResult["status"], extra: Partial<SubmitResult> = {}): SubmitResult => ({ status, ...extra });
 
-describe("production study user actions", () => {
+describe("writing study user actions", () => {
   it("keeps the submitted card through ambiguous accept and reject actions", () => {
     const ambiguous = result("ambiguous", { card: card() });
     expect(cardAfterResult(card(), ambiguous)).toEqual(card());
@@ -31,7 +31,7 @@ describe("production study user actions", () => {
     expect(cardAfterResult(card(), cleared)).toBeNull();
     expect(enterAction(cleared)).toBe("stage");
     expect(activeCardTimerRuns(null, cleared)).toBe(false);
-    const next = card("next:recognition");
+    const next = card("next:reading");
     expect(cardAfterResult(null, result("pass", { card: next }))).toBe(next);
   });
 
@@ -51,8 +51,8 @@ describe("production study user actions", () => {
   });
 
   it("auto-plays pronunciation after Korean and Japanese written answers only", () => {
-    expect(shouldAutoPlayAfterWrittenAnswer("recognition")).toBe(true);
-    expect(shouldAutoPlayAfterWrittenAnswer("production")).toBe(true);
+    expect(shouldAutoPlayAfterWrittenAnswer("reading")).toBe(true);
+    expect(shouldAutoPlayAfterWrittenAnswer("writing")).toBe(true);
     expect(shouldAutoPlayAfterWrittenAnswer("listening")).toBe(false);
   });
 

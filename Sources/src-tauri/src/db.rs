@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, path::{Path, PathBuf}};
+use std::{collections::{BTreeMap, HashMap, HashSet}, fs, path::{Path, PathBuf}};
 
 use chrono::Utc;
 use rusqlite::{params, params_from_iter, types::{Value as SqlValue, ValueRef}, Connection, OptionalExtension, Transaction};
@@ -6,10 +6,76 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    model::{AudioAssetDraft, DeckRecord, DeckStats, DeckSummary, EntryDraft, EntryRecord, ImportResult, PitchConfidence, PitchQuestion, RecallTimeoutByMode, StudyMode},
+    model::{AudioAssetDraft, DeckRecord, DeckStats, DeckSummary, EntryDraft, EntryRecord, ImportResult, LibraryDeckStats, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, RecallTimeoutByMode, StudyMode},
     study::{study_ranges, StudySession},
     timers::TypingProfileState,
 };
+
+#[derive(Default)]
+struct StatsAggregate {
+    attempts: usize,
+    base_correct: usize,
+    pitch_attempts: usize,
+    pitch_correct: usize,
+    joint_correct: usize,
+    recall_latencies: Vec<u64>,
+    last_practiced_at: Option<String>,
+}
+
+impl StatsAggregate {
+    fn record(&mut self, base_correct: bool, pitch_correct: Option<bool>, joint_correct: bool, recall_latency_ms: u64, timestamp: &str) {
+        self.attempts += 1;
+        self.base_correct += usize::from(base_correct);
+        self.joint_correct += usize::from(joint_correct);
+        if let Some(correct) = pitch_correct {
+            self.pitch_attempts += 1;
+            self.pitch_correct += usize::from(correct);
+        }
+        self.recall_latencies.push(recall_latency_ms);
+        if self.last_practiced_at.as_deref().is_none_or(|latest| timestamp > latest) {
+            self.last_practiced_at = Some(timestamp.to_string());
+        }
+    }
+
+    fn median_recall_latency_ms(&self) -> Option<u64> {
+        if self.recall_latencies.is_empty() { return None; }
+        let mut values = self.recall_latencies.clone();
+        values.sort_unstable();
+        Some(values[values.len() / 2])
+    }
+
+    fn deck_stats(&self, mode: StudyMode) -> DeckStats {
+        DeckStats {
+            mode,
+            base_accuracy: ratio(self.base_correct, self.attempts),
+            pitch_accuracy: ratio(self.pitch_correct, self.pitch_attempts),
+            joint_accuracy: ratio(self.joint_correct, self.attempts),
+            median_recall_latency_ms: self.median_recall_latency_ms(),
+            attempts: self.attempts,
+        }
+    }
+}
+
+fn history_mode_points(
+    by_mode: &HashMap<StudyMode, StatsAggregate>,
+    seen_entries_by_mode: &HashMap<StudyMode, HashSet<String>>,
+) -> HashMap<StudyMode, LibraryStatsModePoint> {
+    [StudyMode::Reading, StudyMode::Listening, StudyMode::Writing]
+        .into_iter()
+        .map(|mode| {
+            let stats = by_mode.get(&mode);
+            let point = LibraryStatsModePoint {
+                attempts: stats.map_or(0, |value| value.attempts),
+                seen_entry_count: seen_entries_by_mode.get(&mode).map_or(0, HashSet::len),
+                base_accuracy: stats.and_then(|value| ratio(value.base_correct, value.attempts)),
+                pitch_accuracy: stats.and_then(|value| ratio(value.pitch_correct, value.pitch_attempts)),
+                median_recall_latency_ms: stats.and_then(StatsAggregate::median_recall_latency_ms),
+                study_time_ms: 0,
+            };
+            (mode, point)
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -62,7 +128,7 @@ impl Database {
               enabled_modes TEXT NOT NULL,
               increment_size INTEGER NOT NULL DEFAULT 50,
               checkpoint_size INTEGER NOT NULL DEFAULT 300,
-              recall_timeout_by_mode TEXT NOT NULL DEFAULT '{"recognition":3000,"listening":3000,"production":3000}',
+              recall_timeout_by_mode TEXT NOT NULL DEFAULT '{"reading":3000,"listening":3000,"writing":3000}',
               adaptive_completion_timer_enabled INTEGER NOT NULL DEFAULT 1,
               pitch_policy TEXT NOT NULL DEFAULT 'verified_only',
               strict_orthography INTEGER NOT NULL DEFAULT 0,
@@ -159,6 +225,16 @@ impl Database {
               started_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               device_id TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS study_activity (
+              date TEXT NOT NULL,
+              deck_id TEXT NOT NULL REFERENCES decks(id),
+              mode TEXT NOT NULL,
+              duration_ms INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL,
+              device_id TEXT NOT NULL,
+              PRIMARY KEY(date, deck_id, mode, device_id)
             );
 
             CREATE TABLE IF NOT EXISTS stage_states (
@@ -417,7 +493,7 @@ impl Database {
         let mut conn = self.conn()?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let id = Uuid::new_v4().to_string();
-        let modes = serde_json::to_string(&vec![StudyMode::Recognition, StudyMode::Listening, StudyMode::Production]).unwrap();
+        let modes = serde_json::to_string(&vec![StudyMode::Reading, StudyMode::Listening, StudyMode::Writing]).unwrap();
         let timestamp = now();
         tx.execute(
             "INSERT INTO decks(id,name,source_language,target_language,enabled_modes,created_at,updated_at,device_id) VALUES(?1,?2,?3,?4,?5,?6,?6,?7)",
@@ -425,7 +501,7 @@ impl Database {
         ).map_err(|e| e.to_string())?;
         journal(&tx, &id, "deck", &self.device_id, 1, "insert", &serde_json::json!({"name":name}))?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(DeckSummary { id, name: name.into(), source_language: source_language.into(), target_language: target_language.into(), enabled_modes: vec![StudyMode::Recognition,StudyMode::Listening,StudyMode::Production], entry_count: 0, current_round: 1, active_stage: None, study_ranges: Vec::new(), completed_range_count: 0 })
+        Ok(DeckSummary { id, name: name.into(), source_language: source_language.into(), target_language: target_language.into(), enabled_modes: vec![StudyMode::Reading,StudyMode::Listening,StudyMode::Writing], entry_count: 0, current_round: 1, active_stage: None, study_ranges: Vec::new(), completed_range_count: 0 })
     }
 
     pub fn setting(&self, key: &str) -> Result<Option<String>, String> {
@@ -650,6 +726,19 @@ impl Database {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    pub fn record_study_activity(&self, deck_id: &str, mode: Option<StudyMode>, duration_ms: u64) -> Result<(), String> {
+        if duration_ms == 0 { return Ok(()); }
+        let conn = self.conn()?;
+        let timestamp = now();
+        let date = timestamp.get(..10).unwrap_or(timestamp.as_str());
+        let mode = mode.map(StudyMode::as_str).unwrap_or("all");
+        conn.execute(
+            "INSERT INTO study_activity(date,deck_id,mode,duration_ms,updated_at,device_id) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(date,deck_id,mode,device_id) DO UPDATE SET duration_ms=study_activity.duration_ms+excluded.duration_ms,updated_at=excluded.updated_at",
+            params![date, deck_id, mode, duration_ms as i64, timestamp, self.device_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn load_session(&self, deck_id: &str) -> Result<Option<StudySession>, String> {
         let conn = self.conn()?;
         let state: Option<String> = conn.query_row("SELECT state_json FROM stage_states WHERE deck_id=?1",[deck_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
@@ -730,7 +819,7 @@ impl Database {
     pub fn stats(&self, deck_id:&str)->Result<Vec<DeckStats>,String>{
         let conn=self.conn()?;
         let mut output=Vec::new();
-        for mode in [StudyMode::Recognition,StudyMode::Listening,StudyMode::Production]{
+        for mode in [StudyMode::Reading,StudyMode::Listening,StudyMode::Writing]{
             let mut stmt=conn.prepare("SELECT base_correct,pitch_correct,joint_correct,recall_latency_ms FROM attempts WHERE deck_id=?1 AND variant=?2").map_err(|e|e.to_string())?;
             let rows=stmt.query_map(params![deck_id,mode.as_str()],|r|Ok((r.get::<_,i64>(0)?!=0,r.get::<_,Option<i64>>(1)?.map(|v|v!=0),r.get::<_,i64>(2)?!=0,r.get::<_,i64>(3)? as u64))).map_err(|e|e.to_string())?;
             let data=rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
@@ -744,6 +833,186 @@ impl Database {
             output.push(DeckStats{mode,base_accuracy,pitch_accuracy,joint_accuracy,median_recall_latency_ms:median,attempts});
         }
         Ok(output)
+    }
+
+    pub fn library_stats(&self) -> Result<LibraryStats, String> {
+        let conn = self.conn()?;
+        let decks = {
+            let mut stmt = conn.prepare(
+                "SELECT d.id,d.name,COUNT(e.id),d.current_round FROM decks d LEFT JOIN entries e ON e.deck_id=d.id AND e.deleted_at IS NULL WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.created_at",
+            ).map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as u32,
+            ))).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+
+        let mut overall = StatsAggregate::default();
+        let mut by_mode: HashMap<StudyMode, StatsAggregate> = HashMap::new();
+        let mut by_deck: HashMap<String, StatsAggregate> = decks.iter()
+            .map(|(id, _, _, _)| (id.clone(), StatsAggregate::default()))
+            .collect();
+        let mut seen_entries = HashSet::new();
+        let mut seen_entries_by_mode: HashMap<StudyMode, HashSet<String>> = HashMap::new();
+        let mut history = Vec::new();
+        let mut history_date: Option<String> = None;
+
+        let mut stmt = conn.prepare(
+            "SELECT a.deck_id,a.entry_id,a.variant,a.base_correct,a.pitch_correct,a.joint_correct,a.recall_latency_ms,a.timestamp FROM attempts a JOIN decks d ON d.id=a.deck_id WHERE d.deleted_at IS NULL ORDER BY a.timestamp,a.id",
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |row| Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)? != 0,
+            row.get::<_, Option<i64>>(4)?.map(|value| value != 0),
+            row.get::<_, i64>(5)? != 0,
+            row.get::<_, i64>(6)? as u64,
+            row.get::<_, String>(7)?,
+        ))).map_err(|e| e.to_string())?;
+
+        for row in rows {
+            let (deck_id, entry_id, variant, base_correct, pitch_correct, joint_correct, recall_latency_ms, timestamp) = row.map_err(|e| e.to_string())?;
+            let date = timestamp.get(..10).unwrap_or(timestamp.as_str()).to_string();
+            if history_date.as_deref().is_some_and(|previous| previous != date) {
+                history.push(LibraryStatsPoint {
+                    date: history_date.take().unwrap(),
+                    attempts: overall.attempts,
+                    seen_entry_count: seen_entries.len(),
+                    base_accuracy: ratio(overall.base_correct, overall.attempts),
+                    pitch_accuracy: ratio(overall.pitch_correct, overall.pitch_attempts),
+                    median_recall_latency_ms: overall.median_recall_latency_ms(),
+                    study_time_ms: 0,
+                    modes: history_mode_points(&by_mode, &seen_entries_by_mode),
+                });
+            }
+            history_date = Some(date);
+            let mode = match variant.as_str() {
+                "reading" => StudyMode::Reading,
+                "listening" => StudyMode::Listening,
+                "writing" => StudyMode::Writing,
+                _ => continue,
+            };
+            seen_entries.insert(entry_id.clone());
+            seen_entries_by_mode.entry(mode).or_default().insert(entry_id);
+            overall.record(base_correct, pitch_correct, joint_correct, recall_latency_ms, &timestamp);
+            by_mode.entry(mode).or_default().record(base_correct, pitch_correct, joint_correct, recall_latency_ms, &timestamp);
+            if let Some(deck) = by_deck.get_mut(&deck_id) {
+                deck.record(base_correct, pitch_correct, joint_correct, recall_latency_ms, &timestamp);
+            }
+        }
+        if let Some(date) = history_date {
+            history.push(LibraryStatsPoint {
+                date,
+                attempts: overall.attempts,
+                seen_entry_count: seen_entries.len(),
+                base_accuracy: ratio(overall.base_correct, overall.attempts),
+                pitch_accuracy: ratio(overall.pitch_correct, overall.pitch_attempts),
+                median_recall_latency_ms: overall.median_recall_latency_ms(),
+                study_time_ms: 0,
+                modes: history_mode_points(&by_mode, &seen_entries_by_mode),
+            });
+        }
+
+        let mut activity_by_date: BTreeMap<String, HashMap<String, u64>> = BTreeMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT s.date,s.mode,SUM(s.duration_ms) FROM study_activity s JOIN decks d ON d.id=s.deck_id WHERE d.deleted_at IS NULL GROUP BY s.date,s.mode ORDER BY s.date",
+            ).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+            ))).map_err(|e| e.to_string())?;
+            for row in rows {
+                let (date, mode, duration_ms) = row.map_err(|e| e.to_string())?;
+                *activity_by_date.entry(date).or_default().entry(mode).or_default() += duration_ms;
+            }
+        }
+
+        let mut attempt_history = history.into_iter().map(|point| (point.date.clone(), point)).collect::<BTreeMap<_, _>>();
+        let mut dates = BTreeMap::<String, ()>::new();
+        dates.extend(attempt_history.keys().cloned().map(|date| (date, ())));
+        dates.extend(activity_by_date.keys().cloned().map(|date| (date, ())));
+        let mut history = Vec::with_capacity(dates.len());
+        let mut last_attempt_point: Option<LibraryStatsPoint> = None;
+        let mut cumulative_study_time_ms = 0u64;
+        let mut cumulative_mode_study_time: HashMap<StudyMode, u64> = HashMap::new();
+        for date in dates.into_keys() {
+            if let Some(point) = attempt_history.remove(&date) {
+                last_attempt_point = Some(point);
+            }
+            if let Some(activity) = activity_by_date.get(&date) {
+                for (mode, duration_ms) in activity {
+                    cumulative_study_time_ms += *duration_ms;
+                    let parsed_mode = match mode.as_str() {
+                        "reading" => Some(StudyMode::Reading),
+                        "listening" => Some(StudyMode::Listening),
+                        "writing" => Some(StudyMode::Writing),
+                        _ => None,
+                    };
+                    if let Some(parsed_mode) = parsed_mode {
+                        *cumulative_mode_study_time.entry(parsed_mode).or_default() += *duration_ms;
+                    }
+                }
+            }
+            let mut point = last_attempt_point.clone().unwrap_or_else(|| LibraryStatsPoint {
+                date: date.clone(),
+                attempts: 0,
+                seen_entry_count: 0,
+                base_accuracy: None,
+                pitch_accuracy: None,
+                median_recall_latency_ms: None,
+                study_time_ms: 0,
+                modes: history_mode_points(&HashMap::new(), &HashMap::new()),
+            });
+            point.date = date;
+            point.study_time_ms = cumulative_study_time_ms;
+            for mode in [StudyMode::Reading, StudyMode::Listening, StudyMode::Writing] {
+                if let Some(mode_point) = point.modes.get_mut(&mode) {
+                    mode_point.study_time_ms = cumulative_mode_study_time.get(&mode).copied().unwrap_or(0);
+                }
+            }
+            history.push(point);
+        }
+
+        let mode_stats = [StudyMode::Reading, StudyMode::Listening, StudyMode::Writing]
+            .into_iter()
+            .map(|mode| by_mode.remove(&mode).unwrap_or_default().deck_stats(mode))
+            .collect();
+        let mut deck_stats = decks.into_iter().map(|(deck_id, deck_name, entry_count, current_round)| {
+            let stats = by_deck.remove(&deck_id).unwrap_or_default();
+            LibraryDeckStats {
+                deck_id,
+                deck_name,
+                entry_count,
+                current_round,
+                attempts: stats.attempts,
+                base_accuracy: ratio(stats.base_correct, stats.attempts),
+                joint_accuracy: ratio(stats.joint_correct, stats.attempts),
+                median_recall_latency_ms: stats.median_recall_latency_ms(),
+                last_practiced_at: stats.last_practiced_at,
+            }
+        }).collect::<Vec<_>>();
+        deck_stats.sort_by(|left, right| right.last_practiced_at.cmp(&left.last_practiced_at).then_with(|| left.deck_name.cmp(&right.deck_name)));
+
+        Ok(LibraryStats {
+            deck_count: deck_stats.len(),
+            active_deck_count: deck_stats.iter().filter(|deck| deck.attempts > 0).count(),
+            entry_count: deck_stats.iter().map(|deck| deck.entry_count).sum(),
+            seen_entry_count: seen_entries.len(),
+            attempts: overall.attempts,
+            base_accuracy: ratio(overall.base_correct, overall.attempts),
+            pitch_accuracy: ratio(overall.pitch_correct, overall.pitch_attempts),
+            joint_accuracy: ratio(overall.joint_correct, overall.attempts),
+            median_recall_latency_ms: overall.median_recall_latency_ms(),
+            study_time_ms: cumulative_study_time_ms,
+            mode_stats,
+            deck_stats,
+            history,
+        })
     }
 
     pub fn set_entry_analysis(&self, entry_id:&str, reading:Option<&str>, analysis_json:&serde_json::Value, provider:&str, source:&str, confidence:&str, model_version:Option<&str>, pitch_patterns:Option<&[Vec<u8>]>, scope:&str, audio:&[AudioAssetDraft]) -> Result<(),String>{
@@ -950,6 +1219,47 @@ mod tests{
     }
 
     #[test]
+    fn library_stats_aggregate_every_deck_and_keep_inactive_decks_visible() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let reading_deck = db.create_deck("Reading", "ko-KR", "ja-JP").unwrap();
+        let listening_deck = db.create_deck("Listening", "ko-KR", "ja-JP").unwrap();
+        db.create_deck("Not started", "ko-KR", "ja-JP").unwrap();
+        let draft = EntryDraft { term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()) };
+        db.import_entries(&reading_deck.id, "ja-JP", &[draft.clone()]).unwrap();
+        db.import_entries(&listening_deck.id, "ja-JP", &[draft]).unwrap();
+        let reading_entry = db.entries(&reading_deck.id).unwrap().remove(0);
+        let listening_entry = db.entries(&listening_deck.id).unwrap().remove(0);
+        db.insert_attempt(&reading_entry.id, &reading_deck.id, StudyMode::Reading, 1, "0~1", "고양이", true, Some(true), true, "exact", None, 400, 100, None).unwrap();
+        db.insert_attempt(&listening_entry.id, &listening_deck.id, StudyMode::Listening, 1, "0~1", "猫", false, Some(false), false, "exact", None, 800, 100, None).unwrap();
+        db.record_study_activity(&reading_deck.id, Some(StudyMode::Reading), 2_500).unwrap();
+        db.record_study_activity(&listening_deck.id, Some(StudyMode::Listening), 3_500).unwrap();
+        db.record_study_activity(&reading_deck.id, None, 500).unwrap();
+
+        let stats = db.library_stats().unwrap();
+        assert_eq!(stats.deck_count, 3);
+        assert_eq!(stats.active_deck_count, 2);
+        assert_eq!(stats.entry_count, 2);
+        assert_eq!(stats.seen_entry_count, 2);
+        assert_eq!(stats.attempts, 2);
+        assert_eq!(stats.base_accuracy, Some(0.5));
+        assert_eq!(stats.pitch_accuracy, Some(0.5));
+        assert_eq!(stats.joint_accuracy, Some(0.5));
+        assert_eq!(stats.median_recall_latency_ms, Some(800));
+        assert_eq!(stats.study_time_ms, 6_500);
+        assert_eq!(stats.history.last().map(|point| point.attempts), Some(2));
+        assert_eq!(stats.history.last().map(|point| point.seen_entry_count), Some(2));
+        assert_eq!(stats.history.last().map(|point| point.study_time_ms), Some(6_500));
+        let latest_history = stats.history.last().unwrap();
+        assert_eq!(latest_history.modes.get(&StudyMode::Reading).map(|point| (point.attempts, point.seen_entry_count, point.base_accuracy)), Some((1, 1, Some(1.0))));
+        assert_eq!(latest_history.modes.get(&StudyMode::Listening).map(|point| (point.attempts, point.seen_entry_count, point.base_accuracy)), Some((1, 1, Some(0.0))));
+        assert_eq!(latest_history.modes.get(&StudyMode::Reading).map(|point| point.study_time_ms), Some(2_500));
+        assert_eq!(latest_history.modes.get(&StudyMode::Listening).map(|point| point.study_time_ms), Some(3_500));
+        assert_eq!(stats.mode_stats.iter().map(|mode| mode.attempts).collect::<Vec<_>>(), vec![1, 1, 0]);
+        assert_eq!(stats.deck_stats.iter().filter(|deck| deck.attempts == 0).count(), 1);
+    }
+
+    #[test]
     fn portable_export_roundtrips_deck_entries_aliases_progress_attempts_and_enrichment() {
         let source_dir = tempdir().unwrap();
         let source = Database::open(source_dir.path().join("source.db")).unwrap();
@@ -957,8 +1267,8 @@ mod tests{
         source.import_entries(&deck.id, "ja-JP", &[EntryDraft { term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()) }]).unwrap();
         let entry = source.entries(&deck.id).unwrap().remove(0);
         source.set_alias(&entry.id, "냥이", true).unwrap();
-        source.insert_attempt(&entry.id, &deck.id, StudyMode::Recognition, 1, "0~1", "고양이", true, None, true, "exact", None, 500, 200, None).unwrap();
-        let session = StudySession::new(deck.id.clone(), 1, &[entry.clone()], &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~1", "고양이", true, None, true, "exact", None, 500, 200, None).unwrap();
+        let session = StudySession::new(deck.id.clone(), 1, &[entry.clone()], &[StudyMode::Reading], 50, 300, 1).unwrap();
         source.save_session(&session).unwrap();
         source.set_entry_analysis(&entry.id, Some("ねこ"), &serde_json::json!({"scope":"lexical","morae":["ね","こ"]}), "fixture", "fixture", "VERIFIED", Some("1"), Some(&[vec![1,0]]), "lexical", &[]).unwrap();
 
@@ -986,12 +1296,12 @@ mod tests{
         let deck = db.create_deck("timers", "ko-KR", "ja-JP").unwrap();
         db.conn().unwrap().execute(
             "UPDATE decks SET recall_timeout_by_mode=?1, adaptive_completion_timer_enabled=0 WHERE id=?2",
-            params![r#"{"recognition":2100,"listening":3200,"production":4300}"#, deck.id],
+            params![r#"{"reading":2100,"listening":3200,"writing":4300}"#, deck.id],
         ).unwrap();
         let loaded = db.deck(&deck.id).unwrap();
-        assert_eq!(loaded.recall_timeout_by_mode.for_mode(StudyMode::Recognition), 2_100);
+        assert_eq!(loaded.recall_timeout_by_mode.for_mode(StudyMode::Reading), 2_100);
         assert_eq!(loaded.recall_timeout_by_mode.for_mode(StudyMode::Listening), 3_200);
-        assert_eq!(loaded.recall_timeout_by_mode.for_mode(StudyMode::Production), 4_300);
+        assert_eq!(loaded.recall_timeout_by_mode.for_mode(StudyMode::Writing), 4_300);
         assert!(!loaded.adaptive_completion_timer_enabled);
     }
 

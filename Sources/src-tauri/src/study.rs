@@ -240,14 +240,14 @@ mod tests {
     #[test]
     fn session_can_start_from_an_explicit_range() {
         let values = entries(600);
-        let session = StudySession::new_at_stage("deck".into(), 1, &values, &[StudyMode::Recognition], 50, 300, 7, 1).unwrap();
+        let session = StudySession::new_at_stage("deck".into(), 1, &values, &[StudyMode::Reading], 50, 300, 7, 1).unwrap();
         assert_eq!(session.stage().label(), "300~400");
         assert_eq!(session.stage_total, 100);
     }
 
     #[test]
     fn failed_variant_stays_and_pass_removes_only_current_stage() {
-        let v = VariantKey { entry_id: "a".into(), mode: StudyMode::Recognition };
+        let v = VariantKey { entry_id: "a".into(), mode: StudyMode::Reading };
         let mut q = QueueState::new(vec![v.clone()], 1);
         let pulled = q.pop_next(10).unwrap();
         q.mark_fail(&pulled);
@@ -260,7 +260,7 @@ mod tests {
     fn same_entry_modes_do_not_have_to_clump() {
         let mut variants = Vec::new();
         for i in 0..20 {
-            for mode in [StudyMode::Recognition, StudyMode::Listening, StudyMode::Production] {
+            for mode in [StudyMode::Reading, StudyMode::Listening, StudyMode::Writing] {
                 variants.push(VariantKey { entry_id: format!("e{i}"), mode });
             }
         }
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn pass_review_then_exit_does_not_restore_variant() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         session.resolve_current(&variant, true).unwrap();
         session.recover_interrupted_card();
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn fail_review_then_exit_keeps_variant_required() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         session.resolve_current(&variant, false).unwrap();
         session.recover_interrupted_card();
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn unresolved_exit_and_restart_do_not_lose_variant() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         let persisted = serde_json::to_string(&session).unwrap();
         let mut restarted: StudySession = serde_json::from_str(&persisted).unwrap();
@@ -314,11 +314,11 @@ mod tests {
     #[test]
     fn stage_advance_does_not_consume_next_stage_card() {
         let values = entries(51);
-        let mut session = StudySession::new("deck".into(), 1, &values, &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &values, &[StudyMode::Reading], 50, 300, 1).unwrap();
         while let Some(variant) = session.next_variant(10) {
             session.resolve_current(&variant, true).unwrap();
         }
-        assert!(session.advance_stage(&values, &[StudyMode::Recognition], 2));
+        assert!(session.advance_stage(&values, &[StudyMode::Reading], 2));
         assert!(session.current.is_none());
         assert_eq!(session.queue.queue.len(), session.stage_total);
         assert_eq!(session.queue.remaining_count(), session.stage_total);
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn completed_round_has_no_active_card() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         session.resolve_current(&variant, true).unwrap();
         assert!(session.current.is_none());
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn pitch_review_then_exit_preserves_the_pitch_outcome() {
         for passed in [true, false] {
-            let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+            let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
             let variant = session.next_variant(10).unwrap();
             session.resolve_current(&variant, passed).unwrap();
             session.recover_interrupted_card();
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn pitch_failure_reappears_from_the_base_question_not_pitch_pending_state() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         session.resolve_current(&variant, false).unwrap();
         session.pending = Some(PendingState::Review {
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn restart_roundtrips_each_non_terminal_pending_state() {
-        let mut active = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Recognition], 50, 300, 1).unwrap();
+        let mut active = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
         let variant = active.next_variant(10).unwrap();
 
         active.pending = Some(PendingState::Ambiguous {
