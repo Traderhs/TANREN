@@ -718,6 +718,29 @@ fn configured_semantic_home(db: &Database, app_data: &Path) -> Result<PathBuf, S
     Ok(std::env::var_os("TANREN_SEMANTIC_HOME").map(PathBuf::from).unwrap_or_else(|| app_data.join("semantic")))
 }
 
+fn migrate_audio_storage(db: &Database, old_root: &Path, new_root: &Path) -> Result<(), String> {
+    if old_root == new_root || !old_root.exists() { return Ok(()); }
+    copy_directory_contents(old_root, new_root)?;
+    db.relocate_audio_paths(old_root, new_root)?;
+    let _ = std::fs::remove_dir_all(old_root);
+    Ok(())
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_directory_contents(&source_path, &destination_path)?;
+        } else {
+            std::fs::copy(&source_path, &destination_path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn storage_settings_snapshot(state: &AppState) -> Result<StorageSettings, String> {
     let selected = state.db.setting(SEMANTIC_STORAGE_SETTING)?.filter(|value| !value.trim().is_empty());
     let requested = selected.as_ref().map(PathBuf::from)
@@ -789,7 +812,10 @@ pub fn run() {
             let default_semantic_home = app_data.join("semantic");
             let semantic_home = configured_semantic_home(&db, &app_data)?;
             let voicevox = VoicevoxRuntime::install(semantic_home.join("voicevox"));
-            let analyzer = JapaneseAnalyzer::install(app.handle().clone(), &app_data, app_data.join("audio"), Arc::clone(&voicevox))?;
+            let audio_dir = semantic_home.join("audio");
+            migrate_audio_storage(&db, &app_data.join("audio"), &audio_dir)?;
+            app.asset_protocol_scope().allow_directory(&audio_dir, true).map_err(|e| e.to_string())?;
+            let analyzer = JapaneseAnalyzer::install(app.handle().clone(), &app_data, audio_dir, Arc::clone(&voicevox))?;
             let semantic_backend = LlamaCppEmbeddingBackend::install(semantic_home.clone());
             let semantic = Arc::new(SemanticGrader::new(semantic_backend, db.clone(), SemanticThresholds::configured()));
             let enrichment_running = Arc::new(AtomicBool::new(false));
