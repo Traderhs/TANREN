@@ -23,6 +23,7 @@
 html, body, #root { min-height: 100%; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--bg); color: var(--text); }
 button, input, textarea { font: inherit; }
+input, textarea { font-family: var(--font-ui); }
 button { border: 0; color: inherit; cursor: pointer; }
 button:disabled { opacity: .32; cursor: default; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid #e8c983; outline-offset: 3px; }
@@ -225,7 +226,7 @@ input:focus, textarea:focus { border-color: #69717b; }
 .mode-options label { display: flex; gap: 7px; align-items: center; }
 .mode-options input { accent-color: var(--brand); }
 .danger { color: #e68a8f !important; }
-.bulk-input { width: 100%; min-height: 390px; padding: 18px; margin: 18px 0 12px; resize: vertical; background: #0c0f12; line-height: 1.7; font-family: "Cascadia Code", Consolas, monospace; font-size: 13px; }
+.bulk-input { width: 100%; min-height: 390px; padding: 18px; margin: 18px 0 12px; resize: vertical; background: #0c0f12; line-height: 1.7; font-family: var(--font-ui); font-size: 13px; }
 .editor-footer { margin-top: 34px; padding-top: 16px; }
 .error { width: min(1160px, calc(100% - 64px)); margin: 18px auto 0; padding: 11px 14px; border-left: 3px solid var(--incorrect); background: #241417; color: #ffb4b8; font-size: 12px; }
 
@@ -854,6 +855,7 @@ input:focus, textarea:focus {
   margin: 0 auto;
   padding: 14px 6px 16px;
   border-bottom: 2px solid rgba(255,255,255,.19);
+  font-family: var(--font-jp);
   cursor: text;
   transition: border-color .12s ease, color .12s ease;
 }
