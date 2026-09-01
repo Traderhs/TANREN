@@ -470,17 +470,26 @@ body::before {
 }
 
 button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button) {
-  min-height: 40px;
-  border: 1px solid rgba(234,195,119,.48);
-  border-radius: 11px;
-  background: linear-gradient(180deg, #dcb666, #b9883a);
-  color: #17130d;
-  font-weight: 760;
-  box-shadow: inset 0 1px rgba(255,255,255,.28), 0 8px 26px rgba(0,0,0,.16);
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 6px;
+  background: transparent;
+  color: #aaa9a4;
+  font-size: 13px;
+  font-weight: 650;
+  box-shadow: none;
+  transition: transform .06s ease, border-color .08s ease, color .08s ease, background-color .08s ease;
 }
 button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):hover {
-  background: linear-gradient(180deg, #e7c57b, #c79746);
-  border-color: rgba(246,215,151,.62);
+  border-color: rgba(255,255,255,.24);
+  background: rgba(255,255,255,.025);
+  color: #eceae4;
+}
+button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):not(:disabled):active {
+  border-color: rgba(238,207,143,.36);
+  background: rgba(216,173,92,.10);
+  color: #e6c983;
 }
 button.secondary {
   border-color: rgba(255,255,255,.12) !important;
@@ -500,6 +509,12 @@ input, textarea {
   border-radius: 11px;
   background: rgba(8,9,10,.45);
   box-shadow: inset 0 1px rgba(255,255,255,.02);
+  transition: border-color .06s ease, background-color .06s ease, box-shadow .06s ease;
+}
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):hover:not(:focus),
+textarea:hover:not(:focus) {
+  border-color: rgba(255,255,255,.22);
+  background: rgba(12,13,14,.56);
 }
 input:focus, textarea:focus {
   border-color: rgba(219,178,99,.56);
@@ -2126,11 +2141,17 @@ input:focus, textarea:focus {
   border-radius: 8px !important;
   background: rgba(216,173,92,.08) !important;
   color: #d9ae56 !important;
-  font-size: 26px;
+  font-size: 0;
   font-weight: 400 !important;
   line-height: 1;
   box-shadow: none !important;
   backdrop-filter: none;
+}
+.home-create .add-deck-button > span {
+  display: block;
+  font-size: 26px;
+  font-weight: 400;
+  line-height: .8;
 }
 .home-create .add-deck-button:hover:not(:disabled) {
   border-color: rgba(216,173,92,.55) !important;
@@ -2861,6 +2882,12 @@ input:focus, textarea:focus {
   border-color: rgba(255,255,255,.24) !important;
   background: rgba(255,255,255,.025) !important;
   color: #eceae4 !important;
+  transform: none !important;
+}
+.settings-action-button:not(:disabled):active {
+  border-color: rgba(238,207,143,.36) !important;
+  background: rgba(216,173,92,.10) !important;
+  color: #e6c983 !important;
   transform: none !important;
 }
 .settings-control-list { gap: 0; }

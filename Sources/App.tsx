@@ -811,7 +811,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
             placeholder="책 이름을 입력해주세요"
             aria-label="책 이름"
           />
-          <button className="add-deck-button" type="submit" aria-label="책 추가" title="책 추가" disabled={!name.trim()}>+</button>
+          <button className="add-deck-button" type="submit" aria-label="책 추가" title="책 추가" disabled={!name.trim()}><span aria-hidden="true">+</span></button>
           {createError && <p className="home-create-error">{createError}</p>}
         </form>
         {Array.from({ length: Math.ceil(decks.length / 5) }, (_, rowIndex) => (
