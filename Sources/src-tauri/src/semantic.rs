@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::{
     db::Database,
-    grading::{grade_recognition_deterministic, normalize_generic},
+    grading::{grade_recognition_deterministic, normalize_generic, split_recognition_answer},
     model::{EntryRecord, GradeDecision, GradeOutcome},
 };
 
@@ -112,6 +112,10 @@ impl SemanticGrader {
             return outcome;
         }
 
+        if entry.meanings.len() > 1 {
+            return self.grade_multiple_meanings(entry, answer);
+        }
+
         let normalized_answer = normalize_generic(answer);
         if normalized_answer.chars().count() < 2 {
             return GradeOutcome { decision: GradeDecision::Fail, method: "semantic_degenerate", score: Some(0.0) };
@@ -156,6 +160,55 @@ impl SemanticGrader {
         } else {
             GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_embedding", score: Some(best_positive) }
         }
+    }
+
+    fn grade_multiple_meanings(&self, entry: &EntryRecord, answer: &str) -> GradeOutcome {
+        let answers = split_recognition_answer(answer, entry.meanings.len());
+        if answers.len() != entry.meanings.len() {
+            return GradeOutcome { decision: GradeDecision::Fail, method: "meaning_count_mismatch", score: Some(0.0) };
+        }
+
+        let normalized_answers = normalized_unique(answers.iter());
+        if normalized_answers.len() != answers.len() {
+            return GradeOutcome { decision: GradeDecision::Fail, method: "duplicate_meaning_answer", score: Some(0.0) };
+        }
+        if normalized_answers.iter().any(|value| value.chars().count() < 2) {
+            return GradeOutcome { decision: GradeDecision::Fail, method: "semantic_degenerate", score: Some(0.0) };
+        }
+
+        let meanings = normalized_unique(entry.meanings.iter());
+        if meanings.len() != entry.meanings.len() {
+            return GradeOutcome { decision: GradeDecision::Fail, method: "duplicate_canonical_meaning", score: Some(0.0) };
+        }
+        if meanings.iter().any(|value| contains_hangul(value)) && normalized_answers.iter().any(|value| !contains_hangul(value)) {
+            return GradeOutcome { decision: GradeDecision::Fail, method: "semantic_wrong_language", score: Some(0.0) };
+        }
+
+        let answer_requests: Vec<_> = normalized_answers.iter().cloned().map(|value| ("query", value)).collect();
+        let answer_embeddings = match self.embeddings(&answer_requests) {
+            Ok(values) => values,
+            Err(_) => return GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_unavailable", score: None },
+        };
+        let meaning_embeddings = match self.document_embeddings(&meanings) {
+            Ok(values) => values,
+            Err(_) => return GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_unavailable", score: None },
+        };
+
+        let matrix: Vec<Vec<f64>> = answer_embeddings
+            .iter()
+            .map(|answer_embedding| meaning_embeddings.iter().map(|meaning_embedding| cosine(answer_embedding, meaning_embedding)).collect())
+            .collect();
+
+        if let Some(matching) = perfect_matching(&matrix, |score| score >= self.thresholds.pass) {
+            let score = matching_floor(&matrix, &matching);
+            return GradeOutcome { decision: GradeDecision::Pass, method: "semantic_multi_embedding", score: Some(score) };
+        }
+        if let Some(matching) = perfect_matching(&matrix, |score| score > self.thresholds.fail) {
+            let score = matching_floor(&matrix, &matching);
+            return GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_multi_embedding", score: Some(score) };
+        }
+
+        GradeOutcome { decision: GradeDecision::Fail, method: "semantic_multi_embedding", score: Some(best_row_floor(&matrix)) }
     }
 
     pub fn precompute_documents(&self, texts: &[String]) -> Result<(), String> {
@@ -236,6 +289,55 @@ fn normalized_embedding(mut value: Vec<f32>) -> Result<Vec<f32>, String> {
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 { a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum() }
 
+fn perfect_matching(matrix: &[Vec<f64>], allowed: impl Fn(f64) -> bool + Copy) -> Option<Vec<usize>> {
+    fn augment(
+        row: usize,
+        matrix: &[Vec<f64>],
+        seen: &mut [bool],
+        column_to_row: &mut [Option<usize>],
+        allowed: impl Fn(f64) -> bool + Copy,
+    ) -> bool {
+        for column in 0..matrix[row].len() {
+            if seen[column] || !allowed(matrix[row][column]) {
+                continue;
+            }
+            seen[column] = true;
+            if column_to_row[column].is_none_or(|previous_row| augment(previous_row, matrix, seen, column_to_row, allowed)) {
+                column_to_row[column] = Some(row);
+                return true;
+            }
+        }
+        false
+    }
+
+    if matrix.is_empty() || matrix.iter().any(|row| row.len() != matrix.len()) {
+        return None;
+    }
+    let mut column_to_row = vec![None; matrix.len()];
+    for row in 0..matrix.len() {
+        let mut seen = vec![false; matrix.len()];
+        if !augment(row, matrix, &mut seen, &mut column_to_row, allowed) {
+            return None;
+        }
+    }
+    let mut row_to_column = vec![0; matrix.len()];
+    for (column, row) in column_to_row.into_iter().enumerate() {
+        row_to_column[row?] = column;
+    }
+    Some(row_to_column)
+}
+
+fn matching_floor(matrix: &[Vec<f64>], matching: &[usize]) -> f64 {
+    matching.iter().enumerate().map(|(row, &column)| matrix[row][column]).fold(1.0, f64::min)
+}
+
+fn best_row_floor(matrix: &[Vec<f64>]) -> f64 {
+    matrix
+        .iter()
+        .map(|row| row.iter().copied().fold(-1.0, f64::max))
+        .fold(1.0, f64::min)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,21 +347,32 @@ mod tests {
     struct FakeBackend { calls: AtomicUsize, unavailable: bool }
 
     impl EmbeddingBackend for FakeBackend {
-        fn identity(&self) -> BackendIdentity { BackendIdentity { model_id: "fake".into(), model_version: "1".into(), dimension: 3 } }
+        fn identity(&self) -> BackendIdentity { BackendIdentity { model_id: "fake".into(), model_version: "1".into(), dimension: 4 } }
         fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.unavailable { return Err("offline".into()); }
             Ok(texts.iter().map(|text| {
-                if text.contains("미래를 내다보다") || text == "내다보다" || text == "전망하다" { vec![1.0, 0.0, 0.0] }
-                else if text.contains("쳐다보다") { vec![0.0, 1.0, 0.0] }
-                else if text.contains("과거만 보다") { vec![0.8, 0.6, 0.0] }
-                else { vec![0.0, 0.0, 1.0] }
+                if text.ends_with("전화하다") || text.ends_with("전화를 걸다") { vec![0.0, 1.0, 0.0, 0.0] }
+                else if text.contains("미래를 내다보다") || text == "내다보다" || text == "전망하다" || text.ends_with("걸다") || text.ends_with("매달다") { vec![1.0, 0.0, 0.0, 0.0] }
+                else if text == "시간을 들이다" || text.ends_with("시간을 쓰다") { vec![0.0, 0.0, 1.0, 0.0] }
+                else if text.contains("쳐다보다") { vec![0.0, 0.0, 0.0, 1.0] }
+                else if text.contains("과거만 보다") { vec![0.8, 0.0, 0.0, 0.6] }
+                else { vec![0.0, 0.0, 0.0, 1.0] }
             }).collect())
         }
-        fn status(&self) -> SemanticRuntimeStatus { SemanticRuntimeStatus { phase: "ready".into(), model_id: "fake".into(), model_version: "1".into(), dimension: 3, backend: "fake".into(), gpu_requested: false, load_time_ms: Some(0), last_embedding_ms: Some(0), error: None } }
+        fn status(&self) -> SemanticRuntimeStatus { SemanticRuntimeStatus { phase: "ready".into(), model_id: "fake".into(), model_version: "1".into(), dimension: 4, backend: "fake".into(), gpu_requested: false, load_time_ms: Some(0), last_embedding_ms: Some(0), error: None } }
     }
 
-    fn entry() -> EntryRecord { EntryRecord { id: "e".into(), term: "見据える".into(), meanings: vec!["내다보다".into(), "전망하다".into()], reading: None } }
+    fn entry() -> EntryRecord { EntryRecord { id: "e".into(), term: "見据える".into(), meanings: vec!["내다보다".into()], reading: None } }
+
+    fn multi_entry() -> EntryRecord {
+        EntryRecord {
+            id: "multi".into(),
+            term: "掛ける".into(),
+            meanings: vec!["걸다".into(), "전화를 걸다".into(), "시간을 들이다".into()],
+            reading: None,
+        }
+    }
 
     fn grader(backend: Arc<FakeBackend>) -> SemanticGrader {
         let dir = tempdir().unwrap().keep();
@@ -302,5 +415,22 @@ mod tests {
         let outcome = grader.grade_recognition(&entry(), "미래를 예측하다", &[], &[]);
         assert_eq!(outcome.decision, GradeDecision::Ambiguous);
         assert_eq!(outcome.method, "semantic_unavailable");
+    }
+
+    #[test]
+    fn multiple_meanings_are_order_independent_one_to_one() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let grader = grader(backend);
+        let outcome = grader.grade_recognition(&multi_entry(), "시간을 쓰다 / 매달다 / 전화하다", &[], &[]);
+        assert_eq!(outcome.decision, GradeDecision::Pass);
+        assert_eq!(outcome.method, "semantic_multi_embedding");
+    }
+
+    #[test]
+    fn multiple_meanings_fail_on_missing_or_wrong_item() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let grader = grader(backend);
+        assert_eq!(grader.grade_recognition(&multi_entry(), "매달다 / 전화하다", &[], &[]).decision, GradeDecision::Fail);
+        assert_eq!(grader.grade_recognition(&multi_entry(), "매달다 / 전화하다 / 쳐다보다", &[], &[]).decision, GradeDecision::Fail);
     }
 }
