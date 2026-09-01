@@ -6,7 +6,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use serde::Deserialize;
@@ -18,6 +18,9 @@ const MODEL_ID: &str = "Qwen/Qwen3-Embedding-8B-GGUF";
 const MODEL_VERSION: &str = "Q4_K_M:90f57aa:llama.cpp-b10621";
 const MODEL_FILE: &str = "Qwen3-Embedding-8B-Q4_K_M.gguf";
 const DIMENSION: usize = 4096;
+const MODEL_SIZE: u64 = 4_676_804_928;
+const LLAMA_ZIP_SIZE: u64 = 250_464_283;
+const CUDA_ZIP_SIZE: u64 = 391_443_627;
 
 struct RuntimeState {
     phase: String,
@@ -142,6 +145,14 @@ impl LlamaCppEmbeddingBackend {
     fn set_phase(&self, phase: &str) -> Result<(), String> {
         self.state.lock().map_err(|_| "semantic runtime lock poisoned".to_string()).map(|mut state| state.phase = phase.into())
     }
+
+    fn download_progress(&self) -> Option<u8> {
+        latest_partial_progress(&[
+            (self.home.join("models").join(MODEL_FILE), MODEL_SIZE),
+            (self.home.join("runtime").join("llama-b10621-bin-win-cuda-12.4-x64.zip"), LLAMA_ZIP_SIZE),
+            (self.home.join("runtime").join("cudart-llama-bin-win-cuda-12.4-x64.zip"), CUDA_ZIP_SIZE),
+        ])
+    }
 }
 
 impl EmbeddingBackend for LlamaCppEmbeddingBackend {
@@ -167,8 +178,10 @@ impl EmbeddingBackend for LlamaCppEmbeddingBackend {
 
     fn status(&self) -> SemanticRuntimeStatus {
         let state = self.state.lock().ok();
+        let phase = state.as_ref().map(|value| value.phase.clone()).unwrap_or_else(|| "unavailable".into());
         SemanticRuntimeStatus {
-            phase: state.as_ref().map(|value| value.phase.clone()).unwrap_or_else(|| "unavailable".into()),
+            download_progress: if phase == "downloading" { self.download_progress() } else { None },
+            phase,
             model_id: MODEL_ID.into(),
             model_version: MODEL_VERSION.into(),
             dimension: DIMENSION,
@@ -179,6 +192,21 @@ impl EmbeddingBackend for LlamaCppEmbeddingBackend {
             error: state.and_then(|value| value.error.clone()),
         }
     }
+}
+
+fn latest_partial_progress(assets: &[(PathBuf, u64)]) -> Option<u8> {
+    let mut latest: Option<(SystemTime, u64, u64)> = None;
+    for (path, total) in assets {
+        let mut partial_name = path.as_os_str().to_os_string();
+        partial_name.push(".partial");
+        let partial = PathBuf::from(partial_name);
+        let Ok(metadata) = fs::metadata(partial) else { continue; };
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if latest.as_ref().map_or(true, |(current, _, _)| modified >= *current) {
+            latest = Some((modified, metadata.len(), *total));
+        }
+    }
+    latest.map(|(_, downloaded, total)| ((downloaded.min(total) * 100) / total.max(1)) as u8)
 }
 
 impl Drop for LlamaCppEmbeddingBackend {

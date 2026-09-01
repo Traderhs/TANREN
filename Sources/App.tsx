@@ -29,14 +29,18 @@ const VIEW_LABELS: Record<Exclude<View, "decks" | "study">, string> = {
   settings: "설정",
 };
 
-function runtimePhaseLabel(phase: string) {
+function runtimePhaseLabel(phase: string, downloadProgress?: number | null) {
   switch (phase) {
     case "starting": return "준비 중이에요";
-    case "downloading": return "필요한 파일을 받고 있어요";
+    case "downloading": return downloadProgress == null ? "필요한 파일을 받고 있어요" : `${downloadProgress}%  ·  필요한 파일을 받고 있어요`;
     case "loading": return "불러오고 있어요";
     case "ready": return "사용할 수 있어요";
     default: return "지금은 사용할 수 없어요";
   }
+}
+
+function runtimePhaseIsLoading(phase?: string) {
+  return !phase || phase === "starting" || phase === "downloading" || phase === "loading";
 }
 
 function OpenBook3D() {
@@ -90,6 +94,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [semanticStatus, setSemanticStatus] = useState<SemanticRuntimeStatus | null>(null);
   const [voicevoxStatus, setVoicevoxStatus] = useState<VoicevoxRuntimeStatus | null>(null);
+  const [initialRuntimeReady, setInitialRuntimeReady] = useState(false);
   const [audioSettings, setAudioSettings] = useState<AudioSettings>({ auto_play: true, volume: 1, playback_rate: 1 });
   const homeScrollRef = useRef<HTMLDivElement>(null);
   const homeWheelLockRef = useRef(false);
@@ -331,6 +336,25 @@ function App() {
     const interval = window.setInterval(update, 2000);
     return () => window.clearInterval(interval);
   }, []);
+  useEffect(() => {
+    if (initialRuntimeReady || !semanticStatus || !voicevoxStatus) return;
+    if (!runtimePhaseIsLoading(semanticStatus.phase) && !runtimePhaseIsLoading(voicevoxStatus.phase)) {
+      setInitialRuntimeReady(true);
+    }
+  }, [initialRuntimeReady, semanticStatus, voicevoxStatus]);
+  useEffect(() => {
+    if (initialRuntimeReady) return;
+    const blockKeyboard = (event: globalThis.KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    window.addEventListener("keydown", blockKeyboard, true);
+    window.addEventListener("keyup", blockKeyboard, true);
+    return () => {
+      window.removeEventListener("keydown", blockKeyboard, true);
+      window.removeEventListener("keyup", blockKeyboard, true);
+    };
+  }, [initialRuntimeReady]);
 
   const openStudy = async (deck: DeckSummary, stageIndex?: number) => {
     try {
@@ -397,8 +421,6 @@ function App() {
             />
             <DeckList
               decks={decks}
-              semanticStatus={semanticStatus}
-              voicevoxStatus={voicevoxStatus}
               onRefresh={refresh}
               onEdit={(d) => { setSelected(d); setView("editor"); }}
               onStudy={openStudy}
@@ -461,6 +483,16 @@ function App() {
           setAudioSettings(await api.audioSettings());
         }}
       />}
+      {!initialRuntimeReady && <div className="initial-loading-overlay" role="dialog" aria-modal="true" aria-labelledby="initial-loading-title">
+        <div className="initial-loading-content">
+          <span className="initial-loading-spinner" aria-hidden="true" />
+          <h2 id="initial-loading-title">TANREN을 준비하고 있어요</h2>
+          <div className="initial-loading-status" aria-live="polite">
+            <p><span>의미 모델</span><strong>{runtimePhaseLabel(semanticStatus?.phase ?? "starting", semanticStatus?.download_progress)}</strong></p>
+            <p><span>음성 모델</span><strong>{runtimePhaseLabel(voicevoxStatus?.phase ?? "starting", voicevoxStatus?.download_progress)}</strong></p>
+          </div>
+        </div>
+      </div>}
     </main>
   );
 }
@@ -588,16 +620,14 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
             <input type="range" min="0.5" max="2" step="0.1" value={audioSettings.playback_rate} onChange={(event) => updateAudio({ ...audioSettings, playback_rate: Number(event.target.value) })} />
           </label>
         </div>
-        {voicevoxStatus?.phase !== "ready" && voicevoxStatus && <p className="settings-runtime">음성 · {runtimePhaseLabel(voicevoxStatus.phase)}{voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}</p>}
+        {voicevoxStatus?.phase !== "ready" && voicevoxStatus && <p className="settings-runtime">음성 모델 · {runtimePhaseLabel(voicevoxStatus.phase, voicevoxStatus.download_progress)}{voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}</p>}
       </article>
     </div>
   </section>;
 }
 
-function DeckList({ decks, semanticStatus, voicevoxStatus, onRefresh, onEdit, onStudy, onStats }: {
+function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
   decks: DeckSummary[];
-  semanticStatus: SemanticRuntimeStatus | null;
-  voicevoxStatus: VoicevoxRuntimeStatus | null;
   onRefresh: () => Promise<void>;
   onEdit: (d: DeckSummary) => void;
   onStudy: (d: DeckSummary, stageIndex?: number) => void;
@@ -625,10 +655,6 @@ function DeckList({ decks, semanticStatus, voicevoxStatus, onRefresh, onEdit, on
       await onRefresh();
     }
   };
-  const runtimeIssues = [
-    semanticStatus && semanticStatus.phase !== "ready" ? `의미 모델 · ${runtimePhaseLabel(semanticStatus.phase)}${semanticStatus.error ? ` · ${semanticStatus.error}` : ""}` : null,
-    voicevoxStatus && voicevoxStatus.phase !== "ready" ? `음성 · ${runtimePhaseLabel(voicevoxStatus.phase)}${voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}` : null,
-  ].filter(Boolean) as string[];
   const openedDeck = openedDeckId ? decks.find((deck) => deck.id === openedDeckId) ?? null : null;
   useEffect(() => {
     if (flutterTimerRef.current !== null) window.clearTimeout(flutterTimerRef.current);
@@ -663,7 +689,6 @@ function DeckList({ decks, semanticStatus, voicevoxStatus, onRefresh, onEdit, on
     }, 4);
   };
   return <section className={`content home-content ${openedDeck ? "is-book-open" : ""}`}>
-    {runtimeIssues.length > 0 && <div className="runtime-strip"><span className="runtime-dot" />{runtimeIssues.join("  ·  ")}</div>}
     <AnimatePresence initial={false} mode="popLayout">
       {openedDeck ? <motion.section
         key={`opened-${openedDeck.id}-${bookOpenCycle}`}

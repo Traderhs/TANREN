@@ -24,6 +24,7 @@ pub struct BackendIdentity {
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticRuntimeStatus {
     pub phase: String,
+    pub download_progress: Option<u8>,
     pub model_id: String,
     pub model_version: String,
     pub dimension: usize,
@@ -360,7 +361,7 @@ mod tests {
                 else { vec![0.0, 0.0, 0.0, 1.0] }
             }).collect())
         }
-        fn status(&self) -> SemanticRuntimeStatus { SemanticRuntimeStatus { phase: "ready".into(), model_id: "fake".into(), model_version: "1".into(), dimension: 4, backend: "fake".into(), gpu_requested: false, load_time_ms: Some(0), last_embedding_ms: Some(0), error: None } }
+        fn status(&self) -> SemanticRuntimeStatus { SemanticRuntimeStatus { phase: "ready".into(), download_progress: None, model_id: "fake".into(), model_version: "1".into(), dimension: 4, backend: "fake".into(), gpu_requested: false, load_time_ms: Some(0), last_embedding_ms: Some(0), error: None } }
     }
 
     fn entry() -> EntryRecord { EntryRecord { id: "e".into(), term: "見据える".into(), meanings: vec!["내다보다".into()], reading: None } }

@@ -126,6 +126,7 @@ export interface EntryDraft {
 
 export interface SemanticRuntimeStatus {
   phase: "starting" | "downloading" | "loading" | "ready" | "unavailable" | string;
+  download_progress?: number | null;
   model_id: string;
   model_version: string;
   dimension: number;
@@ -138,6 +139,7 @@ export interface SemanticRuntimeStatus {
 
 export interface VoicevoxRuntimeStatus {
   phase: "starting" | "downloading" | "loading" | "ready" | "unavailable" | string;
+  download_progress?: number | null;
   engine_version: string;
   backend: string;
   error?: string | null;

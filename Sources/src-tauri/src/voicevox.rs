@@ -6,7 +6,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use serde::Serialize;
@@ -15,6 +15,18 @@ const INSTALLER: &str = include_str!("../sidecar/install_voicevox.ps1");
 const ENGINE_VERSION: &str = "0.25.2";
 const REQUIRED_VOICE_MODELS: [&str; 7] = [
     "0.vvm", "4.vvm", "7.vvm", "12.vvm", "13.vvm", "15.vvm", "21.vvm",
+];
+const ENGINE_LIST_SIZE: u64 = 47;
+const ENGINE_ARCHIVE_SIZE: u64 = 1_810_425_262;
+const SEVEN_ZIP_SIZE: u64 = 602_112;
+const VOICE_MODEL_SIZES: [(&str, u64); 7] = [
+    ("0.vvm", 58_214_379),
+    ("4.vvm", 58_211_265),
+    ("7.vvm", 57_232_459),
+    ("12.vvm", 58_213_390),
+    ("13.vvm", 60_231_935),
+    ("15.vvm", 65_647_574),
+    ("21.vvm", 62_075_160),
 ];
 
 struct RuntimeState {
@@ -27,6 +39,7 @@ struct RuntimeState {
 #[derive(Debug, Clone, Serialize)]
 pub struct VoicevoxRuntimeStatus {
     pub phase: String,
+    pub download_progress: Option<u8>,
     pub engine_version: String,
     pub backend: String,
     pub error: Option<String>,
@@ -154,8 +167,10 @@ impl VoicevoxRuntime {
 
     pub fn status(&self) -> VoicevoxRuntimeStatus {
         let state = self.state.lock().ok();
+        let phase = state.as_ref().map(|value| value.phase.clone()).unwrap_or_else(|| "unavailable".into());
         VoicevoxRuntimeStatus {
-            phase: state.as_ref().map(|value| value.phase.clone()).unwrap_or_else(|| "unavailable".into()),
+            download_progress: if phase == "downloading" { self.download_progress() } else { None },
+            phase,
             engine_version: ENGINE_VERSION.into(),
             backend: "DirectML".into(),
             error: state.and_then(|value| value.error.clone()),
@@ -164,6 +179,22 @@ impl VoicevoxRuntime {
 
     fn set_phase(&self, phase: &str) -> Result<(), String> {
         self.state.lock().map_err(|_| "VOICEVOX runtime lock poisoned".to_string()).map(|mut state| state.phase = phase.into())
+    }
+
+    fn download_progress(&self) -> Option<u8> {
+        let downloads = self.home.join("downloads");
+        let mut assets = vec![
+            (downloads.join("voicevox_engine-windows-directml-0.25.2.7z.txt"), ENGINE_LIST_SIZE),
+            (downloads.join("voicevox_engine-windows-directml-0.25.2.7z.001"), ENGINE_ARCHIVE_SIZE),
+            (downloads.join("7zr.exe"), SEVEN_ZIP_SIZE),
+        ];
+        if let Some(run) = find_file(&self.home.join("runtime"), "run.exe") {
+            if let Some(parent) = run.parent() {
+                let model_dir = parent.join("model");
+                assets.extend(VOICE_MODEL_SIZES.iter().map(|(name, size)| (model_dir.join(name), *size)));
+            }
+        }
+        latest_partial_progress(&assets)
     }
 }
 
@@ -191,6 +222,21 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn latest_partial_progress(assets: &[(PathBuf, u64)]) -> Option<u8> {
+    let mut latest: Option<(SystemTime, u64, u64)> = None;
+    for (path, total) in assets {
+        let mut partial_name = path.as_os_str().to_os_string();
+        partial_name.push(".partial");
+        let partial = PathBuf::from(partial_name);
+        let Ok(metadata) = fs::metadata(partial) else { continue; };
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if latest.as_ref().map_or(true, |(current, _, _)| modified >= *current) {
+            latest = Some((modified, metadata.len(), *total));
+        }
+    }
+    latest.map(|(_, downloaded, total)| ((downloaded.min(total) * 100) / total.max(1)) as u8)
 }
 
 fn voice_model_layout_needs_reconcile(run: Option<&Path>) -> bool {
