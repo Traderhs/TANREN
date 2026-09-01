@@ -13,6 +13,9 @@ use serde::Serialize;
 
 const INSTALLER: &str = include_str!("../sidecar/install_voicevox.ps1");
 const ENGINE_VERSION: &str = "0.25.2";
+const REQUIRED_VOICE_MODELS: [&str; 7] = [
+    "0.vvm", "4.vvm", "7.vvm", "12.vvm", "13.vvm", "15.vvm", "21.vvm",
+];
 
 struct RuntimeState {
     phase: String,
@@ -63,7 +66,7 @@ impl VoicevoxRuntime {
         fs::create_dir_all(&self.home).map_err(|e| e.to_string())?;
         let runtime_dir = self.home.join("runtime");
         let mut run = find_file(&runtime_dir, "run.exe");
-        if run.is_none() {
+        if voice_model_layout_needs_reconcile(run.as_deref()) {
             self.set_phase("downloading")?;
             let installer = self.home.join("install_voicevox.ps1");
             if fs::read_to_string(&installer).ok().as_deref() != Some(INSTALLER) {
@@ -190,6 +193,33 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+fn voice_model_layout_needs_reconcile(run: Option<&Path>) -> bool {
+    let Some(model_dir) = run.and_then(Path::parent).map(|parent| parent.join("model")) else {
+        return true;
+    };
+    let Ok(entries) = fs::read_dir(model_dir) else {
+        return true;
+    };
+    let mut installed = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("vvm")))
+                .then(|| path.file_name()?.to_str().map(str::to_owned))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    installed.sort_unstable();
+
+    let mut required = REQUIRED_VOICE_MODELS.map(str::to_owned).to_vec();
+    required.sort_unstable();
+    installed != required
+}
+
 fn http_get(port: u16, path: &str) -> Result<Vec<u8>, String> {
     let mut stream = TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}").parse().map_err(|e| format!("invalid VOICEVOX address: {e}"))?,
@@ -206,4 +236,29 @@ fn http_get(port: u16, path: &str) -> Result<Vec<u8>, String> {
         return Err(format!("VOICEVOX returned {}", status.lines().next().unwrap_or_default()));
     }
     Ok(response[split + 4..].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{voice_model_layout_needs_reconcile, REQUIRED_VOICE_MODELS};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn voicevox_reconciles_to_only_tanren_models() {
+        let temp = tempdir().unwrap();
+        let runtime = temp.path().join("windows-directml");
+        let model = runtime.join("model");
+        fs::create_dir_all(&model).unwrap();
+        fs::write(runtime.join("run.exe"), []).unwrap();
+        for name in REQUIRED_VOICE_MODELS {
+            fs::write(model.join(name), []).unwrap();
+        }
+
+        let run = runtime.join("run.exe");
+        assert!(!voice_model_layout_needs_reconcile(Some(&run)));
+
+        fs::write(model.join("1.vvm"), []).unwrap();
+        assert!(voice_model_layout_needs_reconcile(Some(&run)));
+    }
 }
