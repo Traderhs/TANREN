@@ -45,23 +45,33 @@ function runtimePhaseIsLoading(phase?: string) {
 
 function OpenBook3D() {
   return <div className="book-3d book-3d-open" aria-hidden="true">
-    <Canvas orthographic camera={{ position: [0, 0.1, 10], zoom: 72 }} dpr={[1, 1.5]} gl={{ alpha: true, antialias: true }}>
-      <ambientLight intensity={1.08} />
-      <directionalLight position={[1.5, 5, 7]} intensity={1.35} />
-      <group rotation={[-0.035, 0, 0]} position={[0, 0.02, -0.12]}>
-        <group position={[-1.74, 0, 0]} rotation={[0, -0.055, -0.005]}>
-          <RoundedBox args={[3.42, 4.52, 0.16]} radius={0.055} smoothness={4} position={[-0.03, 0, -0.19]}><meshStandardMaterial color="#0a0d10" roughness={0.76} /></RoundedBox>
-          <RoundedBox args={[3.28, 4.38, 0.16]} radius={0.035} smoothness={4} position={[0, 0, -0.06]}><meshStandardMaterial color="#a99f89" roughness={0.96} /></RoundedBox>
-          <RoundedBox args={[3.22, 4.31, 0.055]} radius={0.025} smoothness={3} position={[0.035, 0, 0.055]}><meshStandardMaterial color="#151719" roughness={0.9} /></RoundedBox>
+    <Canvas
+      orthographic
+      camera={{ position: [0, 0.1, 10], zoom: 154 }}
+      dpr={[1, 1.5]}
+      gl={{ alpha: true, antialias: true }}
+      resize={{ scroll: false }}
+    >
+      <ambientLight intensity={0.92} />
+      <directionalLight position={[2.4, 5.8, 7.5]} intensity={1.55} />
+      <directionalLight position={[-4, -1, 4]} intensity={0.38} />
+      <group rotation={[-0.065, 0, 0]} position={[0, 0.02, -0.12]} scale={[1.15, 1.05, 1]}>
+        <group position={[-1.76, 0, 0]} rotation={[0, -0.085, -0.008]}>
+          <RoundedBox args={[3.36, 4.46, 0.27]} radius={0.04} smoothness={4} position={[-0.01, -0.005, -0.09]}><meshStandardMaterial color="#b1a68f" roughness={0.94} /></RoundedBox>
+          <RoundedBox args={[0.075, 4.18, 0.20]} radius={0.018} smoothness={3} position={[-1.64, 0.01, 0.015]}><meshStandardMaterial color="#d0c4aa" roughness={0.96} /></RoundedBox>
+          <RoundedBox args={[3.10, 0.075, 0.20]} radius={0.018} smoothness={3} position={[-0.03, -2.16, 0.015]}><meshStandardMaterial color="#c7baa0" roughness={0.96} /></RoundedBox>
+          <RoundedBox args={[3.24, 4.31, 0.06]} radius={0.025} smoothness={3} position={[0.05, 0, 0.105]}><meshStandardMaterial color="#151719" roughness={0.88} /></RoundedBox>
         </group>
-        <group position={[1.74, 0, 0]} rotation={[0, 0.055, 0.005]}>
-          <RoundedBox args={[3.42, 4.52, 0.16]} radius={0.055} smoothness={4} position={[0.03, 0, -0.19]}><meshStandardMaterial color="#0a0d10" roughness={0.76} /></RoundedBox>
-          <RoundedBox args={[3.28, 4.38, 0.16]} radius={0.035} smoothness={4} position={[0, 0, -0.06]}><meshStandardMaterial color="#a99f89" roughness={0.96} /></RoundedBox>
-          <RoundedBox args={[3.22, 4.31, 0.055]} radius={0.025} smoothness={3} position={[-0.035, 0, 0.055]}><meshStandardMaterial color="#131517" roughness={0.9} /></RoundedBox>
+        <group position={[1.76, 0, 0]} rotation={[0, 0.085, 0.008]}>
+          <RoundedBox args={[3.36, 4.46, 0.27]} radius={0.04} smoothness={4} position={[0.01, -0.005, -0.09]}><meshStandardMaterial color="#b1a68f" roughness={0.94} /></RoundedBox>
+          <RoundedBox args={[0.075, 4.18, 0.20]} radius={0.018} smoothness={3} position={[1.64, 0.01, 0.015]}><meshStandardMaterial color="#d0c4aa" roughness={0.96} /></RoundedBox>
+          <RoundedBox args={[3.10, 0.075, 0.20]} radius={0.018} smoothness={3} position={[0.03, -2.16, 0.015]}><meshStandardMaterial color="#c7baa0" roughness={0.96} /></RoundedBox>
+          <RoundedBox args={[3.24, 4.31, 0.06]} radius={0.025} smoothness={3} position={[-0.05, 0, 0.105]}><meshStandardMaterial color="#131517" roughness={0.88} /></RoundedBox>
         </group>
-        <RoundedBox args={[0.18, 4.34, 0.20]} radius={0.05} smoothness={4} position={[0, 0, -0.10]}><meshStandardMaterial color="#090b0d" roughness={0.82} /></RoundedBox>
+        <RoundedBox args={[0.24, 4.36, 0.30]} radius={0.07} smoothness={4} position={[0, -0.01, -0.15]}><meshStandardMaterial color="#06080a" roughness={0.8} /></RoundedBox>
+        <RoundedBox args={[0.07, 4.16, 0.13]} radius={0.02} smoothness={3} position={[-0.10, 0, 0.045]} rotation={[0, -0.17, 0]}><meshStandardMaterial color="#9f947f" roughness={0.95} /></RoundedBox>
+        <RoundedBox args={[0.07, 4.16, 0.13]} radius={0.02} smoothness={3} position={[0.10, 0, 0.045]} rotation={[0, 0.17, 0]}><meshStandardMaterial color="#9f947f" roughness={0.95} /></RoundedBox>
       </group>
-      <ContactShadows position={[0, -2.52, -0.48]} opacity={0.46} scale={8.3} blur={3.2} far={4.5} />
     </Canvas>
   </div>;
 }
@@ -206,7 +216,14 @@ function App() {
       }
 
       if (target?.closest(".deck-create-backdrop")) return;
-      if (target?.closest(".open-book-stage")) return;
+
+      const bookRangeScroller = target?.closest<HTMLElement>(".book-range-scroll");
+      if (bookRangeScroller && bookRangeScroller.scrollHeight > bookRangeScroller.clientHeight) {
+        const deltaY = normalizeWheelDelta(event, bookRangeScroller.clientHeight);
+        const canScrollUp = deltaY < 0 && bookRangeScroller.scrollTop > 2;
+        const canScrollDown = deltaY > 0 && bookRangeScroller.scrollHeight - bookRangeScroller.clientHeight - bookRangeScroller.scrollTop > 2;
+        if (canScrollUp || canScrollDown) return;
+      }
 
       const statsScroller = target?.closest<HTMLElement>(".home-stats-section > .stats-dashboard");
       if (statsScroller && statsScroller.scrollHeight > statsScroller.clientHeight) {
@@ -642,6 +659,9 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
   const flipBookRef = useRef<any>(null);
   const flutterTimerRef = useRef<number | null>(null);
   const flutteringRef = useRef(false);
+  const activeBookSessionRef = useRef("");
+  const flutterRetryRef = useRef(0);
+  const flutterStartedSessionRef = useRef("");
   const create = async (e: FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
@@ -656,37 +676,76 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
     }
   };
   const openedDeck = openedDeckId ? decks.find((deck) => deck.id === openedDeckId) ?? null : null;
-  useEffect(() => {
+  const bookSessionKey = openedDeck ? `${openedDeck.id}:${bookOpenCycle}` : "";
+  activeBookSessionRef.current = bookSessionKey;
+
+  const clearFlutterTimer = () => {
     if (flutterTimerRef.current !== null) window.clearTimeout(flutterTimerRef.current);
-    flutteringRef.current = Boolean(openedDeckId && !reduceMotion);
-    setBookSettled(Boolean(openedDeckId && reduceMotion));
-    if (!openedDeckId || reduceMotion) return;
+    flutterTimerRef.current = null;
+  };
+
+  const scheduleBookFlutter = (sessionKey: string, delayMs: number) => {
+    clearFlutterTimer();
     flutterTimerRef.current = window.setTimeout(() => {
+      if (!sessionKey || activeBookSessionRef.current !== sessionKey || reduceMotion) return;
       const pageFlip = flipBookRef.current?.pageFlip?.();
-      if (pageFlip?.getCurrentPageIndex?.() === 0) pageFlip.flipNext("top");
-    }, 85);
+      if (!pageFlip) {
+        if (flutterRetryRef.current++ < 24) scheduleBookFlutter(sessionKey, 16);
+        return;
+      }
+      flutterRetryRef.current = 0;
+      const pageIndex = Number(pageFlip.getCurrentPageIndex?.() ?? 0);
+      if (pageIndex >= BOOK_CONTENT_PAGE) {
+        flutteringRef.current = false;
+        setBookSettled(true);
+        return;
+      }
+      flutteringRef.current = true;
+      pageFlip.flipNext("top");
+    }, delayMs);
+  };
+
+  const beginBookFlutter = (sessionKey: string) => {
+    if (reduceMotion || !sessionKey || activeBookSessionRef.current !== sessionKey) return;
+    if (flutterStartedSessionRef.current === sessionKey) return;
+    flutterStartedSessionRef.current = sessionKey;
+    flutterRetryRef.current = 0;
+    flutteringRef.current = true;
+    setBookSettled(false);
+    scheduleBookFlutter(sessionKey, 32);
+  };
+
+  const closeOpenedBook = () => {
+    activeBookSessionRef.current = "";
+    clearFlutterTimer();
+    flutteringRef.current = false;
+    flutterRetryRef.current = 0;
+    flutterStartedSessionRef.current = "";
+    setBookSettled(false);
+    setOpenedDeckId(null);
+  };
+  useEffect(() => {
+    clearFlutterTimer();
+    flutteringRef.current = false;
+    flutterRetryRef.current = 0;
+    flutterStartedSessionRef.current = "";
+    setBookSettled(Boolean(openedDeckId && reduceMotion));
+    if (openedDeckId && !reduceMotion && bookSessionKey) {
+      flutterTimerRef.current = window.setTimeout(() => beginBookFlutter(bookSessionKey), 120);
+    }
     return () => {
-      if (flutterTimerRef.current !== null) window.clearTimeout(flutterTimerRef.current);
-      flutterTimerRef.current = null;
+      clearFlutterTimer();
       flutteringRef.current = false;
     };
-  }, [openedDeckId, reduceMotion]);
-  const continueBookFlutter = (pageIndex: number) => {
+  }, [openedDeckId, bookOpenCycle, reduceMotion]);
+  const continueBookFlutter = (pageIndex: number, sessionKey: string) => {
+    if (activeBookSessionRef.current !== sessionKey) return;
     if (reduceMotion || !flutteringRef.current || pageIndex >= BOOK_CONTENT_PAGE) {
       flutteringRef.current = false;
       if (pageIndex >= BOOK_CONTENT_PAGE) setBookSettled(true);
       return;
     }
-    if (flutterTimerRef.current !== null) window.clearTimeout(flutterTimerRef.current);
-    flutterTimerRef.current = window.setTimeout(() => {
-      const pageFlip = flipBookRef.current?.pageFlip?.();
-      if (!pageFlip || pageFlip.getCurrentPageIndex() >= BOOK_CONTENT_PAGE) {
-        flutteringRef.current = false;
-        setBookSettled(true);
-        return;
-      }
-      pageFlip.flipNext("top");
-    }, 4);
+    scheduleBookFlutter(sessionKey, 4);
   };
   return <section className={`content home-content ${openedDeck ? "is-book-open" : ""}`}>
     <AnimatePresence initial={false} mode="popLayout">
@@ -700,6 +759,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
         transition={reduceMotion ? { duration: .01 } : { duration: .28, ease: [0.22, 1, 0.36, 1] }}
       >
         <OpenBook3D />
+        <div className="book-flip-stack">
         <HTMLFlipBook
           key={`${openedDeck.id}-${bookOpenCycle}`}
           ref={flipBookRef}
@@ -727,15 +787,27 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
           showPageCorners={false}
           disableFlipByClick={true}
           renderOnlyPageLengthChange={false}
-          onFlip={(event) => continueBookFlutter(Number(event.data))}
+          onInit={() => beginBookFlutter(bookSessionKey)}
+          onFlip={(event) => continueBookFlutter(Number(event.data), bookSessionKey)}
         >
-          <FlipPage className="book-cover-page" hard>
-            <div className="book-cover-frame" />
-            <span className="book-cover-volume">Vol. {String(decks.findIndex((deck) => deck.id === openedDeck.id) + 1).padStart(2, "0")}</span>
-            <span className="book-cover-language">{openedDeck.source_language} → {openedDeck.target_language}</span>
-            <strong>{openedDeck.name}</strong>
-            <span className="book-cover-mark">鍛</span>
-            <span className="book-cover-foot">TANREN · TRAINING DECK</span>
+          <FlipPage className="book-cover-page book-shelf-cover-page" hard>
+            <span className="ebook-cover">
+              <span className="ebook-cover-face">
+                <span className="ebook-volume">Vol. {String(decks.findIndex((deck) => deck.id === openedDeck.id) + 1).padStart(2, "0")}</span>
+                <span className="ebook-rule" />
+                <span className="ebook-language">日本語</span>
+                <strong title={openedDeck.name}>{openedDeck.name}</strong>
+                <span className="ebook-bottom">
+                  <span className="ebook-meta">{openedDeck.entry_count.toLocaleString("en-US")} Words</span>
+                  <span className="ebook-current">
+                    <span className="ebook-current-round">Round {openedDeck.current_round}</span>
+                    <span className="ebook-current-range">{openedDeck.active_stage ? openedDeck.active_stage.replace(" · cumulative", "").replace("~", " - ") : "—"}</span>
+                  </span>
+                  <span className="ebook-progress" aria-hidden="true"><i style={{ width: `${openedDeck.study_ranges.length === 0 ? 0 : Math.min(100, (openedDeck.completed_range_count / openedDeck.study_ranges.length) * 100)}%` }} /></span>
+                </span>
+              </span>
+              <span className="ebook-page-edge ebook-page-edge-right" aria-hidden="true" />
+            </span>
           </FlipPage>
 
           {Array.from({ length: BOOK_FLUTTER_LEAF_COUNT }, (_, index) => (
@@ -747,7 +819,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
           <FlipPage className="book-inside-page book-inside-left">
             <div className="book-page-inner">
               <div className="book-page-topline">
-                <button className="book-close ghost" onClick={() => setOpenedDeckId(null)}>← 책장</button>
+                <button className="book-close ghost" onClick={closeOpenedBook}>← 책장</button>
                 <span className="book-folio">{String(decks.findIndex((deck) => deck.id === openedDeck.id) + 1).padStart(2, "0")}</span>
               </div>
               <div className="book-title-page">
@@ -801,6 +873,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
             <span>鍛錬</span>
           </FlipPage>
         </HTMLFlipBook>
+        </div>
       </motion.section> : <motion.div key="shelf" className="book-shelf" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: .18 }}>
         <form className="home-create" onSubmit={create}>
           <input
@@ -824,6 +897,11 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
                 key={d.id}
                 aria-label={`${d.name} 책 열기`}
                 onClick={() => {
+                  clearFlutterTimer();
+                  flutteringRef.current = false;
+                  flutterRetryRef.current = 0;
+                  flutterStartedSessionRef.current = "";
+                  setBookSettled(false);
                   setBookOpenCycle((cycle) => cycle + 1);
                   setOpenedDeckId(d.id);
                 }}
