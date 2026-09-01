@@ -1,4 +1,4 @@
-use std::{fs, path::{Path, PathBuf}};
+use std::{collections::HashSet, fs, path::{Path, PathBuf}};
 
 use chrono::Utc;
 use rusqlite::{params, params_from_iter, types::{Value as SqlValue, ValueRef}, Connection, OptionalExtension, Transaction};
@@ -169,6 +169,14 @@ impl Database {
               state_json TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               device_id TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS stage_completions (
+              deck_id TEXT NOT NULL REFERENCES decks(id),
+              stage_label TEXT NOT NULL,
+              first_completed_round INTEGER NOT NULL,
+              first_completed_at TEXT NOT NULL,
+              PRIMARY KEY(deck_id, stage_label)
             );
 
             CREATE TABLE IF NOT EXISTS attempts (
@@ -380,6 +388,28 @@ impl Database {
                 [now()],
             ).map_err(|e| e.to_string())?;
         }
+        let stage_completion_migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=8)",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !stage_completion_migrated {
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS stage_completions (
+                  deck_id TEXT NOT NULL REFERENCES decks(id),
+                  stage_label TEXT NOT NULL,
+                  first_completed_round INTEGER NOT NULL,
+                  first_completed_at TEXT NOT NULL,
+                  PRIMARY KEY(deck_id, stage_label)
+                );
+                "#,
+            ).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(8, ?1)",
+                [now()],
+            ).map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -395,7 +425,7 @@ impl Database {
         ).map_err(|e| e.to_string())?;
         journal(&tx, &id, "deck", &self.device_id, 1, "insert", &serde_json::json!({"name":name}))?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(DeckSummary { id, name: name.into(), source_language: source_language.into(), target_language: target_language.into(), enabled_modes: vec![StudyMode::Recognition,StudyMode::Listening,StudyMode::Production], entry_count: 0, current_round: 1, active_stage: None, study_ranges: Vec::new() })
+        Ok(DeckSummary { id, name: name.into(), source_language: source_language.into(), target_language: target_language.into(), enabled_modes: vec![StudyMode::Recognition,StudyMode::Listening,StudyMode::Production], entry_count: 0, current_round: 1, active_stage: None, study_ranges: Vec::new(), completed_range_count: 0 })
     }
 
     pub fn setting(&self, key: &str) -> Result<Option<String>, String> {
@@ -422,23 +452,46 @@ impl Database {
 
     pub fn list_decks(&self) -> Result<Vec<DeckSummary>, String> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            r#"SELECT d.id,d.name,d.source_language,d.target_language,d.enabled_modes,d.current_round,
-               COUNT(e.id),s.stage_label,d.increment_size,d.checkpoint_size
-               FROM decks d LEFT JOIN entries e ON e.deck_id=d.id AND e.deleted_at IS NULL
-               LEFT JOIN stage_states s ON s.deck_id=d.id
-               WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.created_at"#,
+        let mut decks = {
+            let mut stmt = conn.prepare(
+                r#"SELECT d.id,d.name,d.source_language,d.target_language,d.enabled_modes,d.current_round,
+                   COUNT(e.id),s.stage_label,d.increment_size,d.checkpoint_size
+                   FROM decks d LEFT JOIN entries e ON e.deck_id=d.id AND e.deleted_at IS NULL
+                   LEFT JOIN stage_states s ON s.deck_id=d.id
+                   WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.created_at"#,
+            ).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([], |row| {
+                let modes: String = row.get(4)?;
+                let entry_count = row.get::<_, i64>(6)? as usize;
+                Ok(DeckSummary {
+                    id: row.get(0)?, name: row.get(1)?, source_language: row.get(2)?, target_language: row.get(3)?,
+                    enabled_modes: serde_json::from_str(&modes).unwrap_or_default(), current_round: row.get::<_, i64>(5)? as u32,
+                    entry_count, active_stage: row.get(7)?, study_ranges: study_ranges(entry_count, row.get::<_, i64>(8)? as usize, row.get::<_, i64>(9)? as usize),
+                    completed_range_count: 0,
+                })
+            }).map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?
+        };
+
+        let mut completed_stmt = conn.prepare("SELECT stage_label FROM stage_completions WHERE deck_id=?1").map_err(|e| e.to_string())?;
+        for deck in &mut decks {
+            let completed = completed_stmt
+                .query_map([&deck.id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            deck.completed_range_count = deck.study_ranges.iter().filter(|range| completed.contains(&range.label)).count();
+        }
+        Ok(decks)
+    }
+
+    pub fn mark_stage_completed(&self, deck_id: &str, stage_label: &str, round: u32) -> Result<(), String> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO stage_completions(deck_id,stage_label,first_completed_round,first_completed_at) VALUES(?1,?2,?3,?4)",
+            params![deck_id, stage_label, round as i64, now()],
         ).map_err(|e| e.to_string())?;
-        let rows = stmt.query_map([], |row| {
-            let modes: String = row.get(4)?;
-            let entry_count = row.get::<_, i64>(6)? as usize;
-            Ok(DeckSummary {
-                id: row.get(0)?, name: row.get(1)?, source_language: row.get(2)?, target_language: row.get(3)?,
-                enabled_modes: serde_json::from_str(&modes).unwrap_or_default(), current_round: row.get::<_, i64>(5)? as u32,
-                entry_count, active_stage: row.get(7)?, study_ranges: study_ranges(entry_count, row.get::<_, i64>(8)? as usize, row.get::<_, i64>(9)? as usize),
-            })
-        }).map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())
+        Ok(())
     }
 
     pub fn deck(&self, id: &str) -> Result<DeckRecord, String> {
@@ -778,6 +831,7 @@ impl Database {
             ("audio_assets", "SELECT a.* FROM audio_assets a JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
             ("audio_playback_state", "SELECT a.* FROM audio_playback_state a JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
             ("stage_states", "SELECT * FROM stage_states WHERE deck_id=?1"),
+            ("stage_completions", "SELECT * FROM stage_completions WHERE deck_id=?1"),
             ("attempts", "SELECT * FROM attempts WHERE deck_id=?1 ORDER BY timestamp"),
             ("typing_profiles", "SELECT * FROM typing_profiles WHERE deck_id=?1"),
             ("grading_decisions", "SELECT g.* FROM grading_decisions g JOIN entries e ON e.id=g.entry_id WHERE e.deck_id=?1"),
@@ -807,7 +861,7 @@ impl Database {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM decks WHERE id=?1)", [&deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
         if exists { return Err("this deck already exists; restore into a fresh TANREN database or delete the existing database first".into()); }
-        let order = ["decks", "entries", "entry_aliases", "japanese_analyses", "pitch_patterns", "audio_assets", "audio_playback_state", "stage_states", "attempts", "typing_profiles", "grading_decisions", "enrichment_jobs", "sync_journal"];
+        let order = ["decks", "entries", "entry_aliases", "japanese_analyses", "pitch_patterns", "audio_assets", "audio_playback_state", "stage_states", "stage_completions", "attempts", "typing_profiles", "grading_decisions", "enrichment_jobs", "sync_journal"];
         for table in order {
             if let Some(rows) = tables.get(table).and_then(Value::as_array) {
                 for row in rows { insert_json_row(&tx, table, row)?; }

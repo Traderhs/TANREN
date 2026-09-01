@@ -10,6 +10,7 @@ export interface DeckSummary {
   current_round: number;
   active_stage?: string | null;
   study_ranges: StudyRange[];
+  completed_range_count: number;
 }
 
 export interface StudyRange {
