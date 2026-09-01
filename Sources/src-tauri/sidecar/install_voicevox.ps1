@@ -2,10 +2,21 @@ param([Parameter(Mandatory = $true)][string]$HomePath)
 
 $ErrorActionPreference = "Stop"
 $EngineVersion = "0.25.2"
+$VvmVersion = "0.16.4"
 $SevenZipVersion = "26.02"
 $Runtime = Join-Path $HomePath "runtime"
 $Downloads = Join-Path $HomePath "downloads"
 New-Item -ItemType Directory -Force -Path $Runtime, $Downloads | Out-Null
+
+$RequiredVoiceModels = @(
+    "0.vvm",
+    "4.vvm",
+    "7.vvm",
+    "12.vvm",
+    "13.vvm",
+    "15.vvm",
+    "21.vvm"
+)
 
 function Get-GitHubRelease {
     param([string]$Repo, [string]$Tag)
@@ -53,8 +64,34 @@ if (-not $Run) {
 
 if (-not $Run) { throw "VOICEVOX run.exe was not installed" }
 
+$ModelDirectory = Join-Path $Run.Directory.FullName "model"
+New-Item -ItemType Directory -Force -Path $ModelDirectory | Out-Null
+
+$MissingVoiceModels = @($RequiredVoiceModels | Where-Object {
+    -not (Test-Path -LiteralPath (Join-Path $ModelDirectory $_))
+})
+
+if ($MissingVoiceModels.Count -gt 0) {
+    $vvmRelease = Get-GitHubRelease "VOICEVOX/voicevox_vvm" $VvmVersion
+    foreach ($modelName in $MissingVoiceModels) {
+        Get-VerifiedReleaseAsset $vvmRelease $modelName (Join-Path $ModelDirectory $modelName)
+    }
+}
+
+Get-ChildItem -LiteralPath $ModelDirectory -Filter "*.vvm" -File -ErrorAction SilentlyContinue |
+    Where-Object { $RequiredVoiceModels -notcontains $_.Name } |
+    Remove-Item -Force
+
+foreach ($modelName in $RequiredVoiceModels) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ModelDirectory $modelName))) {
+        throw "required VOICEVOX model is missing after installation: $modelName"
+    }
+}
+
 [pscustomobject]@{
     engine = $Run.FullName
     version = $EngineVersion
     backend = "DirectML"
+    vvm_version = $VvmVersion
+    voice_models = $RequiredVoiceModels
 } | ConvertTo-Json -Compress
