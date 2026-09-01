@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
-    "web:dev": "vite",
-    "build": "tsc && vite build",
+    "ime:sync": "powershell -ExecutionPolicy Bypass -File tools/sync_hechima.ps1",
+    "web:dev": "npm run ime:sync && vite",
+    "build": "npm run ime:sync && tsc && vite build",
     "test": "vitest run",
     "sidecar:build": "powershell -ExecutionPolicy Bypass -File tools/build_sidecar.ps1",
     "sidecar:test": "powershell -ExecutionPolicy Bypass -File tools/test_sidecar.ps1",
@@ -16,7 +17,7 @@
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",
-    "@fontsource/zen-kaku-gothic-new": "^5.3.0",
+    "@fontsource/noto-sans-jp": "^5.3.0",
     "@react-three/drei": "^10.7.8",
     "@react-three/fiber": "^9.7.0",
     "@tauri-apps/api": "^2.8.0",

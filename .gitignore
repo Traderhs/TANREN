@@ -1,6 +1,11 @@
 # JavaScript / Vite
 Sources/node_modules/
 Sources/dist/
+Sources/public/vendor/hechima/*
+!Sources/public/vendor/hechima/hechima.js
+Sources/public/vendor/hechima-wasm/
+Sources/public/vendor/hechima-notices/
+Sources/public/vendor/.tanren-hechima-pin
 
 # Rust / Tauri generated output
 Sources/src-tauri/target/
