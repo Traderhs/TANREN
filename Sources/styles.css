@@ -2349,7 +2349,7 @@ input:focus, textarea:focus {
 }
 .stats-metric-label > span:first-child {
   color: #9a9b96;
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 700;
 }
 .stats-help {
