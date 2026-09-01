@@ -60,6 +60,7 @@ pub struct DeckSummary {
     pub current_round: u32,
     pub active_stage: Option<String>,
     pub study_ranges: Vec<StudyRange>,
+    pub completed_range_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

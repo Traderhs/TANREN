@@ -356,6 +356,8 @@ fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
     if session.queue.remaining_count() == 0 {
         let deck = state.db.deck(&session.deck_id)?;
         let entries = state.db.entries(&session.deck_id)?;
+        let completed_stage_label = session.stage().label();
+        state.db.mark_stage_completed(&session.deck_id, &completed_stage_label, session.round)?;
         if session.advance_stage(&entries, &deck.enabled_modes, random()) {
             session.pending = Some(PendingState::StageTransition);
             state.db.save_session(session)?;
