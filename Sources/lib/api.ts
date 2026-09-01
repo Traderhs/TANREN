@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DeckStats, DeckSummary, EntryDraft, ImportResult, SemanticRuntimeStatus, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
+import type { DeckStats, DeckSummary, EntryDraft, ImportResult, LibraryStats, SemanticRuntimeStatus, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
 
 export const api = {
   listDecks: () => invoke<DeckSummary[]>("list_decks"),
@@ -17,6 +17,8 @@ export const api = {
   deleteDeck: (deckId: string) => invoke<void>("delete_deck", { deckId }),
   exportDeck: (deckId: string) => invoke<string>("export_deck", { deckId }),
   importDeckExport: (payload: string) => invoke<DeckSummary>("import_deck_export", { payload }),
+  recordStudyActivity: (deckId: string, mode: StudyMode | null, durationMs: number) =>
+    invoke<void>("record_study_activity", { deckId, mode, durationMs }),
   submitAnswer: (
     variantId: string,
     answer: string,
@@ -36,6 +38,7 @@ export const api = {
   adjudicate: (variantId: string, accept: boolean) =>
     invoke<SubmitResult>("adjudicate_answer", { variantId, accept }),
   stats: (deckId: string) => invoke<DeckStats[]>("deck_stats", { deckId }),
+  libraryStats: () => invoke<LibraryStats>("library_stats"),
   semanticStatus: () => invoke<SemanticRuntimeStatus>("semantic_status"),
   voicevoxStatus: () => invoke<VoicevoxRuntimeStatus>("voicevox_status"),
   storageSettings: () => invoke<StorageSettings>("storage_settings"),

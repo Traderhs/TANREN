@@ -38,7 +38,7 @@ export function activeCardTimerRuns(card: StudyCard | null, result: SubmitResult
 }
 
 export function shouldAutoPlayAfterWrittenAnswer(mode: StudyMode): boolean {
-  return mode === "recognition" || mode === "production";
+  return mode === "reading" || mode === "writing";
 }
 
 export async function exitStudyForDeckNavigation(

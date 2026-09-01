@@ -3,24 +3,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum StudyMode {
-    Recognition,
+    Reading,
     Listening,
-    Production,
+    Writing,
 }
 
 impl StudyMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Recognition => "recognition",
+            Self::Reading => "reading",
             Self::Listening => "listening",
-            Self::Production => "production",
+            Self::Writing => "writing",
         }
     }
 
     pub fn answer_language<'a>(self, source: &'a str, target: &'a str) -> &'a str {
         match self {
-            Self::Recognition => source,
-            Self::Listening | Self::Production => target,
+            Self::Reading => source,
+            Self::Listening | Self::Writing => target,
         }
     }
 }
@@ -28,23 +28,23 @@ impl StudyMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RecallTimeoutByMode {
-    pub recognition: u64,
+    pub reading: u64,
     pub listening: u64,
-    pub production: u64,
+    pub writing: u64,
 }
 
 impl Default for RecallTimeoutByMode {
     fn default() -> Self {
-        Self { recognition: 3_000, listening: 3_000, production: 3_000 }
+        Self { reading: 3_000, listening: 3_000, writing: 3_000 }
     }
 }
 
 impl RecallTimeoutByMode {
     pub fn for_mode(&self, mode: StudyMode) -> u64 {
         match mode {
-            StudyMode::Recognition => self.recognition,
+            StudyMode::Reading => self.reading,
             StudyMode::Listening => self.listening,
-            StudyMode::Production => self.production,
+            StudyMode::Writing => self.writing,
         }
     }
 }
@@ -243,6 +243,58 @@ pub struct DeckStats {
     pub joint_accuracy: Option<f64>,
     pub median_recall_latency_ms: Option<u64>,
     pub attempts: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryDeckStats {
+    pub deck_id: String,
+    pub deck_name: String,
+    pub entry_count: usize,
+    pub current_round: u32,
+    pub attempts: usize,
+    pub base_accuracy: Option<f64>,
+    pub joint_accuracy: Option<f64>,
+    pub median_recall_latency_ms: Option<u64>,
+    pub last_practiced_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryStats {
+    pub deck_count: usize,
+    pub active_deck_count: usize,
+    pub entry_count: usize,
+    pub seen_entry_count: usize,
+    pub attempts: usize,
+    pub base_accuracy: Option<f64>,
+    pub pitch_accuracy: Option<f64>,
+    pub joint_accuracy: Option<f64>,
+    pub median_recall_latency_ms: Option<u64>,
+    pub study_time_ms: u64,
+    pub mode_stats: Vec<DeckStats>,
+    pub deck_stats: Vec<LibraryDeckStats>,
+    pub history: Vec<LibraryStatsPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryStatsPoint {
+    pub date: String,
+    pub attempts: usize,
+    pub seen_entry_count: usize,
+    pub base_accuracy: Option<f64>,
+    pub pitch_accuracy: Option<f64>,
+    pub median_recall_latency_ms: Option<u64>,
+    pub study_time_ms: u64,
+    pub modes: std::collections::HashMap<StudyMode, LibraryStatsModePoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryStatsModePoint {
+    pub attempts: usize,
+    pub seen_entry_count: usize,
+    pub base_accuracy: Option<f64>,
+    pub pitch_accuracy: Option<f64>,
+    pub median_recall_latency_ms: Option<u64>,
+    pub study_time_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

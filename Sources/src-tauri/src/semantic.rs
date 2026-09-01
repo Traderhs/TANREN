@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::{
     db::Database,
-    grading::{grade_recognition_deterministic, normalize_generic, split_recognition_answer},
+    grading::{grade_reading_deterministic, normalize_generic, split_reading_answer},
     model::{EntryRecord, GradeDecision, GradeOutcome},
 };
 
@@ -107,8 +107,8 @@ impl SemanticGrader {
 
     pub fn status(&self) -> SemanticRuntimeStatus { self.backend.status() }
 
-    pub fn grade_recognition(&self, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String]) -> GradeOutcome {
-        if let Some(outcome) = grade_recognition_deterministic(entry, answer, accepted, rejected) {
+    pub fn grade_reading(&self, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String]) -> GradeOutcome {
+        if let Some(outcome) = grade_reading_deterministic(entry, answer, accepted, rejected) {
             return outcome;
         }
 
@@ -163,7 +163,7 @@ impl SemanticGrader {
     }
 
     fn grade_multiple_meanings(&self, entry: &EntryRecord, answer: &str) -> GradeOutcome {
-        let answers = split_recognition_answer(answer, entry.meanings.len());
+        let answers = split_reading_answer(answer, entry.meanings.len());
         if answers.len() != entry.meanings.len() {
             return GradeOutcome { decision: GradeDecision::Fail, method: "meaning_count_mismatch", score: Some(0.0) };
         }
@@ -384,9 +384,9 @@ mod tests {
     fn deterministic_alias_paths_never_call_model() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend.clone());
-        assert_eq!(grader.grade_recognition(&entry(), "내다보다", &[], &[]).decision, GradeDecision::Pass);
-        assert_eq!(grader.grade_recognition(&entry(), "앞날", &["앞날".into()], &[]).decision, GradeDecision::Pass);
-        assert_eq!(grader.grade_recognition(&entry(), "과거", &[], &["과거".into()]).decision, GradeDecision::Fail);
+        assert_eq!(grader.grade_reading(&entry(), "내다보다", &[], &[]).decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "앞날", &["앞날".into()], &[]).decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "과거", &[], &["과거".into()]).decision, GradeDecision::Fail);
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     }
 
@@ -394,9 +394,9 @@ mod tests {
     fn semantic_synonym_passes_and_canonical_cache_is_reused() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend.clone());
-        assert_eq!(grader.grade_recognition(&entry(), "미래를 내다보다", &[], &[]).decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "미래를 내다보다", &[], &[]).decision, GradeDecision::Pass);
         let first_calls = backend.calls.load(Ordering::Relaxed);
-        assert_eq!(grader.grade_recognition(&entry(), "미래를 내다보다", &[], &[]).decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "미래를 내다보다", &[], &[]).decision, GradeDecision::Pass);
         assert_eq!(backend.calls.load(Ordering::Relaxed), first_calls);
     }
 
@@ -404,15 +404,15 @@ mod tests {
     fn unrelated_fails_and_confusable_negative_never_passes() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend);
-        assert_eq!(grader.grade_recognition(&entry(), "쳐다보다", &[], &[]).decision, GradeDecision::Fail);
-        assert_ne!(grader.grade_recognition(&entry(), "과거만 보다", &[], &["과거를 보다".into()]).decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "쳐다보다", &[], &[]).decision, GradeDecision::Fail);
+        assert_ne!(grader.grade_reading(&entry(), "과거만 보다", &[], &["과거를 보다".into()]).decision, GradeDecision::Pass);
     }
 
     #[test]
     fn unavailable_backend_abstains() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: true });
         let grader = grader(backend);
-        let outcome = grader.grade_recognition(&entry(), "미래를 예측하다", &[], &[]);
+        let outcome = grader.grade_reading(&entry(), "미래를 예측하다", &[], &[]);
         assert_eq!(outcome.decision, GradeDecision::Ambiguous);
         assert_eq!(outcome.method, "semantic_unavailable");
     }
@@ -421,7 +421,7 @@ mod tests {
     fn multiple_meanings_are_order_independent_one_to_one() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend);
-        let outcome = grader.grade_recognition(&multi_entry(), "시간을 쓰다 / 매달다 / 전화하다", &[], &[]);
+        let outcome = grader.grade_reading(&multi_entry(), "시간을 쓰다 / 매달다 / 전화하다", &[], &[]);
         assert_eq!(outcome.decision, GradeDecision::Pass);
         assert_eq!(outcome.method, "semantic_multi_embedding");
     }
@@ -430,7 +430,7 @@ mod tests {
     fn multiple_meanings_fail_on_missing_or_wrong_item() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend);
-        assert_eq!(grader.grade_recognition(&multi_entry(), "매달다 / 전화하다", &[], &[]).decision, GradeDecision::Fail);
-        assert_eq!(grader.grade_recognition(&multi_entry(), "매달다 / 전화하다 / 쳐다보다", &[], &[]).decision, GradeDecision::Fail);
+        assert_eq!(grader.grade_reading(&multi_entry(), "매달다 / 전화하다", &[], &[]).decision, GradeDecision::Fail);
+        assert_eq!(grader.grade_reading(&multi_entry(), "매달다 / 전화하다 / 쳐다보다", &[], &[]).decision, GradeDecision::Fail);
     }
 }

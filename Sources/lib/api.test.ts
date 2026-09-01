@@ -10,8 +10,8 @@ describe("study command payloads", () => {
 
   it.each([true, false])("adjudicates from backend pending data (accept=%s)", async (accept) => {
     invoke.mockResolvedValue({ status: "review" });
-    await api.adjudicate("entry:recognition", accept);
-    expect(invoke).toHaveBeenCalledWith("adjudicate_answer", { variantId: "entry:recognition", accept });
+    await api.adjudicate("entry:reading", accept);
+    expect(invoke).toHaveBeenCalledWith("adjudicate_answer", { variantId: "entry:reading", accept });
   });
 
   it("uses an explicit command to enter the next stage", async () => {

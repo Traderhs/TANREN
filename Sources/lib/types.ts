@@ -1,4 +1,4 @@
-export type StudyMode = "recognition" | "listening" | "production";
+export type StudyMode = "reading" | "listening" | "writing";
 
 export interface DeckSummary {
   id: string;
@@ -68,6 +68,54 @@ export interface DeckStats {
   joint_accuracy: number | null;
   median_recall_latency_ms: number | null;
   attempts: number;
+}
+
+export interface LibraryDeckStats {
+  deck_id: string;
+  deck_name: string;
+  entry_count: number;
+  current_round: number;
+  attempts: number;
+  base_accuracy: number | null;
+  joint_accuracy: number | null;
+  median_recall_latency_ms: number | null;
+  last_practiced_at: string | null;
+}
+
+export interface LibraryStats {
+  deck_count: number;
+  active_deck_count: number;
+  entry_count: number;
+  seen_entry_count: number;
+  attempts: number;
+  base_accuracy: number | null;
+  pitch_accuracy: number | null;
+  joint_accuracy: number | null;
+  median_recall_latency_ms: number | null;
+  study_time_ms: number;
+  mode_stats: DeckStats[];
+  deck_stats: LibraryDeckStats[];
+  history: LibraryStatsPoint[];
+}
+
+export interface LibraryStatsPoint {
+  date: string;
+  attempts: number;
+  seen_entry_count: number;
+  base_accuracy: number | null;
+  pitch_accuracy: number | null;
+  median_recall_latency_ms: number | null;
+  study_time_ms: number;
+  modes: Partial<Record<StudyMode, LibraryStatsModePoint>>;
+}
+
+export interface LibraryStatsModePoint {
+  attempts: number;
+  seen_entry_count: number;
+  base_accuracy: number | null;
+  pitch_accuracy: number | null;
+  median_recall_latency_ms: number | null;
+  study_time_ms: number;
 }
 
 export interface EntryDraft {
