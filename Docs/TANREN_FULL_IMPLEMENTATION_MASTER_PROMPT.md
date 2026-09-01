@@ -9,7 +9,7 @@ TANREN의 목적은 Anki/FSRS 계열의 "최소 횟수로 장기 기억 유지"�
 핵심 철학은 다음과 같다.
 
 > 전체 학습 범위를 반복적으로 확장하면서 이미 맞힌 항목까지 다시 실제 인출시키고,
-> Recognition / Listening / Production을 제한시간 내 실제 입력으로 검사하여
+> Reading / Listening / Writing을 제한시간 내 실제 입력으로 검사하여
 > 언어 처리가 자동화될 때까지 반복한다.
 
 이 프로그램은 버튼으로 "알아요"라고 자기평가하는 프로그램이 아니다.
@@ -239,9 +239,9 @@ Entry를 복제 저장하지 않는다.
 
 Study 시 다음 Variant를 동적으로 생성한다.
 
-- Recognition
+- Reading
 - Listening
-- Production
+- Writing
 
 예:
 
@@ -250,7 +250,7 @@ Entry:
 Meaning:
 내다보다 / 전망하다
 
-Recognition:
+Reading:
 見据える
 → Korean meaning
 
@@ -258,7 +258,7 @@ Listening:
 Japanese audio
 → Japanese textual form
 
-Production:
+Writing:
 내다보다 / 전망하다
 → 見据える
 
@@ -271,7 +271,7 @@ Production:
 
 # 7. MODE SEMANTICS
 
-## Recognition
+## Reading
 
 Question:
 target-language text
@@ -311,7 +311,7 @@ audio: みすえる
 한 번 들은 뒤 표현 자체를 바로 식별할 수 있는가.
 
 
-## Production
+## Writing
 
 Question:
 source-language meaning
@@ -333,7 +333,7 @@ answer = 予想する
 
 이면 의미가 비슷하더라도 FAIL이다.
 
-Production은 해당 Entry 표현 자체의 능동 인출을 검사한다.
+Writing은 해당 Entry 표현 자체의 능동 인출을 검사한다.
 
 
 # 8. JAPANESE PITCH AS SECOND-STAGE GATE
@@ -350,7 +350,7 @@ Pitch Question PASS
 
 즉 Pitch를 4번째 독립 Variant로 만들지 않는다.
 
-Recognition / Listening / Production 각각의 두 번째 단계로 둔다.
+Reading / Listening / Writing 각각의 두 번째 단계로 둔다.
 
 
 ## State
@@ -385,22 +385,22 @@ Pitch에서 틀렸다면 해당 Variant는 현재 Stage에서 제거하지 않�
 
 예:
 
-Recognition base accuracy
-Recognition pitch accuracy
-Recognition joint accuracy
+Reading base accuracy
+Reading pitch accuracy
+Reading joint accuracy
 
 Listening base accuracy
 Listening pitch accuracy
 Listening joint accuracy
 
-Production base accuracy
-Production pitch accuracy
-Production joint accuracy
+Writing base accuracy
+Writing pitch accuracy
+Writing joint accuracy
 
 
 Listening은 이미 audio를 들은 뒤 pitch 문제를 풀기 때문에:
 
-Recognition / Production pitch
+Reading / Writing pitch
 → Pitch Recall
 
 Listening pitch
@@ -684,9 +684,9 @@ CompletionTimer
 
 예:
 
-Korean Recognition
+Korean Reading
 Japanese Listening
-Japanese Production
+Japanese Writing
 
 TypingProfile:
 
@@ -797,7 +797,7 @@ TypingProfile update sample은 최소:
 
 # 24. RECOGNITION GRADING
 
-Recognition은 의미의 자유로운 표현을 허용해야 한다.
+Reading은 의미의 자유로운 표현을 허용해야 한다.
 
 예:
 
@@ -1144,17 +1144,17 @@ shuffle/spacing 안에서 다시 배치한다.
 
 같은 Entry의:
 
-Recognition
+Reading
 Listening
-Production
+Writing
 
 이 연속으로 나오지 않게 한다.
 
 예:
 
-見据える Recognition
+見据える Reading
 見据える Listening
-見据える Production
+見据える Writing
 
 금지.
 
@@ -1447,13 +1447,13 @@ target_language = ja-JP
 
 이면:
 
-Recognition answer
+Reading answer
 → ko-KR input
 
 Listening answer
 → ja-JP input
 
-Production answer
+Writing answer
 → ja-JP input
 
 Pitch question
@@ -1502,7 +1502,7 @@ legacy IMM API는 fallback으로만 사용한다.
 
 # 53. KOREAN AUTO SWITCH
 
-Recognition처럼 Korean answer가 필요한 경우:
+Reading처럼 Korean answer가 필요한 경우:
 
 ko-KR
 
@@ -1632,7 +1632,7 @@ schema는 normalize하되 과도한 추상화는 피한다.
 
 Per Deck:
 
-Recognition
+Reading
 - base accuracy
 - pitch accuracy
 - joint accuracy
@@ -1644,7 +1644,7 @@ Listening
 - joint accuracy
 - median recall latency
 
-Production
+Writing
 - base accuracy
 - pitch recall accuracy
 - joint accuracy
@@ -1657,9 +1657,9 @@ Per Entry:
 
 見据える
 
-Recognition 96%
+Reading 96%
 Listening 74%
-Production 55%
+Writing 55%
 Pitch Recall 48%
 Pitch Perception 88%
 
@@ -1955,7 +1955,7 @@ Antonym/confusable:
 Ambiguous path:
 manual adjudication
 
-Production:
+Writing:
 見据える target
 予想する answer
 → FAIL
@@ -2015,7 +2015,7 @@ Platform adapter는 interface로 만들고 mock test 가능해야 한다.
 
 50~100 Japanese entries
 
-Recognition / Listening / Production / pitch를 실제로 테스트할 수 있게 한다.
+Reading / Listening / Writing / pitch를 실제로 테스트할 수 있게 한다.
 
 단 production database와 test fixture를 명확히 분리한다.
 
@@ -2028,10 +2028,10 @@ Recognition / Listening / Production / pitch를 실제로 테스트할 수 있�
 2. Entry import
 3. enrichment 실행
 4. Study 시작
-5. Recognition answer
+5. Reading answer
 6. pitch answer
 7. Listening
-8. Production
+8. Writing
 9. empty Enter
 10. wrong answer
 11. recall timeout
@@ -2211,13 +2211,13 @@ FAIL
 ## Study algorithm
 PASS / FAIL
 
-## Recognition
+## Reading
 PASS / FAIL
 
 ## Listening
 PASS / FAIL
 
-## Production
+## Writing
 PASS / FAIL
 
 ## Pitch gate
