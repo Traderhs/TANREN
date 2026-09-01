@@ -8,7 +8,8 @@ import { ContactShadows, RoundedBox } from "@react-three/drei";
 import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api } from "./lib/api";
 import { parseEntryText } from "./lib/importParser";
-import type { DeckStats, DeckSummary, LibraryStats, PitchQuestion, SemanticRuntimeStatus, StorageSettings, StudyCard, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./lib/types";
+import { japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime, type JapaneseImeSegment, type JapaneseImeSession } from "./lib/japaneseIme";
+import type { AudioSettings, DeckStats, DeckSummary, LibraryStats, PitchQuestion, SemanticRuntimeStatus, StorageSettings, StudyCard, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./lib/types";
 import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, setPitchLevel, shouldAutoPlayAfterWrittenAnswer, type PitchLevel, type PitchSelection } from "./lib/studyFlow";
 import { completionDelayMs, firstMeaningfulInputAt, isMeaningfulInput, recallHasTimedOut } from "./lib/studyTimers";
 
@@ -89,6 +90,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [semanticStatus, setSemanticStatus] = useState<SemanticRuntimeStatus | null>(null);
   const [voicevoxStatus, setVoicevoxStatus] = useState<VoicevoxRuntimeStatus | null>(null);
+  const [audioSettings, setAudioSettings] = useState<AudioSettings>({ auto_play: true, volume: 1, playback_rate: 1 });
   const homeScrollRef = useRef<HTMLDivElement>(null);
   const homeWheelLockRef = useRef(false);
   const homeShelfWheelAtRef = useRef(0);
@@ -105,6 +107,8 @@ function App() {
   };
 
   useEffect(() => void refresh(), []);
+  useEffect(() => { void api.audioSettings().then(setAudioSettings); }, []);
+  useEffect(() => { void loadJapaneseImeRuntime().catch(() => undefined); }, []);
   useEffect(() => {
     if (view !== "decks") return;
     let active = true;
@@ -277,9 +281,38 @@ function App() {
       unlockTimer = window.setTimeout(unlock, 420);
     };
 
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+      if (event.repeat) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
+      if (target?.closest(".deck-create-backdrop, .open-book-stage")) return;
+
+      const sections = Array.from(scroller.querySelectorAll<HTMLElement>(".home-snap-section"));
+      if (sections.length === 0) return;
+
+      let currentIndex = 0;
+      let closestDistance = Number.POSITIVE_INFINITY;
+      sections.forEach((section, index) => {
+        const distance = Math.abs(section.offsetTop - scroller.scrollTop);
+        if (distance < closestDistance) {
+          closestDistance = distance;
+          currentIndex = index;
+        }
+      });
+
+      const direction = event.key === "ArrowDown" ? 1 : -1;
+      const nextIndex = Math.max(0, Math.min(sections.length - 1, currentIndex + direction));
+      if (nextIndex === currentIndex) return;
+      event.preventDefault();
+      scroller.scrollTo({ top: sections[nextIndex].offsetTop, behavior: "smooth" });
+    };
+
     scroller.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("keydown", onKeyDown);
     return () => {
       scroller.removeEventListener("wheel", onWheel);
+      window.removeEventListener("keydown", onKeyDown);
       shelfForSync?.removeEventListener("scroll", syncShelfScrollTarget);
       if (homeShelfScrollFrameRef.current !== null) {
         cancelAnimationFrame(homeShelfScrollFrameRef.current);
@@ -317,6 +350,15 @@ function App() {
     setView("stats");
   };
 
+  const scrollHomeSection = (index: number) => {
+    const scroller = homeScrollRef.current;
+    if (!scroller) return;
+    const sections = Array.from(scroller.querySelectorAll<HTMLElement>(".home-snap-section"));
+    const target = sections[index];
+    if (!target) return;
+    scroller.scrollTo({ top: target.offsetTop, behavior: "smooth" });
+  };
+
   const openDecks = async () => {
     try {
       await exitStudyForDeckNavigation(view, api.exitStudy);
@@ -347,6 +389,12 @@ function App() {
       {view === "decks" && (
         <div ref={homeScrollRef} className="library-frame home-scroll">
           <section className="home-snap-section home-library-section">
+            <button
+              type="button"
+              className="home-guide-arrow home-guide-arrow--down"
+              aria-label="통계로 이동"
+              onClick={() => scrollHomeSection(1)}
+            />
             <DeckList
               decks={decks}
               semanticStatus={semanticStatus}
@@ -358,10 +406,36 @@ function App() {
             />
           </section>
           <section className="home-snap-section home-stats-section">
+            <button
+              type="button"
+              className="home-guide-arrow home-guide-arrow--up"
+              aria-label="책장으로 이동"
+              onClick={() => scrollHomeSection(0)}
+            />
             <LibraryStatsView stats={libraryStats} />
+            <button
+              type="button"
+              className="home-guide-arrow home-guide-arrow--down"
+              aria-label="설정으로 이동"
+              onClick={() => scrollHomeSection(2)}
+            />
           </section>
           <section className="home-snap-section home-settings-section">
-            <SettingsView voicevoxStatus={voicevoxStatus} />
+            <button
+              type="button"
+              className="home-guide-arrow home-guide-arrow--up"
+              aria-label="통계로 이동"
+              onClick={() => scrollHomeSection(1)}
+            />
+            <SettingsView
+              voicevoxStatus={voicevoxStatus}
+              audioSettings={audioSettings}
+              onAudioSettingsChange={setAudioSettings}
+              onDataRestored={async () => {
+                await refresh();
+                setAudioSettings(await api.audioSettings());
+              }}
+            />
           </section>
         </div>
       )}
@@ -373,21 +447,35 @@ function App() {
           result={result}
           setCard={setCard}
           setResult={setResult}
+          audioSettings={audioSettings}
           onExit={openDecks}
         />
       )}
       {view === "stats" && selected && <DeckStatsView deck={selected} stats={stats} />}
-      {view === "settings" && <SettingsView voicevoxStatus={voicevoxStatus} />}
+      {view === "settings" && <SettingsView
+        voicevoxStatus={voicevoxStatus}
+        audioSettings={audioSettings}
+        onAudioSettingsChange={setAudioSettings}
+        onDataRestored={async () => {
+          await refresh();
+          setAudioSettings(await api.audioSettings());
+        }}
+      />}
     </main>
   );
 }
 
-function SettingsView({ voicevoxStatus }: { voicevoxStatus: VoicevoxRuntimeStatus | null }) {
+function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, onDataRestored }: {
+  voicevoxStatus: VoicevoxRuntimeStatus | null;
+  audioSettings: AudioSettings;
+  onAudioSettingsChange: (settings: AudioSettings) => void;
+  onDataRestored: () => Promise<void>;
+}) {
   const [settings, setSettings] = useState<StorageSettings | null>(null);
   const [path, setPath] = useState("");
   const [message, setMessage] = useState("");
-  const [restoreText, setRestoreText] = useState("");
-  const [restoreMessage, setRestoreMessage] = useState("");
+  const [backupMessage, setBackupMessage] = useState("");
+  const audioWriteTail = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     void api.storageSettings().then((value) => {
@@ -405,50 +493,104 @@ function SettingsView({ voicevoxStatus }: { voicevoxStatus: VoicevoxRuntimeStatu
     const value = await api.setStorageDirectory(path.trim() || null);
     setSettings(value);
     setPath(value.selected_path ?? value.default_path);
-    setMessage(value.restart_required ? "저장했어요. TANREN을 재시작하면 적용돼요." : "저장했어요.");
+    setMessage("");
   };
 
   const reset = async () => {
     const value = await api.setStorageDirectory(null);
     setSettings(value);
     setPath(value.default_path);
-    setMessage(value.restart_required ? "기본 위치로 바꿨어요. 재시작하면 적용돼요." : "기본 위치를 사용하고 있어요.");
+    setMessage("");
   };
 
-  const restore = async () => {
-    const restored = await api.importDeckExport(restoreText);
-    setRestoreText("");
-    setRestoreMessage(`${restored.name}을 복원했어요.`);
+  const updateAudio = (next: AudioSettings) => {
+    onAudioSettingsChange(next);
+    audioWriteTail.current = audioWriteTail.current
+      .then(async () => { await api.setAudioSettings(next); })
+      .catch(() => {});
   };
 
-  return <section className="content narrow">
-    <div className="section-heading"><div><h1>설정</h1><p>TANREN의 저장 위치와 백업을 관리해요.</p></div></div>
-    <div className="settings-card">
-      <label htmlFor="semantic-storage">모델·음성 데이터</label>
-      <p className="setting-help">모델과 음성 파일을 저장할 위치를 정해요.</p>
-      {voicevoxStatus?.phase !== "ready" && voicevoxStatus && <p className="setting-help runtime-inline">음성 · {runtimePhaseLabel(voicevoxStatus.phase)}{voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}</p>}
-      <div className="path-row">
-        <input id="semantic-storage" value={path} onChange={(e) => setPath(e.target.value)} placeholder={settings?.default_path ?? ""} />
-        <button className="secondary" onClick={() => void browse()}>폴더 선택</button>
-      </div>
-      {settings && <div className="storage-meta">
-        <span>현재 위치 <code>{settings.active_path}</code></span>
-        <span>기본 위치 <code>{settings.default_path}</code></span>
-      </div>}
-      <div className="actions">
-        <button onClick={() => void save()}>저장하기</button>
-        <button className="ghost" onClick={() => void reset()}>기본값 사용</button>
-      </div>
-      {message && <p className="success">{message}</p>}
-      {settings?.restart_required && <p className="setting-warning">재시작하면 새 위치가 적용돼요. 기존 파일은 그대로 남아 있어요.</p>}
+  const exportBackup = async () => {
+    const exported = await api.exportBackup();
+    if (exported) setBackupMessage("백업 파일을 내보냈어요.");
+  };
+
+  const importBackup = async () => {
+    if (!window.confirm("현재 데이터를 백업 파일의 내용으로 바꿀까요?")) return;
+    const imported = await api.importBackup();
+    if (!imported) return;
+    const restoredStorage = await api.storageSettings();
+    setSettings(restoredStorage);
+    setPath(restoredStorage.selected_path ?? restoredStorage.active_path);
+    await onDataRestored();
+    setBackupMessage("백업 파일을 가져왔어요.");
+  };
+
+  return <section className="content settings-dashboard">
+    <div className="settings-grid">
+      <article className="settings-panel">
+        <header><span>01</span><h2>데이터</h2></header>
+        <p className="settings-panel-help">저장 위치와 백업을 관리해요.</p>
+        <div className="settings-data-body">
+          <label htmlFor="semantic-storage">저장 위치</label>
+          <div className="settings-path-row">
+            <input
+              id="semantic-storage"
+              className="home-create-input settings-storage-input"
+              value={path}
+              onChange={(e) => setPath(e.target.value)}
+              placeholder={settings?.default_path ?? ""}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+            />
+            <button className="settings-action-button" onClick={() => void browse()}>선택</button>
+          </div>
+          <div className="settings-card-actions">
+            <button className="settings-action-button" onClick={() => void save()}>저장</button>
+            <button className="settings-action-button" onClick={() => void reset()}>기본값</button>
+          </div>
+          {message && <p className="success">{message}</p>}
+          {settings?.restart_required && <p className="setting-warning">재시작하면 새 위치가 적용돼요.</p>}
+
+          <div className="settings-backup-section">
+            <strong>백업</strong>
+            <p>책, 단어, 학습 기록, 통계와 설정을 하나의 <code>.tanren</code> 파일로 저장해요.</p>
+            <div className="settings-backup-actions">
+              <button className="settings-action-button" onClick={() => void exportBackup()}>내보내기</button>
+              <button className="settings-action-button" onClick={() => void importBackup()}>가져오기</button>
+            </div>
+            {backupMessage && <p className="setting-warning">{backupMessage}</p>}
+          </div>
+        </div>
+      </article>
+
+      <article className="settings-panel">
+        <header><span>02</span><h2>음성</h2></header>
+        <p className="settings-panel-help">학습 중 재생되는 음성을 조절해요.</p>
+        <div className="settings-control-list">
+          <div className="settings-control-row">
+            <div><strong>자동 재생</strong><small>문제와 정답 음성을 자동으로 재생해요.</small></div>
+            <button
+              type="button"
+              className={`settings-toggle ${audioSettings.auto_play ? "is-on" : ""}`}
+              aria-pressed={audioSettings.auto_play}
+              onClick={() => updateAudio({ ...audioSettings, auto_play: !audioSettings.auto_play })}
+            ><span /></button>
+          </div>
+          <label className="settings-range-row">
+            <div><strong>음량</strong><span>{Math.round(audioSettings.volume * 100)}%</span></div>
+            <input type="range" min="0" max="1" step="0.05" value={audioSettings.volume} onChange={(event) => updateAudio({ ...audioSettings, volume: Number(event.target.value) })} />
+          </label>
+          <label className="settings-range-row">
+            <div><strong>재생 속도</strong><span>{audioSettings.playback_rate.toFixed(1)}×</span></div>
+            <input type="range" min="0.5" max="2" step="0.1" value={audioSettings.playback_rate} onChange={(event) => updateAudio({ ...audioSettings, playback_rate: Number(event.target.value) })} />
+          </label>
+        </div>
+        {voicevoxStatus?.phase !== "ready" && voicevoxStatus && <p className="settings-runtime">음성 · {runtimePhaseLabel(voicevoxStatus.phase)}{voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}</p>}
+      </article>
     </div>
-    <details className="advanced-panel">
-      <summary>백업 복원</summary>
-      <p className="setting-help">백업한 책 데이터를 다시 불러올 수 있어요.</p>
-      <textarea value={restoreText} onChange={(event) => setRestoreText(event.target.value)} placeholder="백업 JSON을 붙여넣어주세요" />
-      <button disabled={!restoreText.trim()} onClick={() => void restore()}>복원하기</button>
-      {restoreMessage && <p className="success">{restoreMessage}</p>}
-    </details>
   </section>;
 }
 
@@ -741,15 +883,19 @@ function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise
   </section>;
 }
 
-function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
+function StudyView({ deckId, card, result, setCard, setResult, audioSettings, onExit }: {
   deckId: string;
   card: StudyCard | null;
   result: SubmitResult | null;
   setCard: (c: StudyCard | null) => void;
   setResult: (r: SubmitResult | null) => void;
+  audioSettings: AudioSettings;
   onExit: () => Promise<void>;
 }) {
   const [answer, setAnswer] = useState("");
+  const [imeSegments, setImeSegments] = useState<JapaneseImeSegment[]>([]);
+  const [imeCaret, setImeCaret] = useState(0);
+  const [japaneseImeReady, setJapaneseImeReady] = useState(false);
   const [pitchLevels, setPitchLevels] = useState<PitchSelection>([]);
   const [pitchCursor, setPitchCursor] = useState(0);
   const [inputWarning, setInputWarning] = useState<string | null>(null);
@@ -757,6 +903,7 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
   const [submittedPitch, setSubmittedPitch] = useState<PitchSelection | null>(null);
   const [submittedPitchQuestion, setSubmittedPitchQuestion] = useState<PitchQuestion | null>(null);
   const shownAt = useRef(performance.now());
+  const answerRef = useRef("");
   const firstInputAt = useRef<number | null>(null);
   const lastActivityAt = useRef<number | null>(null);
   const interkeyGaps = useRef<number[]>([]);
@@ -772,10 +919,24 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
   const studyActivityMode = useRef<StudyMode | null>(card?.mode ?? null);
   const pendingStudyActivity = useRef(new Map<StudyMode | "all", number>());
   const inputRef = useRef<HTMLInputElement>(null);
+  const japaneseImeRef = useRef<JapaneseImeSession | null>(null);
+  const imeCaretRef = useRef(0);
+  const imeCandidateListRef = useRef<HTMLDivElement>(null);
   const pitchButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const pitchQuestion = result?.pitch ?? null;
   const timerActive = activeCardTimerRuns(card, result);
   const reduceMotion = useReducedMotion();
+  const usesJapaneseIme = card?.answer_language === "ja-JP";
+  const imePreedit = imeSegments.map((segment) => segment.text).join("");
+  const imeHasInternalCaret = imeSegments.some((segment) => segment.kind === "yomi" && segment.caretOffset != null);
+
+  const playAudio = (path: string) => {
+    const audio = new Audio(convertFileSrc(path));
+    audio.volume = audioSettings.volume;
+    audio.playbackRate = audioSettings.playback_rate;
+    void audio.play();
+    return audio;
+  };
 
   const studyViewIsActive = () => document.visibilityState === "visible" && document.hasFocus();
 
@@ -838,9 +999,134 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
     await onExit();
   };
 
+  const setImeCaretPosition = (next: number) => {
+    const bounded = Math.max(0, Math.min(next, answerRef.current.length));
+    imeCaretRef.current = bounded;
+    setImeCaret(bounded);
+  };
+
+  const beginJapaneseComposition = () => {
+    if (composing.current) return;
+    composing.current = true;
+    compositionStartedAt.current = performance.now();
+    if (completionTimer.current) window.clearTimeout(completionTimer.current);
+    completionTimer.current = null;
+    completionDeadlineAt.current = null;
+  };
+
+  const endJapaneseComposition = () => {
+    if (!composing.current) return;
+    const now = performance.now();
+    composing.current = false;
+    if (compositionStartedAt.current != null) imeCompositionMs.current += now - compositionStartedAt.current;
+    compositionStartedAt.current = null;
+    compositionEndedAt.current = now;
+    lastActivityAt.current = now;
+  };
+
+  const insertJapaneseText = (text: string) => {
+    if (!text) return;
+    const current = answerRef.current;
+    const caret = imeCaretRef.current;
+    const next = `${current.slice(0, caret)}${text}${current.slice(caret)}`;
+    handleInput(next, false);
+    setImeCaretPosition(caret + text.length);
+  };
+
+  const previousTextIndex = (value: string, index: number) => {
+    let next = Math.max(0, index - 1);
+    if (next > 0) {
+      const code = value.charCodeAt(next);
+      const previous = value.charCodeAt(next - 1);
+      if (code >= 0xdc00 && code <= 0xdfff && previous >= 0xd800 && previous <= 0xdbff) next -= 1;
+    }
+    return next;
+  };
+
+  const nextTextIndex = (value: string, index: number) => {
+    let next = Math.min(value.length, index + 1);
+    if (index < value.length - 1) {
+      const code = value.charCodeAt(index);
+      const following = value.charCodeAt(index + 1);
+      if (code >= 0xd800 && code <= 0xdbff && following >= 0xdc00 && following <= 0xdfff) next += 1;
+    }
+    return next;
+  };
+
+  const handleJapaneseHostKey = (name: string) => {
+    const current = answerRef.current;
+    const caret = imeCaretRef.current;
+    if (name === "Backspace") {
+      if (caret <= 0) return;
+      const start = previousTextIndex(current, caret);
+      const next = `${current.slice(0, start)}${current.slice(caret)}`;
+      setImeCaretPosition(start);
+      handleInput(next, false);
+    } else if (name === "Delete") {
+      if (caret >= current.length) return;
+      const end = nextTextIndex(current, caret);
+      handleInput(`${current.slice(0, caret)}${current.slice(end)}`, false);
+    } else if (name === "ArrowLeft") {
+      setImeCaretPosition(previousTextIndex(current, caret));
+    } else if (name === "ArrowRight") {
+      setImeCaretPosition(nextTextIndex(current, caret));
+    } else if (name === "Home") {
+      setImeCaretPosition(0);
+    } else if (name === "End") {
+      setImeCaretPosition(current.length);
+    }
+  };
+
+  const moveJapaneseCaretFromPointer = (clientX: number, element: HTMLElement) => {
+    if (imeSegments.length > 0) return;
+    const value = answerRef.current;
+    if (!value) {
+      setImeCaretPosition(0);
+      return;
+    }
+
+    const style = getComputedStyle(element);
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+
+    const rect = element.getBoundingClientRect();
+    const totalWidth = context.measureText(value).width;
+    const startX = rect.left + (rect.width - totalWidth) / 2;
+    const target = Math.max(0, Math.min(totalWidth, clientX - startX));
+    let bestIndex = 0;
+    let bestDistance = Math.abs(target);
+    let index = 0;
+    while (index < value.length) {
+      index = nextTextIndex(value, index);
+      const distance = Math.abs(context.measureText(value.slice(0, index)).width - target);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    }
+    setImeCaretPosition(bestIndex);
+  };
+
+  const recordJapaneseKeyActivity = (event: ReturnType<typeof japaneseImeKeyTap>) => {
+    if (!japaneseImeKeyStartsInput(event)) return;
+    const now = performance.now();
+    if (firstInputAt.current == null) {
+      firstInputAt.current = now;
+      if (recallTimer.current) window.clearTimeout(recallTimer.current);
+    }
+    if (lastActivityAt.current != null) interkeyGaps.current.push(Math.round(now - lastActivityAt.current));
+    lastActivityAt.current = now;
+  };
+
   useEffect(() => {
     if (!timerActive) return;
+    japaneseImeRef.current?.reset();
+    japaneseImeRef.current?.setActive(false);
+    japaneseImeRef.current = null;
     shownAt.current = performance.now();
+    answerRef.current = "";
     firstInputAt.current = null;
     lastActivityAt.current = null;
     interkeyGaps.current = [];
@@ -850,6 +1136,10 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
     imeCompositionMs.current = 0;
     timeoutSent.current = false;
     setAnswer("");
+    setImeSegments([]);
+    imeCaretRef.current = 0;
+    setImeCaret(0);
+    setJapaneseImeReady(false);
     setSubmittedPitch(null);
     setSubmittedPitchQuestion(null);
     setInputWarning(null);
@@ -857,8 +1147,55 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
     let current = true;
     let nativeModeRetry: number | null = null;
     const frame = requestAnimationFrame(() => {
+      if (!card) return;
+      if (card.answer_language === "ja-JP") {
+        void loadJapaneseImeRuntime()
+          .then((runtime) => {
+            if (!current) return;
+            const session = runtime.createSession({
+              show: (segments) => {
+                if (!current) return;
+                beginJapaneseComposition();
+                setImeSegments(segments);
+              },
+              hide: () => {
+                if (!current) return;
+                setImeSegments([]);
+                endJapaneseComposition();
+              },
+              commit: (text) => {
+                if (!current) return;
+                // Hechima's commit() clears its internal composition but does not
+                // guarantee a following hide() callback. Clear TANREN's mirrored
+                // preedit state here before inserting the committed text so the
+                // same surface text is never rendered twice.
+                setImeSegments([]);
+                endJapaneseComposition();
+                insertJapaneseText(text);
+              },
+              hostKey: (name) => {
+                if (!current) return;
+                handleJapaneseHostKey(name);
+              },
+            });
+            if (!current) {
+              session.reset();
+              session.setActive(false);
+              return;
+            }
+            session.setActive(true);
+            japaneseImeRef.current = session;
+            setJapaneseImeReady(true);
+            requestAnimationFrame(() => inputRef.current?.focus());
+          })
+          .catch(() => {
+            if (current) setInputWarning("내장 일본어 입력기를 불러오지 못했어요.");
+          });
+        return;
+      }
+
       inputRef.current?.focus();
-      if (card) void api.activateInputProfile(card.answer_language)
+      void api.activateInputProfile(card.answer_language)
         .then((warning) => {
           if (!current) return;
           setInputWarning(warning);
@@ -868,7 +1205,7 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
               .catch(() => { if (current) setInputWarning("입력 언어를 자동으로 바꾸지 못했어요."); });
           }, 100);
         })
-        .catch((error) => {
+        .catch(() => {
           if (current) setInputWarning("입력 언어를 자동으로 바꾸지 못했어요.");
         });
     });
@@ -876,8 +1213,11 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
       current = false;
       cancelAnimationFrame(frame);
       if (nativeModeRetry != null) window.clearTimeout(nativeModeRetry);
+      japaneseImeRef.current?.reset();
+      japaneseImeRef.current?.setActive(false);
+      japaneseImeRef.current = null;
     };
-  }, [card?.variant_id, timerActive]);
+  }, [card?.variant_id, card?.answer_language, timerActive]);
 
   useEffect(() => {
     if (!timerActive || !card) return;
@@ -926,13 +1266,12 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
   }, [card?.variant_id, timerActive]);
 
   useEffect(() => {
-    if (!timerActive || !card || card.mode !== "listening") return;
+    if (!audioSettings.auto_play || !timerActive || !card || card.mode !== "listening") return;
     if (card.audio_path) {
-      const audio = new Audio(convertFileSrc(card.audio_path));
-      void audio.play();
+      const audio = playAudio(card.audio_path);
       return () => { audio.pause(); };
     }
-  }, [card?.variant_id, timerActive]);
+  }, [card?.variant_id, timerActive, audioSettings.auto_play, audioSettings.volume, audioSettings.playback_rate]);
 
   const advance = (r: SubmitResult) => {
     setResult(r);
@@ -941,9 +1280,8 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
 
   const submit = async () => {
     if (!card) return;
-    if (card.audio_path && shouldAutoPlayAfterWrittenAnswer(card.mode)) {
-      const audio = new Audio(convertFileSrc(card.audio_path));
-      void audio.play();
+    if (audioSettings.auto_play && card.audio_path && shouldAutoPlayAfterWrittenAnswer(card.mode)) {
+      playAudio(card.audio_path);
     }
     const now = performance.now();
     const recall = firstInputAt.current == null ? Math.round(now - shownAt.current) : Math.round(firstInputAt.current - shownAt.current);
@@ -958,7 +1296,7 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
     ));
   };
 
-  const handleInput = (value: string) => {
+  const handleInput = (value: string, recordKeyActivity = true) => {
     const now = performance.now();
     if (!isMeaningfulInput(value) && completionTimer.current) {
       window.clearTimeout(completionTimer.current);
@@ -971,10 +1309,11 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
       if (recallTimer.current) window.clearTimeout(recallTimer.current);
     }
     if (isMeaningfulInput(value) && !composing.current) {
-      if (lastActivityAt.current != null) interkeyGaps.current.push(Math.round(now - lastActivityAt.current));
+      if (recordKeyActivity && lastActivityAt.current != null) interkeyGaps.current.push(Math.round(now - lastActivityAt.current));
       lastActivityAt.current = now;
       scheduleCompletionTimeout(value);
     }
+    answerRef.current = value;
     setAnswer(value);
   };
 
@@ -1048,12 +1387,42 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
 
   const playCachedAnswer = () => {
     if (!card?.audio_path) return;
-    const audio = new Audio(convertFileSrc(card.audio_path));
-    void audio.play();
+    playAudio(card.audio_path);
   };
 
   const keydown = async (e: KeyboardEvent<HTMLInputElement>) => {
-    if (!card || e.key !== "Enter" || e.nativeEvent.isComposing) return;
+    if (!card) return;
+    if (usesJapaneseIme) {
+      const session = japaneseImeRef.current;
+      if (!session || !japaneseImeReady) {
+        e.preventDefault();
+        return;
+      }
+      const tap = japaneseImeKeyTap(e.nativeEvent);
+      recordJapaneseKeyActivity(tap);
+      if (session.feed(tap)) {
+        e.preventDefault();
+        return;
+      }
+      if (!tap.ctrlKey && !tap.altKey && !tap.metaKey) {
+        if (["Backspace", "Delete", "ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
+          e.preventDefault();
+          handleJapaneseHostKey(e.key);
+          return;
+        }
+        if (e.key === " ") {
+          e.preventDefault();
+          insertJapaneseText(e.shiftKey ? " " : "　");
+          return;
+        }
+        if (tap.key.length === 1) {
+          e.preventDefault();
+          insertJapaneseText(tap.key);
+          return;
+        }
+      }
+    }
+    if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
     e.preventDefault();
     const action = enterAction(result);
     if (action === "review") {
@@ -1062,6 +1431,25 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
       await submit();
     }
   };
+
+  const keyup = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (!usesJapaneseIme || !japaneseImeReady) return;
+    if (japaneseImeRef.current?.feedUp(japaneseImeKeyTap(e.nativeEvent))) e.preventDefault();
+  };
+
+  const focusedImeSegment = imeSegments.find((segment) => segment.kind === "focus" && segment.candidates?.length);
+  const imeCandidates = focusedImeSegment?.candidates ?? [];
+  const imeCandidateIndex = focusedImeSegment?.candidateIndex ?? 0;
+  const selectJapaneseCandidate = (index: number) => {
+    if (!japaneseImeRef.current?.selectCandidate(index)) return;
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
+  useEffect(() => {
+    if (!imeCandidates.length) return;
+    const selected = imeCandidateListRef.current?.querySelector<HTMLElement>(".ime-candidate.is-selected");
+    selected?.scrollIntoView({ block: "nearest" });
+  }, [imeCandidateIndex, imeCandidates.length]);
 
   const submittedPitchCorrect = submittedPitch && submittedPitchQuestion
     ? submittedPitchQuestion.allowed_patterns.some((pattern) => pattern.length === submittedPitch.length && pattern.every((level, index) => level === submittedPitch[index]))
@@ -1167,7 +1555,72 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
             {review && <motion.div className={`review-card ${feedbackTone}`} initial={reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><span className="feedback-label">정답</span><strong>{result?.canonical_answer}</strong>{result?.reading && <span>{result.reading}</span>}<p>{result?.message}</p>{card.audio_path && <button className="compact-button" type="button" onClick={playCachedAnswer}>▶ 정답 듣기</button>}</motion.div>}
             {ambiguous && <motion.div className="review-card ambiguous-card" initial={reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><span className="feedback-label">확인</span><p>이 답을 정답으로 기억할까요?</p><div className="actions"><button onClick={async () => advance(await api.adjudicate(card.variant_id, true))}>정답이에요</button><button className="secondary" onClick={async () => advance(await api.adjudicate(card.variant_id, false))}>오답이에요</button></div></motion.div>}
 
-            {!pitchQuestion && <input
+            {!pitchQuestion && (usesJapaneseIme ? <div
+              className={`answer-ime-shell ${japaneseImeReady ? "is-ready" : "is-loading"} ${review ? "is-review" : ""}`}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                moveJapaneseCaretFromPointer(event.clientX, event.currentTarget);
+                inputRef.current?.focus();
+              }}
+            >
+              <div className="answer-ime-display" aria-live="polite">
+                {!answer && !imePreedit && <span className="answer-ime-placeholder">{review ? "Enter로 다음 문제" : japaneseImeReady ? "답을 입력해주세요" : "일본어 입력 준비 중..."}</span>}
+                {answer.slice(0, imeCaret)}
+                {imeSegments.map((segment, index) => {
+                  const chars = Array.from(segment.text);
+                  const caretOffset = segment.kind === "yomi" && segment.caretOffset != null
+                    ? Math.max(0, Math.min(segment.caretOffset, chars.length))
+                    : null;
+                  return <span
+                    key={`${segment.kind}-${segment.text}-${index}`}
+                    className={`answer-ime-preedit ${segment.kind}`}
+                  >{caretOffset == null
+                    ? segment.text
+                    : <>{chars.slice(0, caretOffset).join("")}<span className="answer-ime-caret" aria-hidden="true" />{chars.slice(caretOffset).join("")}</>}</span>;
+                })}
+                {!imeHasInternalCaret && <span className="answer-ime-caret" aria-hidden="true" />}
+                {answer.slice(imeCaret)}
+              </div>
+              <input
+                ref={inputRef}
+                className="answer-ime-capture"
+                value=""
+                onChange={() => undefined}
+                onKeyDown={keydown}
+                onKeyUp={keyup}
+                onBeforeInput={(event) => event.preventDefault()}
+                onPaste={(e) => {
+                  e.preventDefault();
+                  const text = e.clipboardData.getData("text");
+                  if (!text) return;
+                  japaneseImeRef.current?.reset();
+                  setImeSegments([]);
+                  endJapaneseComposition();
+                  insertJapaneseText(text);
+                }}
+                disabled={ambiguous}
+                aria-label="답 입력"
+                aria-busy={!japaneseImeReady}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+              />
+              {!review && !ambiguous && imeCandidates.length > 0 && <div ref={imeCandidateListRef} className="ime-candidate-list" role="listbox" aria-label="일본어 변환 후보">
+                {imeCandidates.map((candidate, index) => <button
+                  key={`${candidate}-${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={index === imeCandidateIndex}
+                  className={`ime-candidate ${index === imeCandidateIndex ? "is-selected" : ""}`}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                  }}
+                  onClick={() => selectJapaneseCandidate(index)}
+                ><span>{index < 9 ? index + 1 : ""}</span><strong>{candidate}</strong></button>)}
+              </div>}
+            </div> : <input
               ref={inputRef}
               className="answer-input"
               value={answer}
@@ -1192,8 +1645,10 @@ function StudyView({ deckId, card, result, setCard, setResult, onExit }: {
               placeholder={review ? "Enter로 다음 문제" : "답을 입력해주세요"}
               disabled={ambiguous}
               autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
               spellCheck={false}
-            />}
+            />)}
             {!review && !ambiguous && !pitchQuestion && <div className="study-hint"><span><kbd>↵</kbd> 확인</span><span><kbd>빈 ↵</kbd> 모르면 넘어가기</span></div>}
             {review && <div className="review-next"><kbd>ENTER</kbd><span>다음 문제</span><b>→</b></div>}
           </motion.div>
