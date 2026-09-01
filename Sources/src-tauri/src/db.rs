@@ -817,6 +817,25 @@ impl Database {
         Ok(Some(path))
     }
 
+    pub fn relocate_audio_paths(&self, old_root: &Path, new_root: &Path) -> Result<(), String> {
+        let mut conn = self.conn()?;
+        let paths = {
+            let mut stmt = conn.prepare("SELECT id,path FROM audio_assets WHERE deleted_at IS NULL").map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for (id, path) in paths {
+            let Ok(relative) = Path::new(&path).strip_prefix(old_root) else { continue; };
+            let relocated = new_root.join(relative).to_string_lossy().to_string();
+            tx.execute("UPDATE audio_assets SET path=?1,updated_at=?2 WHERE id=?3", params![relocated, now(), id]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn stats(&self, deck_id:&str)->Result<Vec<DeckStats>,String>{
         let conn=self.conn()?;
         let mut output=Vec::new();
