@@ -149,3 +149,9 @@ export interface StorageSettings {
   default_path: string;
   restart_required: boolean;
 }
+
+export interface AudioSettings {
+  auto_play: boolean;
+  volume: number;
+  playback_rate: number;
+}

@@ -1,4 +1,5 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs, path::{Path, PathBuf}};
+use std::time::Duration;
 
 use chrono::Utc;
 use rusqlite::{params, params_from_iter, types::{Value as SqlValue, ValueRef}, Connection, OptionalExtension, Transaction};
@@ -1139,6 +1140,53 @@ impl Database {
         tx.commit().map_err(|e| e.to_string())?;
         Ok(deck_id)
     }
+
+    pub fn export_backup(&self, path: &Path) -> Result<(), String> {
+        if path == self.path {
+            return Err("현재 TANREN 데이터 파일에는 백업을 덮어쓸 수 없어요.".into());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if path.exists() {
+            fs::remove_file(path).map_err(|e| format!("기존 백업 파일을 덮어쓸 수 없어요: {e}"))?;
+        }
+        let source = self.conn()?;
+        let mut destination = Connection::open(path).map_err(|e| e.to_string())?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination).map_err(|e| e.to_string())?;
+        backup.run_to_completion(128, Duration::from_millis(5), None).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn import_backup(&self, path: &Path) -> Result<(), String> {
+        if path == self.path {
+            return Err("현재 TANREN 데이터 파일은 백업으로 가져올 수 없어요.".into());
+        }
+        if !path.is_file() {
+            return Err("백업 파일을 찾을 수 없어요.".into());
+        }
+        let source = Connection::open(path).map_err(|e| format!("백업 파일을 열 수 없어요: {e}"))?;
+        let valid: bool = source.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='decks')",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| format!("TANREN 백업 파일이 아니에요: {e}"))?;
+        if !valid {
+            return Err("TANREN 백업 파일이 아니에요.".into());
+        }
+        let integrity: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+        if integrity != "ok" {
+            return Err("백업 파일이 손상되어 있어요.".into());
+        }
+        {
+            let mut destination = self.conn()?;
+            let backup = rusqlite::backup::Backup::new(&source, &mut destination).map_err(|e| e.to_string())?;
+            backup.run_to_completion(128, Duration::from_millis(5), None).map_err(|e| e.to_string())?;
+        }
+        self.migrate()?;
+        self.set_setting("device_id", Some(&self.device_id))?;
+        Ok(())
+    }
 }
 
 fn query_json<'a, const N: usize>(conn: &Connection, sql: &str, values: [&'a str; N]) -> Result<Vec<Value>, String> {
@@ -1287,6 +1335,35 @@ mod tests{
         assert!(destination.load_session(&deck.id).unwrap().is_some());
         assert_eq!(destination.stats(&deck.id).unwrap()[0].attempts, 1);
         assert!(destination.pitch_question(&entry.id, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn full_backup_restores_learning_history_and_statistics() {
+        let source_dir = tempdir().unwrap();
+        let source = Database::open(source_dir.path().join("source.db")).unwrap();
+        let deck = source.create_deck("backup", "ko-KR", "ja-JP").unwrap();
+        source.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()),
+        }]).unwrap();
+        let entry = source.entries(&deck.id).unwrap().remove(0);
+        source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~1", "고양이", true, Some(true), true, "exact", None, 420, 180, None).unwrap();
+        source.record_study_activity(&deck.id, Some(StudyMode::Reading), 7_500).unwrap();
+        source.set_setting("audio_volume", Some("0.65")).unwrap();
+
+        let backup_path = source_dir.path().join("all-data.tanren");
+        source.export_backup(&backup_path).unwrap();
+
+        let destination_dir = tempdir().unwrap();
+        let destination = Database::open(destination_dir.path().join("destination.db")).unwrap();
+        destination.import_backup(&backup_path).unwrap();
+        let stats = destination.library_stats().unwrap();
+        assert_eq!(stats.deck_count, 1);
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.seen_entry_count, 1);
+        assert_eq!(stats.study_time_ms, 7_500);
+        assert_eq!(stats.base_accuracy, Some(1.0));
+        assert_eq!(stats.pitch_accuracy, Some(1.0));
+        assert_eq!(destination.setting("audio_volume").unwrap().as_deref(), Some("0.65"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DeckStats, DeckSummary, EntryDraft, ImportResult, LibraryStats, SemanticRuntimeStatus, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
+import type { AudioSettings, DeckStats, DeckSummary, EntryDraft, ImportResult, LibraryStats, SemanticRuntimeStatus, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
 
 export const api = {
   listDecks: () => invoke<DeckSummary[]>("list_decks"),
@@ -44,6 +44,14 @@ export const api = {
   storageSettings: () => invoke<StorageSettings>("storage_settings"),
   pickStorageDirectory: () => invoke<string | null>("pick_storage_directory"),
   setStorageDirectory: (path: string | null) => invoke<StorageSettings>("set_storage_directory", { path }),
+  audioSettings: () => invoke<AudioSettings>("audio_settings"),
+  setAudioSettings: (settings: AudioSettings) => invoke<AudioSettings>("set_audio_settings", {
+    autoPlay: settings.auto_play,
+    volume: settings.volume,
+    playbackRate: settings.playback_rate,
+  }),
+  exportBackup: () => invoke<string | null>("export_backup"),
+  importBackup: () => invoke<boolean>("import_backup"),
   activateInputProfile: (language: string) => invoke<string | null>("activate_input_profile", { language }),
   exitStudy: () => invoke<void>("exit_study"),
 };

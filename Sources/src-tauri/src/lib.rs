@@ -49,6 +49,9 @@ struct AppState {
 }
 
 const SEMANTIC_STORAGE_SETTING: &str = "semantic_storage_dir";
+const AUDIO_AUTO_PLAY_SETTING: &str = "audio_auto_play";
+const AUDIO_VOLUME_SETTING: &str = "audio_volume";
+const AUDIO_PLAYBACK_RATE_SETTING: &str = "audio_playback_rate";
 
 #[derive(Serialize)]
 struct StorageSettings {
@@ -56,6 +59,13 @@ struct StorageSettings {
     active_path: String,
     default_path: String,
     restart_required: bool,
+}
+
+#[derive(Serialize)]
+struct AudioSettings {
+    auto_play: bool,
+    volume: f64,
+    playback_rate: f64,
 }
 
 #[tauri::command]
@@ -448,6 +458,36 @@ fn set_storage_directory(state: State<'_, AppState>, path: Option<String>) -> Re
 }
 
 #[tauri::command]
+fn audio_settings(state: State<'_, AppState>) -> Result<AudioSettings, String> {
+    audio_settings_snapshot(&state)
+}
+
+#[tauri::command]
+fn set_audio_settings(state: State<'_, AppState>, auto_play: bool, volume: f64, playback_rate: f64) -> Result<AudioSettings, String> {
+    let volume = volume.clamp(0.0, 1.0);
+    let playback_rate = playback_rate.clamp(0.5, 2.0);
+    state.db.set_setting(AUDIO_AUTO_PLAY_SETTING, Some(if auto_play { "1" } else { "0" }))?;
+    state.db.set_setting(AUDIO_VOLUME_SETTING, Some(&volume.to_string()))?;
+    state.db.set_setting(AUDIO_PLAYBACK_RATE_SETTING, Some(&playback_rate.to_string()))?;
+    audio_settings_snapshot(&state)
+}
+
+#[tauri::command]
+fn export_backup(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let Some(path) = pick_backup_file(true)? else { return Ok(None); };
+    state.db.export_backup(&path)?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn import_backup(state: State<'_, AppState>) -> Result<bool, String> {
+    let Some(path) = pick_backup_file(false)? else { return Ok(false); };
+    state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?.session = None;
+    state.db.import_backup(&path)?;
+    Ok(true)
+}
+
+#[tauri::command]
 fn exit_study(state: State<'_, AppState>) -> Result<(), String> {
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
     if let Some(session) = engine.session.as_mut() {
@@ -461,6 +501,11 @@ fn exit_study(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn activate_input_profile(window: tauri::WebviewWindow, state: State<'_, AppState>, language: String) -> Result<Option<String>, String> {
+    if language == "ja-JP" {
+        // Japanese input is handled entirely by TANREN's bundled Mozc WASM IME.
+        // Never require or switch the host OS Japanese input profile.
+        return Ok(None);
+    }
     #[cfg(windows)]
     {
         let hwnd = window.hwnd().map_err(|e| format!("could not resolve TANREN window: {e}"))?;
@@ -686,6 +731,45 @@ fn storage_settings_snapshot(state: &AppState) -> Result<StorageSettings, String
     })
 }
 
+fn audio_settings_snapshot(state: &AppState) -> Result<AudioSettings, String> {
+    let auto_play = state.db.setting(AUDIO_AUTO_PLAY_SETTING)?.as_deref() != Some("0");
+    let volume = state.db.setting(AUDIO_VOLUME_SETTING)?
+        .and_then(|value| value.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.0, 1.0);
+    let playback_rate = state.db.setting(AUDIO_PLAYBACK_RATE_SETTING)?
+        .and_then(|value| value.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.5, 2.0);
+    Ok(AudioSettings { auto_play, volume, playback_rate })
+}
+
+fn pick_backup_file(save: bool) -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    {
+        let dialog = if save { "SaveFileDialog" } else { "OpenFileDialog" };
+        let action = if save {
+            "$dialog.FileName = 'TANREN-backup.tanren'; $dialog.DefaultExt = 'tanren'; $dialog.AddExtension = $true; $dialog.OverwritePrompt = $true;"
+        } else {
+            "$dialog.CheckFileExists = $true;"
+        };
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; [Console]::OutputEncoding = [Text.UTF8Encoding]::new(); $dialog = New-Object System.Windows.Forms.{dialog}; $dialog.Filter = 'TANREN 백업 (*.tanren)|*.tanren|모든 파일 (*.*)|*.*'; {action} if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ $dialog.FileName }}"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-STA", "-Command", &script])
+            .output()
+            .map_err(|e| format!("파일 선택기를 열 수 없어요: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        let path = String::from_utf8(output.stdout).map_err(|e| format!("파일 경로를 읽을 수 없어요: {e}"))?;
+        let path = path.trim();
+        return Ok((!path.is_empty()).then(|| PathBuf::from(path)));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = save;
+        Err("백업 파일 선택은 현재 Windows에서만 지원해요.".into())
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -749,6 +833,10 @@ pub fn run() {
             storage_settings,
             pick_storage_directory,
             set_storage_directory,
+            audio_settings,
+            set_audio_settings,
+            export_backup,
+            import_backup,
             activate_input_profile,
             exit_study,
         ])
