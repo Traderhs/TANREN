@@ -1903,12 +1903,12 @@ function LibraryStatsView({ stats }: { stats: LibraryStats | null }) {
       : stats.deck_count === 0 ? <div className="stats-empty"><span>統</span><strong>아직 보여드릴 통계가 없어요.</strong><p>학습을 시작하면 기록이 여기에 쌓여요.</p></div>
       : <>
         <div className="stats-summary-grid">
-          <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="정답 여부와 관계없이 한 문제를 넘길 때마다 1회로 계산해요." />
-          <StatsMetric label="누적 단어 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help={"처음 본 단어만 1개로 계산해요.\n같은 단어를 다시 학습해도 중복되지 않아요."} />
-          <StatsMetric label="문제 정확도" value={formatPercent(stats.base_accuracy)} help={"Reading, Writing, Listening, Speaking의\n문제 정답률이에요. 피치 채점은 포함하지 않아요."} />
-          <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help={"피치 문제가 실제로 채점된 시도만 모아 계산한\n정확도예요."} />
-          <StatsMetric label="중앙 응답시간" value={formatLatency(stats.median_recall_latency_ms)} help="모든 문제 응답시간의 중앙값이에요." />
-          <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="0-50 같은 학습 구간 화면이 활성화되어 있던 시간을 모두 더해요." />
+          <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="지금까지 문제를 푼 횟수예요." />
+          <StatsMetric label="누적 단어 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help="한 번이라도 학습한 단어 수예요." />
+          <StatsMetric label="문제 정확도" value={formatPercent(stats.base_accuracy)} help="피치를 제외한 문제의 정답률이에요." />
+          <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help="피치를 채점한 문제의 정답률이에요." />
+          <StatsMetric label="중앙 응답시간" value={formatLatency(stats.median_recall_latency_ms)} help="문제를 보고 답을 입력하기 시작하기까지 걸린 시간이에요." />
+          <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="학습 화면에서 실제로 공부한 시간을 기록해요." />
           <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요." />
         </div>
 
