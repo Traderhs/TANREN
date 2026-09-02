@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AudioSettings, DeckStats, DeckSummary, EntryDraft, ImportResult, LibraryStats, SemanticRuntimeStatus, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
+import type { AudioSettings, DeckStats, DeckSummary, EntryDraft, EntryListRecord, ImportResult, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
 
 export const api = {
   listDecks: () => invoke<DeckSummary[]>("list_decks"),
+  listEntries: (deckId: string) => invoke<EntryListRecord[]>("list_entries", { deckId }),
+  stageSchedule: (deckId: string, stage: number) => invoke<StageScheduleSummary>("stage_schedule", { deckId, stage }),
   createDeck: (name: string) =>
     invoke<DeckSummary>("create_deck", {
       name,
@@ -11,7 +13,11 @@ export const api = {
     }),
   importEntries: (deckId: string, entries: EntryDraft[]) =>
     invoke<ImportResult>("import_entries", { deckId, entries }),
-  startStudy: (deckId: string, stageIndex?: number) => invoke<SubmitResult>("start_study", { deckId, stageIndex }),
+  updateEntry: (deckId: string, entryId: string, entry: EntryDraft) =>
+    invoke<void>("update_entry", { deckId, entryId, entry }),
+  deleteEntry: (deckId: string, entryId: string) =>
+    invoke<void>("delete_entry", { deckId, entryId }),
+  startStudy: (deckId: string, stage?: number) => invoke<SubmitResult>("start_study", { deckId, stage }),
   updateDeck: (deckId: string, name: string, enabledModes: StudyMode[]) =>
     invoke<DeckSummary>("update_deck", { deckId, name, enabledModes }),
   deleteDeck: (deckId: string) => invoke<void>("delete_deck", { deckId }),
@@ -34,7 +40,6 @@ export const api = {
   submitPitch: (variantId: string, patterns: number[]) =>
     invoke<SubmitResult>("submit_pitch", { variantId, patterns }),
   continueReview: () => invoke<SubmitResult>("continue_review"),
-  continueStage: () => invoke<SubmitResult>("continue_stage"),
   adjudicate: (variantId: string, accept: boolean) =>
     invoke<SubmitResult>("adjudicate_answer", { variantId, accept }),
   stats: (deckId: string) => invoke<DeckStats[]>("deck_stats", { deckId }),

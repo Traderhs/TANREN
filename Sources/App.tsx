@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, forwardRef, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, forwardRef, memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
@@ -9,7 +9,7 @@ import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Too
 import { api } from "./lib/api";
 import { parseEntryText } from "./lib/importParser";
 import { japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime, type JapaneseImeSegment, type JapaneseImeSession } from "./lib/japaneseIme";
-import type { AudioSettings, DeckStats, DeckSummary, LibraryStats, PitchQuestion, SemanticRuntimeStatus, StorageSettings, StudyCard, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./lib/types";
+import type { AudioSettings, DeckStats, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, PitchQuestion, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyCard, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./lib/types";
 import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, setPitchLevel, shouldAutoPlayAfterWrittenAnswer, type PitchLevel, type PitchSelection } from "./lib/studyFlow";
 import { completionDelayMs, firstMeaningfulInputAt, isMeaningfulInput, recallHasTimedOut } from "./lib/studyTimers";
 
@@ -41,6 +41,16 @@ function runtimePhaseLabel(phase: string, downloadProgress?: number | null) {
 
 function runtimePhaseIsLoading(phase?: string) {
   return !phase || phase === "starting" || phase === "downloading" || phase === "loading";
+}
+
+function formatStudyRangeLabel(label?: string | null, separator = " - ") {
+  if (!label) return "—";
+  const core = label.replace(" · cumulative", "");
+  const match = /^(\d+)~(\d+)$/.exec(core);
+  if (!match) return core;
+  const start = Number(match[1]) + 1;
+  const end = Number(match[2]) + 1;
+  return `${start.toLocaleString("ko-KR")}${separator}${end.toLocaleString("ko-KR")}`;
 }
 
 function OpenBook3D() {
@@ -373,10 +383,10 @@ function App() {
     };
   }, [initialRuntimeReady]);
 
-  const openStudy = async (deck: DeckSummary, stageIndex?: number) => {
+  const openStudy = async (deck: DeckSummary, stage?: number) => {
     try {
       setSelected(deck);
-      const started = await api.startStudy(deck.id, stageIndex);
+      const started = await api.startStudy(deck.id, stage);
       setCard(started.card ?? null);
       setResult(started);
       setView("study");
@@ -436,7 +446,7 @@ function App() {
               aria-label="통계로 이동"
               onClick={() => scrollHomeSection(1)}
             />
-            <DeckList
+            <MemoDeckList
               decks={decks}
               onRefresh={refresh}
               onEdit={(d) => { setSelected(d); setView("editor"); }}
@@ -556,7 +566,7 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
     onAudioSettingsChange(next);
     audioWriteTail.current = audioWriteTail.current
       .then(async () => { await api.setAudioSettings(next); })
-      .catch(() => {});
+      .catch(() => { });
   };
 
   const exportBackup = async () => {
@@ -643,11 +653,134 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
   </section>;
 }
 
+type BookWordSortKey = "position" | "term" | "reading" | "meaning" | "attempts";
+
+function BookInlineWordManager({ deckId, onAdd, onImport, onEdit, onDelete }: {
+  deckId: string;
+  onAdd: () => void;
+  onImport: () => void;
+  onEdit: (entry: EntryListRecord) => void;
+  onDelete: (entry: EntryListRecord) => void;
+}) {
+  const [entries, setEntries] = useState<EntryListRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [sort, setSort] = useState<{ key: BookWordSortKey; direction: "asc" | "desc" }>({ key: "position", direction: "asc" });
+  const requestIdRef = useRef(0);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    const loadEntries = async (scrollToBottom = false) => {
+      const requestId = ++requestIdRef.current;
+      setLoading(true);
+      try {
+        const nextEntries = await api.listEntries(deckId);
+        if (!disposed && requestId === requestIdRef.current) {
+          setEntries(nextEntries);
+          if (scrollToBottom) {
+            window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+              const list = listRef.current;
+              if (list) list.scrollTop = list.scrollHeight;
+            }));
+          }
+        }
+      } finally {
+        if (!disposed && requestId === requestIdRef.current) setLoading(false);
+      }
+    };
+    const handleEntriesChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ deckId?: string; scrollToBottom?: boolean }>).detail;
+      if (detail?.deckId === deckId) void loadEntries(Boolean(detail.scrollToBottom));
+    };
+
+    void loadEntries();
+    window.addEventListener("tanren:deck-entries-changed", handleEntriesChanged);
+    return () => {
+      disposed = true;
+      window.removeEventListener("tanren:deck-entries-changed", handleEntriesChanged);
+    };
+  }, [deckId]);
+
+  const query = search.trim().toLocaleLowerCase();
+  const filteredEntries = query
+    ? entries.filter((entry) => entry.term.toLocaleLowerCase().includes(query)
+      || (entry.reading ?? "").toLocaleLowerCase().includes(query)
+      || entry.meanings.some((meaning) => meaning.toLocaleLowerCase().includes(query)))
+    : entries;
+  const entryNumbers = new Map(entries.map((entry) => [entry.id, entry.position + 1]));
+  const sortedEntries = [...filteredEntries].sort((left, right) => {
+    let result = 0;
+    if (sort.key === "position") result = left.position - right.position;
+    else if (sort.key === "attempts") result = left.attempts - right.attempts;
+    else if (sort.key === "term") result = left.term.localeCompare(right.term, undefined, { numeric: true, sensitivity: "base" });
+    else if (sort.key === "reading") result = (left.reading ?? "").localeCompare(right.reading ?? "", undefined, { numeric: true, sensitivity: "base" });
+    else result = left.meanings.join(" / ").localeCompare(right.meanings.join(" / "), undefined, { numeric: true, sensitivity: "base" });
+    if (result === 0) result = left.position - right.position;
+    return sort.direction === "asc" ? result : -result;
+  });
+  const toggleSort = (key: BookWordSortKey) => {
+    setSort((current) => current.key === key
+      ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+      : { key, direction: "asc" });
+  };
+  const sortMark = (key: BookWordSortKey) => sort.key === key ? (sort.direction === "asc" ? " ↑" : " ↓") : "";
+  const sortMarkBefore = (key: BookWordSortKey) => sort.key === key ? (sort.direction === "asc" ? "↑ " : "↓ ") : "";
+
+  return <section className="book-inline-words" aria-label="단어 관리">
+    <div className="book-inline-word-toolbar">
+      <input
+        className="home-create-input"
+        value={search}
+        onChange={(event) => setSearch(event.target.value)}
+        placeholder="단어 검색"
+        aria-label="단어 검색"
+      />
+      <button className="settings-action-button book-inline-word-add" onClick={onAdd} aria-label="단어 추가">+</button>
+      <button className="settings-action-button" onClick={onImport}>파일</button>
+    </div>
+    <div className={`book-inline-word-list ${loading || filteredEntries.length === 0 ? "is-empty" : ""}`} ref={listRef}>
+      <div className="book-inline-word-row book-inline-word-header" role="row">
+        <button type="button" className="ghost book-inline-word-sort" onClick={() => toggleSort("position")}>번호{sortMark("position")}</button>
+        <button type="button" className="ghost book-inline-word-sort" onClick={() => toggleSort("term")}>단어{sortMark("term")}</button>
+        <button type="button" className="ghost book-inline-word-sort" onClick={() => toggleSort("reading")}>발음{sortMark("reading")}</button>
+        <button type="button" className="ghost book-inline-word-sort" onClick={() => toggleSort("meaning")}>뜻{sortMark("meaning")}</button>
+        <button type="button" className="ghost book-inline-word-sort is-numeric" onClick={() => toggleSort("attempts")}>{sortMarkBefore("attempts")}시도</button>
+        <span className="book-inline-word-settings-head">편집</span>
+        <span className="book-inline-word-delete-head">삭제</span>
+      </div>
+      {loading ? <div className="book-inline-word-empty">불러오는 중</div>
+        : filteredEntries.length === 0 ? <div className="book-inline-word-empty">{entries.length === 0 ? "아직 단어가 없어요." : "검색 결과가 없어요."}</div>
+          : sortedEntries.map((entry) => <div className="book-inline-word-row" key={entry.id} role="row">
+            <span className="book-inline-word-number">{(entryNumbers.get(entry.id) ?? 0).toLocaleString("ko-KR")}</span>
+            <strong>{entry.term}</strong>
+            <span className="book-inline-word-reading">{entry.reading || "—"}</span>
+            <span className="book-inline-word-meaning">{entry.meanings.join(" / ")}</span>
+            <span className="book-inline-word-attempts">{entry.attempts.toLocaleString("ko-KR")}회</span>
+            <button type="button" className="book-inline-word-settings" onClick={() => onEdit(entry)} aria-label={`${entry.term} 편집`} title="단어 편집">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 20h4.2L19 9.2a2 2 0 0 0 0-2.8l-1.4-1.4a2 2 0 0 0-2.8 0L4 15.8V20Z" />
+                <path d="m13.8 6 4.2 4.2" />
+              </svg>
+            </button>
+            <button type="button" className="book-inline-word-delete" onClick={() => onDelete(entry)} aria-label={`${entry.term} 삭제`} title="단어 삭제">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h16" />
+                <path d="M9 7V4h6v3" />
+                <path d="m7 7 1 13h8l1-13" />
+                <path d="M10 11v5M14 11v5" />
+              </svg>
+            </button>
+          </div>)}
+    </div>
+  </section>;
+}
+
 function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
   decks: DeckSummary[];
   onRefresh: () => Promise<void>;
   onEdit: (d: DeckSummary) => void;
-  onStudy: (d: DeckSummary, stageIndex?: number) => void;
+  onStudy: (d: DeckSummary, stage?: number) => void;
   onStats: (d: DeckSummary) => void;
 }) {
   const [name, setName] = useState("");
@@ -655,8 +788,25 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
   const [openedDeckId, setOpenedDeckId] = useState<string | null>(null);
   const [bookOpenCycle, setBookOpenCycle] = useState(0);
   const [bookSettled, setBookSettled] = useState(false);
+  const [bookPanel, setBookPanel] = useState<"study" | "words" | "stats">("study");
+  const [bookEntries, setBookEntries] = useState<EntryRecord[]>([]);
+  const [bookStats, setBookStats] = useState<DeckStats[] | null>(null);
+  const [bookPanelLoading, setBookPanelLoading] = useState(false);
+  const [stageSchedules, setStageSchedules] = useState<Record<number, StageScheduleSummary>>({});
+  const [wordSearch, setWordSearch] = useState("");
+  const [wordDialog, setWordDialog] = useState<"single" | "bulk" | null>(null);
+  const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
+  const [deleteCandidate, setDeleteCandidate] = useState<EntryListRecord | null>(null);
+  const [skipDeleteConfirm, setSkipDeleteConfirm] = useState(false);
+  const [singleTerm, setSingleTerm] = useState("");
+  const [singleMeaning, setSingleMeaning] = useState("");
+  const [singleReading, setSingleReading] = useState("");
+  const [bulkText, setBulkText] = useState("");
+  const [wordMessage, setWordMessage] = useState("");
+  const [wordSaving, setWordSaving] = useState(false);
   const reduceMotion = useReducedMotion();
   const flipBookRef = useRef<any>(null);
+  const skipDeleteConfirmDeckIdsRef = useRef(new Set<string>());
   const flutterTimerRef = useRef<number | null>(null);
   const flutteringRef = useRef(false);
   const activeBookSessionRef = useRef("");
@@ -676,8 +826,45 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
     }
   };
   const openedDeck = openedDeckId ? decks.find((deck) => deck.id === openedDeckId) ?? null : null;
+  const filteredBookEntries = wordSearch.trim()
+    ? bookEntries.filter((entry) => {
+      const query = wordSearch.trim().toLocaleLowerCase();
+      return entry.term.toLocaleLowerCase().includes(query)
+        || (entry.reading ?? "").toLocaleLowerCase().includes(query)
+        || entry.meanings.some((meaning) => meaning.toLocaleLowerCase().includes(query));
+    })
+    : bookEntries;
+  const parsedBulkEntries = parseEntryText(bulkText);
   const bookSessionKey = openedDeck ? `${openedDeck.id}:${bookOpenCycle}` : "";
   activeBookSessionRef.current = bookSessionKey;
+
+  useEffect(() => {
+    if (openedDeckId) void onRefresh();
+  }, [openedDeckId, bookOpenCycle]);
+
+  useEffect(() => {
+    if (!openedDeck) {
+      setStageSchedules({});
+      return;
+    }
+    let disposed = false;
+    const stages = Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1);
+    void Promise.all(stages.map(async (stage) => {
+      try {
+        return { stage, schedule: await api.stageSchedule(openedDeck.id, stage) };
+      } catch {
+        return null;
+      }
+    })).then((schedules) => {
+      if (disposed) return;
+      const next: Record<number, StageScheduleSummary> = {};
+      for (const item of schedules) {
+        if (item) next[item.stage] = item.schedule;
+      }
+      setStageSchedules(next);
+      });
+    return () => { disposed = true; };
+  }, [openedDeck?.id, openedDeck?.entry_count, openedDeck?.current_stage, openedDeck?.total_stage_count]);
 
   const clearFlutterTimer = () => {
     if (flutterTimerRef.current !== null) window.clearTimeout(flutterTimerRef.current);
@@ -706,7 +893,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
   };
 
   const beginBookFlutter = (sessionKey: string) => {
-    if (reduceMotion || !sessionKey || activeBookSessionRef.current !== sessionKey) return;
+    if (reduceMotion || bookSettled || !sessionKey || activeBookSessionRef.current !== sessionKey) return;
     if (flutterStartedSessionRef.current === sessionKey) return;
     flutterStartedSessionRef.current = sessionKey;
     flutterRetryRef.current = 0;
@@ -722,7 +909,157 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
     flutterRetryRef.current = 0;
     flutterStartedSessionRef.current = "";
     setBookSettled(false);
+    setBookPanel("study");
+    setWordDialog(null);
+    setEditingEntryId(null);
+    setDeleteCandidate(null);
+    setSkipDeleteConfirm(false);
+    setWordMessage("");
     setOpenedDeckId(null);
+  };
+
+  const openWordPanel = async () => {
+    if (!openedDeck) return;
+    setBookPanel("words");
+    setWordMessage("");
+    setBookPanelLoading(true);
+    try {
+      setBookEntries(await api.listEntries(openedDeck.id));
+    } finally {
+      setBookPanelLoading(false);
+    }
+  };
+
+  const openStatsPanel = async () => {
+    if (!openedDeck) return;
+    setBookPanel("stats");
+    setBookPanelLoading(true);
+    try {
+      setBookStats(await api.stats(openedDeck.id));
+    } finally {
+      setBookPanelLoading(false);
+    }
+  };
+
+  const refreshBookEntries = async (deckId: string, scrollToBottom = false) => {
+    if (bookPanel === "words") setBookEntries(await api.listEntries(deckId));
+    await onRefresh();
+    window.dispatchEvent(new CustomEvent("tanren:deck-entries-changed", { detail: { deckId, scrollToBottom } }));
+  };
+
+  const openAddWordDialog = () => {
+    setEditingEntryId(null);
+    setSingleTerm("");
+    setSingleMeaning("");
+    setSingleReading("");
+    setWordMessage("");
+    setWordDialog("single");
+  };
+
+  const openEditWordDialog = (entry: EntryListRecord) => {
+    setEditingEntryId(entry.id);
+    setSingleTerm(entry.term);
+    setSingleMeaning(entry.meanings.join(" / "));
+    setSingleReading(entry.reading ?? "");
+    setWordMessage("");
+    setWordDialog("single");
+  };
+
+  const openImportWordDialog = () => {
+    setEditingEntryId(null);
+    setWordMessage("");
+    setWordDialog("bulk");
+  };
+
+  const closeWordDialog = () => {
+    setWordDialog(null);
+    setEditingEntryId(null);
+  };
+
+  const deleteWord = async (entry: EntryListRecord) => {
+    if (!openedDeck || wordSaving) return;
+    setWordSaving(true);
+    try {
+      await api.deleteEntry(openedDeck.id, entry.id);
+      setDeleteCandidate(null);
+      setSkipDeleteConfirm(false);
+      await refreshBookEntries(openedDeck.id);
+    } finally {
+      setWordSaving(false);
+    }
+  };
+
+  const openDeleteWordDialog = (entry: EntryListRecord) => {
+    if (!openedDeck) return;
+    if (skipDeleteConfirmDeckIdsRef.current.has(openedDeck.id)) {
+      void deleteWord(entry);
+      return;
+    }
+    setSkipDeleteConfirm(false);
+    setDeleteCandidate(entry);
+  };
+
+  const confirmDeleteWord = async () => {
+    if (!openedDeck || !deleteCandidate) return;
+    if (skipDeleteConfirm) skipDeleteConfirmDeckIdsRef.current.add(openedDeck.id);
+    await deleteWord(deleteCandidate);
+  };
+
+  useEffect(() => {
+    if ((!wordDialog && !deleteCandidate) || wordSaving) return;
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (deleteCandidate) {
+        setDeleteCandidate(null);
+        setSkipDeleteConfirm(false);
+      } else {
+        closeWordDialog();
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => window.removeEventListener("keydown", closeOnEscape, true);
+  }, [wordDialog, deleteCandidate, wordSaving]);
+
+  const addSingleEntry = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!openedDeck || !singleTerm.trim() || !singleMeaning.trim() || wordSaving) return;
+    setWordSaving(true);
+    try {
+      const entry = {
+        term: singleTerm.trim(),
+        meanings: singleMeaning.split("/").map((value) => value.trim()).filter(Boolean),
+        reading: singleReading.trim() || undefined,
+      };
+      const result = editingEntryId
+        ? null
+        : await api.importEntries(openedDeck.id, [entry]);
+      if (editingEntryId) await api.updateEntry(openedDeck.id, editingEntryId, entry);
+      setSingleTerm("");
+      setSingleMeaning("");
+      setSingleReading("");
+      setWordDialog(null);
+      setEditingEntryId(null);
+      setWordMessage("");
+      await refreshBookEntries(openedDeck.id, Boolean(result?.inserted));
+    } finally {
+      setWordSaving(false);
+    }
+  };
+
+  const addBulkEntries = async () => {
+    if (!openedDeck || parsedBulkEntries.entries.length === 0 || wordSaving) return;
+    setWordSaving(true);
+    try {
+      const result = await api.importEntries(openedDeck.id, parsedBulkEntries.entries);
+      setWordMessage("");
+      setBulkText("");
+      setWordDialog(null);
+      await refreshBookEntries(openedDeck.id, result.inserted > 0);
+    } finally {
+      setWordSaving(false);
+    }
   };
   useEffect(() => {
     clearFlutterTimer();
@@ -760,120 +1097,254 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
       >
         <OpenBook3D />
         <div className="book-flip-stack">
-        <HTMLFlipBook
-          key={`${openedDeck.id}-${bookOpenCycle}`}
-          ref={flipBookRef}
-          className="tanren-flip-book"
-          style={{}}
-          width={590}
-          height={690}
-          size="stretch"
-          minWidth={390}
-          maxWidth={620}
-          minHeight={500}
-          maxHeight={720}
-          startPage={reduceMotion ? BOOK_CONTENT_PAGE : 0}
-          drawShadow={!reduceMotion}
-          flippingTime={reduceMotion ? 1 : 125}
-          usePortrait={false}
-          startZIndex={10}
-          autoSize={true}
-          maxShadowOpacity={0.38}
-          showCover={true}
-          mobileScrollSupport={true}
-          clickEventForward={true}
-          useMouseEvents={false}
-          swipeDistance={30}
-          showPageCorners={false}
-          disableFlipByClick={true}
-          renderOnlyPageLengthChange={false}
-          onInit={() => beginBookFlutter(bookSessionKey)}
-          onFlip={(event) => continueBookFlutter(Number(event.data), bookSessionKey)}
-        >
-          <FlipPage className="book-cover-page book-shelf-cover-page" hard>
-            <span className="ebook-cover">
-              <span className="ebook-cover-face">
-                <span className="ebook-volume">Vol. {String(decks.findIndex((deck) => deck.id === openedDeck.id) + 1).padStart(2, "0")}</span>
-                <span className="ebook-rule" />
-                <span className="ebook-language">日本語</span>
-                <strong title={openedDeck.name}>{openedDeck.name}</strong>
-                <span className="ebook-bottom">
-                  <span className="ebook-meta">{openedDeck.entry_count.toLocaleString("en-US")} Words</span>
-                  <span className="ebook-current">
-                    <span className="ebook-current-round">Round {openedDeck.current_round}</span>
-                    <span className="ebook-current-range">{openedDeck.active_stage ? openedDeck.active_stage.replace(" · cumulative", "").replace("~", " - ") : "—"}</span>
+          <span className="book-paper-center-edge" aria-hidden="true" />
+          <HTMLFlipBook
+            key={`${openedDeck.id}-${bookOpenCycle}`}
+            ref={flipBookRef}
+            className="tanren-flip-book"
+            style={{}}
+            width={590}
+            height={690}
+            size="stretch"
+            minWidth={390}
+            maxWidth={620}
+            minHeight={500}
+            maxHeight={720}
+            startPage={reduceMotion || bookSettled ? BOOK_CONTENT_PAGE : 0}
+            drawShadow={!reduceMotion}
+            flippingTime={reduceMotion ? 1 : 125}
+            usePortrait={false}
+            startZIndex={10}
+            autoSize={true}
+            maxShadowOpacity={0.38}
+            showCover={true}
+            mobileScrollSupport={true}
+            clickEventForward={true}
+            useMouseEvents={false}
+            swipeDistance={30}
+            showPageCorners={false}
+            disableFlipByClick={true}
+            renderOnlyPageLengthChange={false}
+            onInit={() => beginBookFlutter(bookSessionKey)}
+            onFlip={(event) => continueBookFlutter(Number(event.data), bookSessionKey)}
+          >
+            <FlipPage className="book-cover-page book-shelf-cover-page" hard>
+              <span className="ebook-cover">
+                <span className="ebook-cover-face">
+                  <span className="ebook-volume">Vol. {String(decks.findIndex((deck) => deck.id === openedDeck.id) + 1).padStart(2, "0")}</span>
+                  <span className="ebook-rule" />
+                  <span className="ebook-language">日本語</span>
+                  <strong title={openedDeck.name}>{openedDeck.name}</strong>
+                  <span className="ebook-bottom">
+                    <span className="ebook-meta">{openedDeck.entry_count.toLocaleString("en-US")} Words</span>
+                    <span className="ebook-current">
+                      <span className="ebook-current-stage">{openedDeck.current_stage}단계</span>
+                      <span className="ebook-current-range">{formatStudyRangeLabel(openedDeck.active_range, " - ")}</span>
+                    </span>
+                    <span className="ebook-progress" aria-hidden="true"><i style={{ width: `${openedDeck.total_stage_count === 0 ? 0 : Math.min(100, (openedDeck.completed_stage_count / openedDeck.total_stage_count) * 100)}%` }} /></span>
                   </span>
-                  <span className="ebook-progress" aria-hidden="true"><i style={{ width: `${openedDeck.study_ranges.length === 0 ? 0 : Math.min(100, (openedDeck.completed_range_count / openedDeck.study_ranges.length) * 100)}%` }} /></span>
                 </span>
+                <span className="ebook-page-edge ebook-page-edge-right" aria-hidden="true" />
               </span>
-              <span className="ebook-page-edge ebook-page-edge-right" aria-hidden="true" />
-            </span>
-          </FlipPage>
-
-          {Array.from({ length: BOOK_FLUTTER_LEAF_COUNT }, (_, index) => (
-            <FlipPage key={`flutter-${index}`} className="book-flutter-page">
-              <span className="book-flutter-folio">{String(index + 1).padStart(2, "0")}</span>
             </FlipPage>
-          ))}
 
-          <FlipPage className="book-inside-page book-inside-left">
-            <div className="book-page-inner">
+            {Array.from({ length: BOOK_FLUTTER_LEAF_COUNT }, (_, index) => (
+              <FlipPage key={`flutter-${index}`} className="book-flutter-page">
+                <span className="book-flutter-folio">{String(index + 1).padStart(2, "0")}</span>
+              </FlipPage>
+            ))}
+
+            <FlipPage className="book-inside-page book-inside-left">
+              <div className="book-page-inner">
               <div className="book-page-topline">
-                <button className="book-close ghost" onClick={closeOpenedBook}>← 책장</button>
-                <span className="book-folio">{String(decks.findIndex((deck) => deck.id === openedDeck.id) + 1).padStart(2, "0")}</span>
+                <button className="book-close ghost" onClick={closeOpenedBook} aria-label="책장" title="책장" />
+                <button className="book-top-stats ghost" onClick={() => void openStatsPanel()}>통계</button>
+                </div>
+                <div className="book-title-summary">
+                  <div className="book-title-page">
+                    <span className="book-language">
+                      {openedDeck.target_language === "ja-JP" ? "日本語"
+                        : openedDeck.target_language === "ko-KR" ? "한국어"
+                          : openedDeck.target_language === "en-US" ? "English"
+                            : openedDeck.target_language}
+                    </span>
+                    <h2>{openedDeck.name}</h2>
+                  </div>
+                  <dl className="book-stats">
+                    <div><dt>Words</dt><dd>{openedDeck.entry_count.toLocaleString("ko-KR")}개</dd></div>
+                    <div><dt>단계</dt><dd>{openedDeck.total_stage_count.toLocaleString("ko-KR")}개</dd></div>
+                  </dl>
+                </div>
+                <BookInlineWordManager
+                  deckId={openedDeck.id}
+                  onAdd={openAddWordDialog}
+                  onImport={openImportWordDialog}
+                  onEdit={openEditWordDialog}
+                  onDelete={openDeleteWordDialog}
+                />
               </div>
-              <div className="book-title-page">
-                <span className="book-imprint">TANREN · 鍛錬</span>
-                <div className="book-rule" />
-                <span className="book-language">{openedDeck.source_language} → {openedDeck.target_language}</span>
-                <h2>{openedDeck.name}</h2>
-                <p>TRAINING DECK</p>
-              </div>
-              <dl className="book-stats">
-                <div><dt>WORDS</dt><dd>{openedDeck.entry_count}</dd></div>
-                <div><dt>ROUND</dt><dd>{openedDeck.current_round}</dd></div>
-                <div><dt>RANGES</dt><dd>{openedDeck.study_ranges.length}</dd></div>
-              </dl>
-              <div className="book-tools">
-                <button className="ghost" onClick={() => onEdit(openedDeck)}>편집</button>
-                <button className="ghost" onClick={() => onStats(openedDeck)}>통계</button>
-              </div>
-            </div>
-          </FlipPage>
+            </FlipPage>
 
-          <FlipPage className="book-inside-page book-inside-right">
-            <div className="book-page-inner book-page-inner-right">
-              <div className="range-heading">
-                <div><span>CONTENTS</span><strong>학습 구간</strong></div>
-                {openedDeck.active_stage && <small>현재 {openedDeck.active_stage.replace(" · cumulative", "").replace("~", "–")}</small>}
-              </div>
-              <div className="book-range-scroll" aria-label={`${openedDeck.name} study ranges`}>
-                {openedDeck.study_ranges.map((range) => {
-                  const label = range.label.replace(" · cumulative", "").replace("~", "–");
-                  const active = openedDeck.active_stage === range.label;
-                  return <button
-                    key={range.stage_index}
-                    className={`book-range ${range.cumulative ? "is-cumulative" : ""} ${active ? "is-current" : ""}`}
-                    onClick={() => onStudy(openedDeck, range.stage_index)}
-                  >
-                    <span className="book-range-index">{String(range.stage_index + 1).padStart(2, "0")}</span>
-                    <span className="book-range-copy"><strong>{label}</strong><small>{range.end - range.start} words</small></span>
-                    {range.cumulative && <span className="book-range-kind">누적</span>}
-                    {active && <span className="book-range-current">현재</span>}
-                    <span className="book-range-arrow" aria-hidden="true">↗</span>
-                  </button>;
-                })}
-                {openedDeck.study_ranges.length === 0 && <div className="book-range-empty">단어를 먼저 추가해주세요.</div>}
-              </div>
-              <span className="book-page-foot">학습할 구간을 골라주세요</span>
-            </div>
-          </FlipPage>
+            <FlipPage className="book-inside-page book-inside-right">
+              <div className="book-page-inner book-page-inner-right">
+                <div className="range-heading">
+                  <div><span>CONTENTS</span><strong>학습 구간</strong></div>
+                </div>
+                <div className="book-range-scroll" aria-label={`${openedDeck.name} study ranges`}>
+                  <div className="book-stage-list">
+                    {Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1).map((stage) => {
+                      const current = stage === openedDeck.current_stage;
+                      const fallbackRange = openedDeck.study_ranges[stage - 1];
+                      const schedule = stageSchedules[stage];
+                      const range = schedule?.study_range ?? fallbackRange;
+                      const completed = Boolean(schedule?.completed);
+                      return <div className={`book-stage-group ${current ? "is-current-stage" : ""} ${completed ? "is-completed-stage" : ""}`} key={stage}>
+                        <button
+                          type="button"
+                          className="ghost book-stage-card"
+                          onClick={() => onStudy(openedDeck, stage)}
+                        >
+                          <strong className="book-stage-title">{stage.toLocaleString("ko-KR")}단계</strong>
 
-          <FlipPage className="book-back-page" hard>
-            <span>鍛錬</span>
-          </FlipPage>
-        </HTMLFlipBook>
+                          <span className="book-stage-middle">
+                            <span className="book-stage-range" aria-label={`${stage}단계 학습 구간`}>
+                              {range && <span
+                                className={`book-stage-range-link ${schedule?.active ? "is-current" : ""}`}
+                              >{formatStudyRangeLabel(range.label)}</span>}
+                            </span>
+                          </span>
+                          {completed && <span className="book-stage-complete" aria-label="클리어 완료">✓</span>}
+                        </button>
+                      </div>;
+                    })}
+                  </div>
+                </div>
+            </div>
+            </FlipPage>
+
+            <FlipPage className="book-back-page" hard>
+              <span>鍛錬</span>
+            </FlipPage>
+          </HTMLFlipBook>
         </div>
+
+        {bookPanel !== "study" && <div
+          className="book-workspace-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !wordDialog) setBookPanel("study");
+          }}
+        >
+          <div className={`book-workspace ${bookPanel === "stats" ? "is-stats" : "is-words"}`} role="dialog" aria-modal="true" aria-label={bookPanel === "words" ? `${openedDeck.name} 단어 관리` : `${openedDeck.name} 통계`}>
+            <header className="book-workspace-header">
+              <div className="book-workspace-title">
+                <div><span>{bookPanel === "words" ? "WORDS" : "STATISTICS"}</span><strong>{openedDeck.name}</strong></div>
+              </div>
+              <div className="book-workspace-actions">
+                {bookPanel === "words" && <>
+                  <button className="ghost" onClick={openAddWordDialog}>+ 단어 추가</button>
+                  <button className="ghost" onClick={openImportWordDialog}>파일에서 추가</button>
+                </>}
+                <button className="ghost book-workspace-close" aria-label="닫기" onClick={() => setBookPanel("study")}>×</button>
+              </div>
+            </header>
+
+            {bookPanel === "words" ? <>
+              <div className="book-word-toolbar">
+                <label className="book-word-search">
+                  <span aria-hidden="true">⌕</span>
+                  <input value={wordSearch} onChange={(event) => setWordSearch(event.target.value)} placeholder="단어, 발음, 뜻 검색" aria-label="단어 검색" />
+                </label>
+                <span>{numberFormat.format(filteredBookEntries.length)} / {numberFormat.format(bookEntries.length)}개</span>
+              </div>
+              {wordMessage && <p className="book-word-message">{wordMessage}</p>}
+              <div className="book-word-browser">
+                <div className="book-word-row book-word-row-head" aria-hidden="true">
+                  <span>#</span><span>단어</span><span>발음</span><span>뜻</span>
+                </div>
+                <div className="book-word-list">
+                  {bookPanelLoading ? <div className="book-workspace-empty">단어를 불러오고 있어요.</div>
+                    : filteredBookEntries.length === 0 ? <div className="book-workspace-empty">{bookEntries.length === 0 ? "아직 단어가 없어요." : "검색 결과가 없어요."}</div>
+                      : filteredBookEntries.map((entry, index) => <div className="book-word-row" key={entry.id}>
+                        <span>{String(index + 1).padStart(3, "0")}</span>
+                        <strong>{entry.term}</strong>
+                        <span className="book-word-reading">{entry.reading || "—"}</span>
+                        <span className="book-word-meaning">{entry.meanings.join(" / ")}</span>
+                      </div>)}
+                </div>
+              </div>
+            </> : <div className="book-stats-workspace">
+              {bookPanelLoading || !bookStats ? <div className="book-workspace-empty">통계를 불러오고 있어요.</div> : <DeckStatsView deck={openedDeck} stats={bookStats} />}
+            </div>}
+
+            {wordDialog && <div className="book-word-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !wordSaving) closeWordDialog(); }}>
+              {wordDialog === "single" ? <form className="book-word-dialog" onSubmit={(event) => void addSingleEntry(event)}>
+                <div className="book-word-dialog-head"><div><span>{editingEntryId ? "EDIT WORD" : "ADD WORD"}</span><h3>{editingEntryId ? "단어 편집" : "단어 추가"}</h3></div><button type="button" className="ghost" onClick={closeWordDialog}>×</button></div>
+                <label><span>단어</span><input autoFocus value={singleTerm} onChange={(event) => setSingleTerm(event.target.value)} placeholder="例: 見据える" /></label>
+                <label><span>발음 <small>선택</small></span><input value={singleReading} onChange={(event) => setSingleReading(event.target.value)} placeholder="みすえる" /></label>
+                <label><span>뜻</span><input value={singleMeaning} onChange={(event) => setSingleMeaning(event.target.value)} placeholder="여러 뜻은 / 로 구분" /></label>
+                <div className="book-word-dialog-actions"><button type="button" className="ghost" onClick={closeWordDialog}>취소</button><button disabled={wordSaving || !singleTerm.trim() || !singleMeaning.trim()}>{editingEntryId ? "저장" : "추가"}</button></div>
+              </form> : <div className="book-word-dialog book-word-dialog-bulk">
+                <div className="book-word-dialog-head"><div><span>IMPORT WORDS</span><h3>파일에서 추가</h3></div><button type="button" className="ghost" onClick={closeWordDialog}>×</button></div>
+                <label className="book-word-file">
+                  <input type="file" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain" onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    if (file) void file.text().then(setBulkText);
+                  }} />
+                  <span><strong>CSV · TSV · TXT</strong><small>파일을 선택하면 아래에서 미리 볼 수 있어요.</small></span>
+                </label>
+                <DeckEntryInput value={bulkText} onChange={setBulkText} compact />
+                <div className="book-word-import-summary"><span>인식 {parsedBulkEntries.entries.length}개</span><span>확인 필요 {parsedBulkEntries.issues.length}개</span></div>
+                <div className="book-word-dialog-actions"><button type="button" className="ghost" onClick={closeWordDialog}>취소</button><button disabled={wordSaving || parsedBulkEntries.entries.length === 0} onClick={() => void addBulkEntries()}>추가</button></div>
+              </div>}
+            </div>}
+          </div>
+        </div>}
+
+        {bookPanel === "study" && wordDialog && <div className="book-word-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !wordSaving) closeWordDialog(); }}>
+          {wordDialog === "single" ? <form className="book-word-dialog" onSubmit={(event) => void addSingleEntry(event)}>
+            <div className="book-word-dialog-head"><div><span>{editingEntryId ? "EDIT WORD" : "ADD WORD"}</span><h3>{editingEntryId ? "단어 편집" : "단어 추가"}</h3></div><button type="button" className="ghost" onClick={closeWordDialog}>×</button></div>
+            <label><span>단어</span><input autoFocus value={singleTerm} onChange={(event) => setSingleTerm(event.target.value)} placeholder="例: 見据える" /></label>
+            <label><span>발음 <small>선택</small></span><input value={singleReading} onChange={(event) => setSingleReading(event.target.value)} placeholder="みすえる" /></label>
+            <label><span>뜻</span><input value={singleMeaning} onChange={(event) => setSingleMeaning(event.target.value)} placeholder="여러 뜻은 / 로 구분" /></label>
+            <div className="book-word-dialog-actions"><button type="button" className="ghost" onClick={closeWordDialog}>취소</button><button disabled={wordSaving || !singleTerm.trim() || !singleMeaning.trim()}>{editingEntryId ? "저장" : "추가"}</button></div>
+          </form> : <div className="book-word-dialog book-word-dialog-bulk">
+            <div className="book-word-dialog-head"><div><span>IMPORT WORDS</span><h3>파일에서 추가</h3></div><button type="button" className="ghost" onClick={closeWordDialog}>×</button></div>
+            <label className="book-word-file">
+              <input type="file" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain" onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                if (file) void file.text().then(setBulkText);
+              }} />
+              <span><strong>CSV · TSV · TXT</strong><small>파일을 선택하면 아래에서 미리 볼 수 있어요.</small></span>
+            </label>
+            <DeckEntryInput value={bulkText} onChange={setBulkText} compact />
+            <div className="book-word-import-summary"><span>인식 {parsedBulkEntries.entries.length}개</span><span>확인 필요 {parsedBulkEntries.issues.length}개</span></div>
+            <div className="book-word-dialog-actions"><button type="button" className="ghost" onClick={closeWordDialog}>취소</button><button disabled={wordSaving || parsedBulkEntries.entries.length === 0} onClick={() => void addBulkEntries()}>추가</button></div>
+          </div>}
+        </div>}
+
+        {deleteCandidate && <div className="book-word-dialog-backdrop" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !wordSaving) {
+            setDeleteCandidate(null);
+            setSkipDeleteConfirm(false);
+          }
+        }}>
+          <div className="book-word-dialog book-word-delete-dialog" role="dialog" aria-modal="true" aria-label={`${deleteCandidate.term} 삭제 확인`}>
+            <div className="book-word-dialog-head">
+              <div><span>DELETE WORD</span><h3>단어를 삭제할까요?</h3></div>
+              <button type="button" className="ghost" onClick={() => { setDeleteCandidate(null); setSkipDeleteConfirm(false); }}>×</button>
+            </div>
+            <p><strong>{deleteCandidate.term}</strong> 단어를 이 책에서 삭제해요.</p>
+            <label className="book-word-delete-skip">
+              <input type="checkbox" checked={skipDeleteConfirm} onChange={(event) => setSkipDeleteConfirm(event.target.checked)} />
+              <span>이 책에서는 더 이상 묻지 않기</span>
+            </label>
+            <div className="book-word-dialog-actions">
+              <button type="button" className="ghost" onClick={() => { setDeleteCandidate(null); setSkipDeleteConfirm(false); }}>취소</button>
+              <button type="button" className="danger" disabled={wordSaving} onClick={() => void confirmDeleteWord()}>삭제</button>
+            </div>
+          </div>
+        </div>}
       </motion.section> : <motion.div key="shelf" className="book-shelf" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: .18 }}>
         <form className="home-create" onSubmit={create}>
           <input
@@ -902,6 +1373,15 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
                   flutterRetryRef.current = 0;
                   flutterStartedSessionRef.current = "";
                   setBookSettled(false);
+                  setBookPanel("study");
+                  setBookEntries([]);
+                  setBookStats(null);
+                  setWordSearch("");
+                  setWordDialog(null);
+                  setEditingEntryId(null);
+                  setDeleteCandidate(null);
+                  setSkipDeleteConfirm(false);
+                  setWordMessage("");
                   setBookOpenCycle((cycle) => cycle + 1);
                   setOpenedDeckId(d.id);
                 }}
@@ -918,10 +1398,10 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
                     <span className="ebook-bottom">
                       <span className="ebook-meta">{d.entry_count.toLocaleString("en-US")} Words</span>
                       <span className="ebook-current">
-                        <span className="ebook-current-round">Round {d.current_round}</span>
-                        <span className="ebook-current-range">{d.active_stage ? d.active_stage.replace(" · cumulative", "").replace("~", " - ") : "—"}</span>
+                        <span className="ebook-current-stage">{d.current_stage}단계</span>
+                        <span className="ebook-current-range">{formatStudyRangeLabel(d.active_range, " - ")}</span>
                       </span>
-                      <span className="ebook-progress" aria-hidden="true"><i style={{ width: `${d.study_ranges.length === 0 ? 0 : Math.min(100, (d.completed_range_count / d.study_ranges.length) * 100)}%` }} /></span>
+                      <span className="ebook-progress" aria-hidden="true"><i style={{ width: `${d.total_stage_count === 0 ? 0 : Math.min(100, (d.completed_stage_count / d.total_stage_count) * 100)}%` }} /></span>
                     </span>
                   </span>
                   <span className="ebook-page-edge ebook-page-edge-right" aria-hidden="true" />
@@ -935,6 +1415,8 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
     </AnimatePresence>
   </section>;
 }
+
+const MemoDeckList = memo(DeckList, (previous, next) => previous.decks === next.decks);
 
 function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise<void> }) {
   const [text, setText] = useState("見据える\t내다보다 / 전망하다\n躊躇う\t망설이다");
@@ -1439,7 +1921,6 @@ function StudyView({ deckId, card, result, setCard, setResult, audioSettings, on
   };
 
   const nextFromReview = async () => advance(await api.continueReview());
-  const nextFromStage = async () => advance(await api.continueStage());
   const review = result?.status === "review" || result?.status === "fail";
   const ambiguous = result?.status === "ambiguous";
 
@@ -1575,16 +2056,13 @@ function StudyView({ deckId, card, result, setCard, setResult, audioSettings, on
   const expectedPitch = submittedPitchQuestion?.allowed_patterns[0] ?? null;
 
   if (!card) {
-    const stageClear = result?.status === "stage_clear";
     return <section className="study">
-      <div className="study-top"><div className="study-wordmark">TANREN</div><div>{stageClear ? "구간 완료" : "회독 완료"}</div><button className="ghost" onClick={() => void exitStudy()}>나가기</button></div>
+      <div className="study-top"><div className="study-wordmark">TANREN</div><div>단계 완료</div><button className="ghost" onClick={() => void exitStudy()}>나가기</button></div>
       <div className="study-center complete-center">
         <motion.div className="completion-card" initial={reduceMotion ? false : { opacity: 0, y: 18, scale: .985 }} animate={{ opacity: 1, y: 0, scale: 1 }}>
-          <span className="completion-kicker">{stageClear ? "구간 완료" : "회독 완료"}</span>
-          <div className="completion-title">{stageClear ? "이 구간을 끝냈어요." : "이번 회독을 끝냈어요."}</div>
-          {stageClear
-            ? <button autoFocus onClick={nextFromStage}>다음 구간 <span aria-hidden="true">→</span></button>
-            : <button autoFocus onClick={() => void exitStudy()}>책장으로</button>}
+          <span className="completion-kicker">단계 완료</span>
+          <div className="completion-title">이번 단계를 끝냈어요.</div>
+          <button autoFocus onClick={() => void exitStudy()}>책장으로</button>
         </motion.div>
       </div>
     </section>;
@@ -1593,7 +2071,7 @@ function StudyView({ deckId, card, result, setCard, setResult, audioSettings, on
   return <section className={`study feedback-${feedbackTone}`}>
     <div className="study-top">
       <div className="mode"><strong>TANREN</strong><span>{card.mode.toUpperCase()} / {card.answer_language}</span></div>
-      <div className="study-stage">{card.stage_label}</div>
+      <div className="study-stage">{card.stage.toLocaleString("ko-KR")}단계 · {formatStudyRangeLabel(card.range_label)}</div>
       <div className="study-top-right"><span className="remaining"><strong>{card.total - card.remaining}</strong><i>/</i>{card.total}</span><button className="ghost" onClick={() => void exitStudy()}>ESC</button></div>
     </div>
     <div className="progress"><div style={{ width: `${100 * (1 - card.remaining / Math.max(card.total, 1))}%` }} /></div>
@@ -2459,19 +2937,19 @@ function LibraryStatsView({ stats }: { stats: LibraryStats | null }) {
   return <section className="content stats-dashboard stats-dashboard-global">
     {!stats ? <div className="stats-loading" aria-live="polite"><span />통계를 불러오고 있어요.</div>
       : stats.deck_count === 0 ? <div className="stats-empty"><span>統</span><strong>아직 보여드릴 통계가 없어요.</strong><p>학습을 시작하면 기록이 여기에 쌓여요.</p></div>
-      : <>
-        <div className="stats-summary-grid">
-          <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="지금까지 문제를 푼 횟수예요." />
-          <StatsMetric label="누적 단어 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help="한 번이라도 학습한 단어 수예요." />
-          <StatsMetric label="문제 정확도" value={formatPercent(stats.base_accuracy)} help="피치를 제외한 문제의 정답률이에요." />
-          <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help="피치를 정확히 맞힌 비율이에요." />
-          <StatsMetric label="중앙 응답시간" value={formatLatency(stats.median_recall_latency_ms)} help="문제를 보고 답을 입력하기 시작하기까지 걸린 시간이에요." />
-          <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="학습 화면에서 실제로 공부한 시간을 기록해요." />
-          <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요." />
-        </div>
+        : <>
+          <div className="stats-summary-grid">
+            <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="지금까지 문제를 푼 횟수예요." />
+            <StatsMetric label="누적 단어 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help="한 번이라도 학습한 단어 수예요." />
+            <StatsMetric label="문제 정확도" value={formatPercent(stats.base_accuracy)} help="피치를 제외한 문제의 정답률이에요." />
+            <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help="피치를 정확히 맞힌 비율이에요." />
+            <StatsMetric label="중앙 응답시간" value={formatLatency(stats.median_recall_latency_ms)} help="문제를 보고 답을 입력하기 시작하기까지 걸린 시간이에요." />
+            <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="학습 화면에서 실제로 공부한 시간을 기록해요." />
+            <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요." />
+          </div>
 
-        <GrowthChart stats={stats} />
-      </>}
+          <GrowthChart stats={stats} />
+        </>}
   </section>;
 }
 
@@ -2487,8 +2965,8 @@ function DeckStatsView({ deck, stats }: { deck: DeckSummary; stats: DeckStats[] 
     <div className="stats-summary-grid">
       <StatsMetric featured label="전체 정확도" value={formatPercent(weightedAccuracy)} help={`통합 정답률 ${formatPercent(weightedJointAccuracy)}`} />
       <StatsMetric label="누적 시도" value={compactNumberFormat.format(attempts)} help={`${numberFormat.format(attempts)}회 학습 기록`} />
-      <StatsMetric label="수록 단어" value={numberFormat.format(deck.entry_count)} help={`${deck.completed_range_count}개 구간 완료`} />
-      <StatsMetric label="현재 회차" value={`Round ${deck.current_round}`} help={deck.active_stage ?? "새 회차 준비"} />
+      <StatsMetric label="수록 단어" value={numberFormat.format(deck.entry_count)} help={`${deck.completed_stage_count}개 단계 완료`} />
+      <StatsMetric label="현재 단계" value={`${deck.current_stage}단계`} help={deck.active_range ? formatStudyRangeLabel(deck.active_range) : "새 단계 준비"} />
     </div>
     <section className="stats-dashboard-section">
       <div className="stats-section-title"><div><span>TRAINING MODES</span><h2>훈련별 성과</h2></div><p>모드별 정확도와 응답 속도를 비교해요.</p></div>
