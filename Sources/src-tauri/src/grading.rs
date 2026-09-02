@@ -1,6 +1,6 @@
 use unicode_normalization::UnicodeNormalization;
 
-use crate::model::{EntryRecord, GradeDecision, GradeOutcome, StudyMode};
+use crate::model::{EntryRecord, GradeDecision, GradeOutcome};
 
 pub fn normalize_generic(input: &str) -> String {
     input
@@ -40,19 +40,6 @@ pub fn grade_form(entry: &EntryRecord, answer: &str, strict_orthography: bool) -
         }
     }
     GradeOutcome { decision: GradeDecision::Fail, method: "form_mismatch", score: None }
-}
-
-pub fn grade_reading(
-    entry: &EntryRecord,
-    answer: &str,
-    accepted: &[String],
-    rejected: &[String],
-) -> GradeOutcome {
-    grade_reading_deterministic(entry, answer, accepted, rejected).unwrap_or(GradeOutcome {
-        decision: GradeDecision::Ambiguous,
-        method: "semantic_unavailable",
-        score: None,
-    })
 }
 
 pub fn grade_reading_deterministic(
@@ -108,13 +95,6 @@ pub fn split_reading_answer(answer: &str, expected_count: usize) -> Vec<String> 
     vec![trimmed.to_owned()]
 }
 
-pub fn grade(mode: StudyMode, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String], strict_orthography: bool) -> GradeOutcome {
-    match mode {
-        StudyMode::Reading => grade_reading(entry, answer, accepted, rejected),
-        StudyMode::Listening | StudyMode::Writing => grade_form(entry, answer, strict_orthography),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,9 +110,9 @@ mod tests {
 
     #[test]
     fn exact_and_alias_grading() {
-        assert_eq!(grade_reading(&entry(), "내다보다", &[], &[]).decision, GradeDecision::Pass);
-        assert_eq!(grade_reading(&entry(), "앞날을 내다보다", &["앞날을 내다보다".into()], &[]).decision, GradeDecision::Pass);
-        assert_eq!(grade_reading(&entry(), "예상하다", &[], &["예상하다".into()]).decision, GradeDecision::Fail);
+        assert_eq!(grade_reading_deterministic(&entry(), "내다보다", &[], &[]).unwrap().decision, GradeDecision::Pass);
+        assert_eq!(grade_reading_deterministic(&entry(), "앞날을 내다보다", &["앞날을 내다보다".into()], &[]).unwrap().decision, GradeDecision::Pass);
+        assert_eq!(grade_reading_deterministic(&entry(), "예상하다", &[], &["예상하다".into()]).unwrap().decision, GradeDecision::Fail);
     }
 
     #[test]

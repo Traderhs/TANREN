@@ -32,7 +32,6 @@ pub struct JapaneseEnrichment {
     pub confidence: String,
     pub model_version: Option<String>,
     pub audio_written: bool,
-    #[serde(default)]
     pub audio_assets: Vec<AudioAssetDraft>,
 }
 
@@ -114,31 +113,5 @@ impl JapaneseAnalyzer {
         let enrichment: JapaneseEnrichment = serde_json::from_slice(&output.stdout).map_err(|e| format!("invalid sidecar response: {e}"))?;
         let audio = enrichment.audio_assets.iter().filter(|asset| Path::new(&asset.path).exists()).cloned().collect();
         Ok((enrichment, audio))
-    }
-}
-
-pub fn split_morae(reading: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for c in reading.chars() {
-        if "ゃゅょぁぃぅぇぉゎャュョァィゥェォヮ".contains(c) {
-            if let Some(last) = out.last_mut() { last.push(c); } else { out.push(c.to_string()); }
-        } else if !c.is_whitespace() {
-            out.push(c.to_string());
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn mora_codec_keeps_small_kana_with_previous_mora() {
-        assert_eq!(split_morae("きょう"), vec!["きょ", "う"]);
-        assert_eq!(split_morae("きゃく"), vec!["きゃ", "く"]);
-        assert_eq!(split_morae("がっこう"), vec!["が", "っ", "こ", "う"]);
-        assert_eq!(split_morae("しんぶん"), vec!["し", "ん", "ぶ", "ん"]);
-        assert_eq!(split_morae("スーパー"), vec!["ス", "ー", "パ", "ー"]);
-        assert_eq!(split_morae("コーヒー"), vec!["コ", "ー", "ヒ", "ー"]);
     }
 }
