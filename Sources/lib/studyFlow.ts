@@ -1,6 +1,6 @@
 import type { StudyCard, StudyMode, SubmitResult } from "./types";
 
-export type StudyEnterAction = "submit" | "pitch" | "review" | "stage" | "none";
+export type StudyEnterAction = "submit" | "pitch" | "review" | "none";
 export type PitchLevel = 0 | 1;
 export type PitchSelection = Array<PitchLevel | null>;
 
@@ -21,7 +21,7 @@ export function pitchSubmission(selection: PitchSelection): number[] | null {
 
 export function cardAfterResult(current: StudyCard | null, result: SubmitResult): StudyCard | null {
   if (result.card) return result.card;
-  if (result.status === "stage_clear" || result.status === "round_complete") return null;
+  if (result.status === "stage_complete") return null;
   return current;
 }
 
@@ -29,7 +29,6 @@ export function enterAction(result: SubmitResult | null): StudyEnterAction {
   if (!result || result.status === "pass") return "submit";
   if (result.pitch) return "pitch";
   if (result.status === "review" || result.status === "fail") return "review";
-  if (result.status === "stage_clear") return "stage";
   return "none";
 }
 

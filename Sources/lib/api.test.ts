@@ -14,12 +14,6 @@ describe("study command payloads", () => {
     expect(invoke).toHaveBeenCalledWith("adjudicate_answer", { variantId: "entry:reading", accept });
   });
 
-  it("uses an explicit command to enter the next stage", async () => {
-    invoke.mockResolvedValue({ status: "pass", card: {} });
-    await api.continueStage();
-    expect(invoke).toHaveBeenCalledWith("continue_stage");
-  });
-
   it("binds timeout requests to the card variant that created the timer", async () => {
     invoke.mockResolvedValue({ status: "review" });
     await api.timeoutCurrent("entry:listening", "completion", "答", 4200, 1200);

@@ -3,8 +3,8 @@ import type { StudyCard, SubmitResult } from "./types";
 import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, setPitchLevel, shouldAutoPlayAfterWrittenAnswer } from "./studyFlow";
 
 const card = (id = "entry:reading"): StudyCard => ({
-  entry_id: "entry", variant_id: id, mode: "reading", question: "問",
-  answer_language: "ko-KR", remaining: 1, total: 1, stage_label: "0~1",
+  entry_id: "entry", variant_id: id, stage: 1, mode: "reading", question: "問",
+  answer_language: "ko-KR", remaining: 1, total: 1, range_label: "0~0",
   recall_timeout_ms: 3000,
 });
 
@@ -26,17 +26,8 @@ describe("writing study user actions", () => {
     expect(enterAction(result("review", { card: card() }))).toBe("review");
   });
 
-  it("does not expose or time a card on stage clear until explicit continuation", () => {
-    const cleared = result("stage_clear");
-    expect(cardAfterResult(card(), cleared)).toBeNull();
-    expect(enterAction(cleared)).toBe("stage");
-    expect(activeCardTimerRuns(null, cleared)).toBe(false);
-    const next = card("next:reading");
-    expect(cardAfterResult(null, result("pass", { card: next }))).toBe(next);
-  });
-
-  it("round completion is terminal with no card, timer, or Enter submission", () => {
-    const complete = result("round_complete");
+  it("stage completion is terminal with no card, timer, or Enter submission", () => {
+    const complete = result("stage_complete");
     expect(cardAfterResult(card(), complete)).toBeNull();
     expect(activeCardTimerRuns(null, complete)).toBe(false);
     expect(enterAction(complete)).toBe("none");
@@ -45,8 +36,8 @@ describe("writing study user actions", () => {
   it("runs timers only for an actual active card", () => {
     expect(activeCardTimerRuns(card(), null)).toBe(true);
     expect(activeCardTimerRuns(card(), result("pass", { card: card() }))).toBe(true);
-    for (const status of ["ambiguous", "pitch", "review", "stage_clear", "round_complete"] as const) {
-      expect(activeCardTimerRuns(status === "stage_clear" || status === "round_complete" ? null : card(), result(status))).toBe(false);
+    for (const status of ["ambiguous", "pitch", "review", "stage_complete"] as const) {
+      expect(activeCardTimerRuns(status === "stage_complete" ? null : card(), result(status))).toBe(false);
     }
   });
 
