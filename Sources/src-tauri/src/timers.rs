@@ -6,7 +6,6 @@ pub struct TypingProfileState {
     pub interkey_gaps_ms: Vec<f64>,
     pub completion_durations_ms: Vec<f64>,
     pub ime_conversion_latencies_ms: Vec<f64>,
-    #[serde(default)]
     pub chars_per_second_samples: Vec<f64>,
 }
 

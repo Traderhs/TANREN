@@ -19,8 +19,8 @@ use db::Database;
 use grading::grade_form;
 use japanese::JapaneseAnalyzer;
 use model::{
-    DeckStats, DeckSummary, EntryDraft, EntryRecord, FailureType, GradeDecision, ImportResult, LibraryStats,
-    StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
+    DeckStats, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, ImportResult, LibraryStats,
+    StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
 };
 use rand::random;
 use study::{PendingState, StudySession};
@@ -74,6 +74,16 @@ fn list_decks(state: State<'_, AppState>) -> Result<Vec<DeckSummary>, String> {
 }
 
 #[tauri::command]
+fn list_entries(state: State<'_, AppState>, deck_id: String) -> Result<Vec<EntryListRecord>, String> {
+    state.db.entry_list(&deck_id)
+}
+
+#[tauri::command]
+fn stage_schedule(state: State<'_, AppState>, deck_id: String, stage: u32) -> Result<StageScheduleSummary, String> {
+    state.db.stage_schedule_summary(&deck_id, stage)
+}
+
+#[tauri::command]
 fn create_deck(
     state: State<'_, AppState>,
     name: String,
@@ -96,6 +106,26 @@ fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<Entr
     let candidates = state.db.entries(&deck_id)?.into_iter().flat_map(|entry| entry.meanings).collect();
     start_semantic_precompute(Arc::clone(&state.semantic), candidates);
     Ok(result)
+}
+
+#[tauri::command]
+fn update_entry(state: State<'_, AppState>, deck_id: String, entry_id: String, entry: EntryDraft) -> Result<(), String> {
+    state.db.update_entry(&deck_id, &entry_id, &entry)?;
+    start_enrichment_worker(
+        state.db.clone(),
+        state.analyzer.clone(),
+        Arc::clone(&state.enrichment_running),
+    );
+    start_semantic_precompute(Arc::clone(&state.semantic), entry.meanings.clone());
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_entry(state: State<'_, AppState>, deck_id: String, entry_id: String) -> Result<(), String> {
+    if state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?.session.as_ref().is_some_and(|session| session.deck_id == deck_id) {
+        return Err("학습을 끝낸 뒤 삭제해주세요.".into());
+    }
+    state.db.delete_entry(&deck_id, &entry_id)
 }
 
 fn deck_summary(db: &Database, deck_id: &str) -> Result<DeckSummary, String> {
@@ -129,34 +159,34 @@ fn import_deck_export(state: State<'_, AppState>, payload: String) -> Result<Dec
 }
 
 #[tauri::command]
-fn start_study(state: State<'_, AppState>, deck_id: String, stage_index: Option<usize>) -> Result<SubmitResult, String> {
+fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) -> Result<SubmitResult, String> {
     let deck = state.db.deck(&deck_id)?;
     let entries = state.db.entries(&deck_id)?;
     if entries.is_empty() { return Err("먼저 단어를 추가해주세요.".into()); }
+    let selected_stage = stage.unwrap_or(deck.current_stage);
+    let slots = state.db.ensure_stage_schedule(&deck_id, selected_stage, &entries)?;
 
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
-    if engine.session.as_ref().is_some_and(|s| s.deck_id != deck_id) {
-        return Err("다른 책을 학습 중이에요. 먼저 종료해주세요.".into());
+    if engine.session.as_ref().is_some_and(|session| session.deck_id != deck_id || session.stage != selected_stage) {
+        return Err("다른 책이나 단계를 학습 중이에요. 먼저 종료해주세요.".into());
     }
-    if let Some(stage_index) = stage_index {
-        engine.session = Some(StudySession::new_at_stage(
-            deck_id.clone(), deck.current_round, &entries, &deck.enabled_modes,
-            deck.increment_size, deck.checkpoint_size, stage_index, random(),
-        ).ok_or("이 학습 구간은 지금 시작할 수 없어요.")?);
-    } else if engine.session.is_none() {
-        let session = if let Some(persisted) = state.db.load_session(&deck_id)? {
+    if engine.session.is_none() {
+        let mut session = if let Some(persisted) = state.db.load_session(&deck_id, selected_stage)? {
             persisted
         } else {
-            StudySession::new(
-                deck_id.clone(), deck.current_round, &entries, &deck.enabled_modes,
+            StudySession::new_for_stage_with_slots(
+                deck_id.clone(), selected_stage, slots, &entries, &deck.enabled_modes,
                 deck.increment_size, deck.checkpoint_size, random(),
-            ).ok_or("학습을 시작하지 못했어요.")?
+            ).ok_or("이 단계는 지금 시작할 수 없어요.")?
         };
+        session.sync_entries(&entries, &deck.enabled_modes);
         engine.session = Some(session);
         let mut input = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요.")?;
         let _ = input.remember_current();
     }
-    resume_session(&state, &mut engine)
+    let result = resume_session(&state, &mut engine)?;
+    state.db.select_stage(&deck_id, selected_stage)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -182,7 +212,7 @@ fn submit_answer(
     if variant.id() != variant_id { return Err("stale study card submission".into()); }
     let deck = state.db.deck(&session.deck_id)?;
     let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
-    let stage_label = session.stage().label();
+    let range_label = session.range().label.clone();
 
     let answer_trimmed = answer.trim_matches(|c: char| c.is_whitespace() || c == '\u{3000}');
     if answer_trimmed.is_empty() {
@@ -235,7 +265,7 @@ fn submit_answer(
             record_successful_typing(&state.db, &deck, &variant, &answer, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
             let pitch = state.db.pitch_question(&entry.id, deck.pitch_policy == "include_predicted")?;
             state.db.insert_attempt(
-                &entry.id, &deck.id, variant.mode, session.round, &stage_label, &answer, true, None,
+                &entry.id, &deck.id, variant.mode, session.stage, &range_label, &answer, true, None,
                 pitch.is_none(), outcome.method, outcome.score, recall_latency_ms, typing_duration_ms, None,
             )?;
             if let Some(question) = pitch {
@@ -301,7 +331,7 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
     record_successful_typing(&state.db, &deck, &variant, &answer, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
     let pitch = state.db.pitch_question(&entry.id, deck.pitch_policy == "include_predicted")?;
     state.db.insert_attempt(
-        &entry.id, &deck.id, variant.mode, session.round, &session.stage().label(), &answer, true, None,
+        &entry.id, &deck.id, variant.mode, session.stage, &session.range().label, &answer, true, None,
         pitch.is_none(), "manual_adjudication_accept", score, recall_latency_ms, typing_duration_ms, None,
     )?;
     if let Some(question) = pitch {
@@ -369,33 +399,9 @@ fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
         None => return Err("no review is active".into()),
     }
     if session.queue.remaining_count() == 0 {
-        let deck = state.db.deck(&session.deck_id)?;
-        let entries = state.db.entries(&session.deck_id)?;
-        let completed_stage_label = session.stage().label();
-        state.db.mark_stage_completed(&session.deck_id, &completed_stage_label, session.round)?;
-        if session.advance_stage(&entries, &deck.enabled_modes, random()) {
-            session.pending = Some(PendingState::StageTransition);
-            state.db.save_session(session)?;
-            return Ok(SubmitResult::simple(SubmitStatus::StageClear));
-        }
-        let deck_id = session.deck_id.clone();
-        state.db.clear_session_and_advance_round(&deck_id)?;
-        engine.session = None;
-        let _ = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요.")?.restore();
-        return Ok(SubmitResult::simple(SubmitStatus::RoundComplete));
+        return complete_current_stage(&state, &mut engine);
     }
     next_card(&state, &mut engine, SubmitStatus::Pass)
-}
-
-#[tauri::command]
-fn continue_stage(state: State<'_, AppState>) -> Result<SubmitResult, String> {
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
-    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
-    match session.pending.take() {
-        Some(PendingState::StageTransition) => next_card(&state, &mut engine, SubmitStatus::Pass),
-        Some(other) => { session.pending = Some(other); Err("아직 다음 구간으로 넘어갈 수 없어요.".into()) }
-        None => Err("이어갈 구간이 없어요.".into()),
-    }
 }
 
 #[tauri::command]
@@ -531,9 +537,9 @@ fn fail_base(
     score: Option<f64>,
 ) -> Result<SubmitResult, String> {
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
-    let stage = session.stage().label();
+    let stage = session.range().label.clone();
     db.insert_attempt(
-        &entry.id, &session.deck_id, variant.mode, session.round, &stage, &answer,
+        &entry.id, &session.deck_id, variant.mode, session.stage, &stage, &answer,
         false, None, false, grading_method, score, recall_latency_ms, typing_duration_ms, Some(failure.as_str()),
     )?;
     session.resolve_current(&variant, false)?;
@@ -565,6 +571,18 @@ fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Res
     Ok(SubmitResult { status, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, card: Some(card) })
 }
 
+fn complete_current_stage(state: &AppState, engine: &mut Engine) -> Result<SubmitResult, String> {
+    let (deck_id, stage) = {
+        let session = engine.session.as_ref().ok_or("진행 중인 학습이 없어요.")?;
+        (session.deck_id.clone(), session.stage)
+    };
+    state.db.mark_stage_completed(&deck_id, stage)?;
+    state.db.clear_stage_session(&deck_id, stage)?;
+    engine.session = None;
+    let _ = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요.")?.restore();
+    Ok(SubmitResult::simple(SubmitStatus::StageComplete))
+}
+
 fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) -> Result<StudyCard, String> {
     let deck = state.db.deck(&session.deck_id)?;
     let entries = state.db.entries(&session.deck_id)?;
@@ -583,12 +601,13 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
     Ok(StudyCard {
         entry_id: entry.id.clone(),
         variant_id: variant.id(),
+        stage: session.stage,
         mode: variant.mode,
         question,
         answer_language,
         remaining: session.queue.remaining_count(),
-        total: session.stage_total,
-        stage_label: session.stage().label(),
+        total: session.range_total,
+        range_label: session.range().label.clone(),
         audio_path,
         recall_timeout_ms: deck.recall_timeout_by_mode.for_mode(variant.mode),
         completion_idle_ms: deck.adaptive_completion_timer_enabled.then(|| profile.allowed_idle_ms()).flatten(),
@@ -597,9 +616,14 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
 }
 
 fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult, String> {
+    let should_complete_empty_stage = engine.session.as_ref().is_some_and(|session| {
+        session.pending.is_none() && session.current.is_none() && session.queue.remaining_count() == 0
+    });
+    if should_complete_empty_stage {
+        return complete_current_stage(state, engine);
+    }
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
     match session.pending.clone() {
-        Some(PendingState::StageTransition) => Ok(SubmitResult::simple(SubmitStatus::StageClear)),
         Some(PendingState::Ambiguous { variant, .. }) => {
             let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
             let card = build_card(state, session, &variant)?;
@@ -718,29 +742,6 @@ fn configured_semantic_home(db: &Database, app_data: &Path) -> Result<PathBuf, S
     Ok(std::env::var_os("TANREN_SEMANTIC_HOME").map(PathBuf::from).unwrap_or_else(|| app_data.join("semantic")))
 }
 
-fn migrate_audio_storage(db: &Database, old_root: &Path, new_root: &Path) -> Result<(), String> {
-    if old_root == new_root || !old_root.exists() { return Ok(()); }
-    copy_directory_contents(old_root, new_root)?;
-    db.relocate_audio_paths(old_root, new_root)?;
-    let _ = std::fs::remove_dir_all(old_root);
-    Ok(())
-}
-
-fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(destination).map_err(|e| e.to_string())?;
-    for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-            copy_directory_contents(&source_path, &destination_path)?;
-        } else {
-            std::fs::copy(&source_path, &destination_path).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
 fn storage_settings_snapshot(state: &AppState) -> Result<StorageSettings, String> {
     let selected = state.db.setting(SEMANTIC_STORAGE_SETTING)?.filter(|value| !value.trim().is_empty());
     let requested = selected.as_ref().map(PathBuf::from)
@@ -813,7 +814,6 @@ pub fn run() {
             let semantic_home = configured_semantic_home(&db, &app_data)?;
             let voicevox = VoicevoxRuntime::install(semantic_home.join("voicevox"));
             let audio_dir = semantic_home.join("audio");
-            migrate_audio_storage(&db, &app_data.join("audio"), &audio_dir)?;
             app.asset_protocol_scope().allow_directory(&audio_dir, true).map_err(|e| e.to_string())?;
             let analyzer = JapaneseAnalyzer::install(app.handle().clone(), &app_data, audio_dir, Arc::clone(&voicevox))?;
             let semantic_backend = LlamaCppEmbeddingBackend::install(semantic_home.clone());
@@ -838,8 +838,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_decks,
+            list_entries,
+            stage_schedule,
             create_deck,
             import_entries,
+            update_entry,
+            delete_entry,
             update_deck,
             delete_deck,
             export_deck,
@@ -851,7 +855,6 @@ pub fn run() {
             adjudicate_answer,
             submit_pitch,
             continue_review,
-            continue_stage,
             deck_stats,
             library_stats,
             semantic_status,

@@ -26,17 +26,10 @@ impl StudyMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
 pub struct RecallTimeoutByMode {
     pub reading: u64,
     pub listening: u64,
     pub writing: u64,
-}
-
-impl Default for RecallTimeoutByMode {
-    fn default() -> Self {
-        Self { reading: 3_000, listening: 3_000, writing: 3_000 }
-    }
 }
 
 impl RecallTimeoutByMode {
@@ -57,25 +50,35 @@ pub struct DeckSummary {
     pub target_language: String,
     pub enabled_modes: Vec<StudyMode>,
     pub entry_count: usize,
-    pub current_round: u32,
-    pub active_stage: Option<String>,
+    pub current_stage: u32,
+    pub active_range: Option<String>,
     pub study_ranges: Vec<StudyRange>,
-    pub completed_range_count: usize,
+    pub completed_stage_count: usize,
+    pub total_stage_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StudyRange {
-    pub stage_index: usize,
+    /// Zero-based inclusive canonical label, e.g. `0~49`.
     pub label: String,
+    /// Zero-based inclusive slice start.
     pub start: usize,
+    /// Zero-based exclusive slice end.
     pub end: usize,
     pub cumulative: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageScheduleSummary {
+    pub stage: u32,
+    pub study_range: StudyRange,
+    pub completed: bool,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct DeckRecord {
     pub id: String,
-    pub name: String,
     pub source_language: String,
     pub target_language: String,
     pub enabled_modes: Vec<StudyMode>,
@@ -85,7 +88,7 @@ pub struct DeckRecord {
     pub adaptive_completion_timer_enabled: bool,
     pub pitch_policy: String,
     pub strict_orthography: bool,
-    pub current_round: u32,
+    pub current_stage: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,12 +104,22 @@ pub struct ImportResult {
     pub duplicates: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryRecord {
     pub id: String,
     pub term: String,
     pub meanings: Vec<String>,
     pub reading: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryListRecord {
+    pub id: String,
+    pub position: usize,
+    pub term: String,
+    pub meanings: Vec<String>,
+    pub reading: Option<String>,
+    pub attempts: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,38 +147,17 @@ impl VariantKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StageKind {
-    Expanding { start: usize, end: usize },
-    Cumulative { end: usize },
-}
-
-impl StageKind {
-    pub fn label(&self) -> String {
-        match self {
-            Self::Expanding { start, end } => format!("{}~{}", start, end),
-            Self::Cumulative { end } => format!("0~{} · cumulative", end),
-        }
-    }
-
-    pub fn range(&self) -> (usize, usize) {
-        match self {
-            Self::Expanding { start, end } => (*start, *end),
-            Self::Cumulative { end } => (0, *end),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudyCard {
     pub entry_id: String,
     pub variant_id: String,
+    pub stage: u32,
     pub mode: StudyMode,
     pub question: String,
     pub answer_language: String,
     pub remaining: usize,
     pub total: usize,
-    pub stage_label: String,
+    pub range_label: String,
     pub audio_path: Option<String>,
     pub recall_timeout_ms: u64,
     pub completion_idle_ms: Option<u64>,
@@ -206,8 +198,7 @@ pub enum SubmitStatus {
     Ambiguous,
     Pitch,
     Review,
-    StageClear,
-    RoundComplete,
+    StageComplete,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,7 +241,7 @@ pub struct LibraryDeckStats {
     pub deck_id: String,
     pub deck_name: String,
     pub entry_count: usize,
-    pub current_round: u32,
+    pub current_stage: u32,
     pub attempts: usize,
     pub base_accuracy: Option<f64>,
     pub joint_accuracy: Option<f64>,

@@ -7,10 +7,12 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    model::{AudioAssetDraft, DeckRecord, DeckStats, DeckSummary, EntryDraft, EntryRecord, ImportResult, LibraryDeckStats, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, RecallTimeoutByMode, StudyMode},
-    study::{study_ranges, StudySession},
+    model::{AudioAssetDraft, DeckRecord, DeckStats, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImportResult, LibraryDeckStats, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageScheduleSummary, StudyMode},
+    study::{stage_study_range, study_ranges, StudySession},
     timers::TypingProfileState,
 };
+
+const SCHEMA_VERSION: i64 = 12;
 
 #[derive(Default)]
 struct StatsAggregate {
@@ -91,7 +93,7 @@ impl Database {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let mut db = Self { path, device_id: String::new() };
-        db.migrate()?;
+        db.initialize_schema()?;
         db.device_id = match db.setting("device_id")? {
             Some(value) => value,
             None => {
@@ -111,14 +113,40 @@ impl Database {
         Ok(conn)
     }
 
-    fn migrate(&self) -> Result<(), String> {
+    fn initialize_schema(&self) -> Result<(), String> {
         let mut conn = self.conn()?;
+        let has_schema: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_info')",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if has_schema {
+            let version: i64 = conn.query_row(
+                "SELECT version FROM schema_info WHERE id=1",
+                [],
+                |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if version != SCHEMA_VERSION {
+                return Err("현재 버전과 호환되지 않는 TANREN 데이터예요.".into());
+            }
+        } else {
+            let user_table_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if user_table_count > 0 {
+                return Err("현재 버전과 호환되지 않는 TANREN 데이터예요.".into());
+            }
+        }
+
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-              version INTEGER PRIMARY KEY,
-              applied_at TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS schema_info (
+              id INTEGER PRIMARY KEY CHECK(id=1),
+              version INTEGER NOT NULL,
+              created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS decks (
@@ -133,7 +161,7 @@ impl Database {
               adaptive_completion_timer_enabled INTEGER NOT NULL DEFAULT 1,
               pitch_policy TEXT NOT NULL DEFAULT 'verified_only',
               strict_orthography INTEGER NOT NULL DEFAULT 0,
-              current_round INTEGER NOT NULL DEFAULT 1,
+              current_stage INTEGER NOT NULL DEFAULT 1,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               revision INTEGER NOT NULL DEFAULT 1,
@@ -211,6 +239,12 @@ impl Database {
               cache_key TEXT NOT NULL UNIQUE,
               path TEXT NOT NULL,
               provider TEXT NOT NULL,
+              voice_profile TEXT NOT NULL,
+              age_band TEXT NOT NULL,
+              gender_presentation TEXT NOT NULL,
+              speaker_id INTEGER,
+              speaker_name TEXT,
+              accent_type INTEGER,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               revision INTEGER NOT NULL DEFAULT 1,
@@ -218,14 +252,10 @@ impl Database {
               device_id TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS study_sessions (
-              id TEXT PRIMARY KEY,
-              deck_id TEXT NOT NULL REFERENCES decks(id),
-              round INTEGER NOT NULL,
-              status TEXT NOT NULL,
-              started_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              device_id TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS audio_playback_state (
+              entry_id TEXT PRIMARY KEY REFERENCES entries(id),
+              next_index INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS study_activity (
@@ -238,22 +268,29 @@ impl Database {
               PRIMARY KEY(date, deck_id, mode, device_id)
             );
 
+            CREATE TABLE IF NOT EXISTS stage_schedules (
+              deck_id TEXT NOT NULL REFERENCES decks(id),
+              stage INTEGER NOT NULL,
+              entry_slots_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              device_id TEXT NOT NULL,
+              PRIMARY KEY(deck_id, stage)
+            );
+
             CREATE TABLE IF NOT EXISTS stage_states (
-              deck_id TEXT PRIMARY KEY REFERENCES decks(id),
-              round INTEGER NOT NULL,
-              stage_index INTEGER NOT NULL,
-              stage_label TEXT NOT NULL,
+              deck_id TEXT NOT NULL REFERENCES decks(id),
+              stage INTEGER NOT NULL,
               state_json TEXT NOT NULL,
               updated_at TEXT NOT NULL,
-              device_id TEXT NOT NULL
+              device_id TEXT NOT NULL,
+              PRIMARY KEY(deck_id, stage)
             );
 
             CREATE TABLE IF NOT EXISTS stage_completions (
               deck_id TEXT NOT NULL REFERENCES decks(id),
-              stage_label TEXT NOT NULL,
-              first_completed_round INTEGER NOT NULL,
-              first_completed_at TEXT NOT NULL,
-              PRIMARY KEY(deck_id, stage_label)
+              stage INTEGER NOT NULL,
+              completed_at TEXT NOT NULL,
+              PRIMARY KEY(deck_id, stage)
             );
 
             CREATE TABLE IF NOT EXISTS attempts (
@@ -261,8 +298,8 @@ impl Database {
               entry_id TEXT NOT NULL REFERENCES entries(id),
               deck_id TEXT NOT NULL REFERENCES decks(id),
               variant TEXT NOT NULL,
-              round INTEGER NOT NULL,
-              stage TEXT NOT NULL,
+              stage INTEGER NOT NULL,
+              range_label TEXT NOT NULL,
               answer_text TEXT NOT NULL,
               base_correct INTEGER NOT NULL,
               pitch_correct INTEGER,
@@ -344,149 +381,9 @@ impl Database {
             "#,
         ).map_err(|e| e.to_string())?;
         tx.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?1)",
-            [now()],
+            "INSERT OR IGNORE INTO schema_info(id,version,created_at) VALUES(1,?1,?2)",
+            params![SCHEMA_VERSION, now()],
         ).map_err(|e| e.to_string())?;
-        let phase5_migrated: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=2)",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if !phase5_migrated {
-            tx.execute(
-                "DELETE FROM pitch_patterns WHERE provider='unidic-fugashi' AND confidence!='MANUAL'",
-                [],
-            ).map_err(|e| e.to_string())?;
-            tx.execute(
-                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT entry_id FROM japanese_analyses WHERE provider='unidic-fugashi')",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?1)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-        }
-        let voicevox_migrated: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if !voicevox_migrated {
-            tx.execute_batch(
-                r#"
-                ALTER TABLE audio_assets ADD COLUMN voice_profile TEXT NOT NULL DEFAULT 'legacy';
-                ALTER TABLE audio_assets ADD COLUMN age_band TEXT NOT NULL DEFAULT 'unknown';
-                ALTER TABLE audio_assets ADD COLUMN gender_presentation TEXT NOT NULL DEFAULT 'unknown';
-                ALTER TABLE audio_assets ADD COLUMN speaker_id INTEGER;
-                ALTER TABLE audio_assets ADD COLUMN speaker_name TEXT;
-                ALTER TABLE audio_assets ADD COLUMN accent_type INTEGER;
-                CREATE TABLE IF NOT EXISTS audio_playback_state (
-                  entry_id TEXT PRIMARY KEY REFERENCES entries(id),
-                  next_index INTEGER NOT NULL DEFAULT 0,
-                  updated_at TEXT NOT NULL
-                );
-                DELETE FROM audio_assets;
-                "#,
-            ).map_err(|e| e.to_string())?;
-            tx.execute(
-                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?1)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-        }
-        let voice_pool_v2_migrated: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=4)",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if !voice_pool_v2_migrated {
-            tx.execute("DELETE FROM audio_assets", []).map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM audio_playback_state", []).map_err(|e| e.to_string())?;
-            tx.execute(
-                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(4, ?1)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-        }
-        let voice_pool_v3_migrated: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if !voice_pool_v3_migrated {
-            tx.execute("DELETE FROM audio_assets", []).map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM audio_playback_state", []).map_err(|e| e.to_string())?;
-            tx.execute(
-                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(5, ?1)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-        }
-        let voice_pool_v4_migrated: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6)",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if !voice_pool_v4_migrated {
-            tx.execute("DELETE FROM audio_assets", []).map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM audio_playback_state", []).map_err(|e| e.to_string())?;
-            tx.execute(
-                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(6, ?1)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-        }
-        let voice_pool_v5_migrated: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if !voice_pool_v5_migrated {
-            tx.execute("DELETE FROM audio_assets", []).map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM audio_playback_state", []).map_err(|e| e.to_string())?;
-            tx.execute(
-                "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(7, ?1)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-        }
-        let stage_completion_migrated: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=8)",
-            [],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if !stage_completion_migrated {
-            tx.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS stage_completions (
-                  deck_id TEXT NOT NULL REFERENCES decks(id),
-                  stage_label TEXT NOT NULL,
-                  first_completed_round INTEGER NOT NULL,
-                  first_completed_at TEXT NOT NULL,
-                  PRIMARY KEY(deck_id, stage_label)
-                );
-                "#,
-            ).map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(8, ?1)",
-                [now()],
-            ).map_err(|e| e.to_string())?;
-        }
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -502,7 +399,7 @@ impl Database {
         ).map_err(|e| e.to_string())?;
         journal(&tx, &id, "deck", &self.device_id, 1, "insert", &serde_json::json!({"name":name}))?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(DeckSummary { id, name: name.into(), source_language: source_language.into(), target_language: target_language.into(), enabled_modes: vec![StudyMode::Reading,StudyMode::Listening,StudyMode::Writing], entry_count: 0, current_round: 1, active_stage: None, study_ranges: Vec::new(), completed_range_count: 0 })
+        Ok(DeckSummary { id, name: name.into(), source_language: source_language.into(), target_language: target_language.into(), enabled_modes: vec![StudyMode::Reading,StudyMode::Listening,StudyMode::Writing], entry_count: 0, current_stage: 1, active_range: None, study_ranges: Vec::new(), completed_stage_count: 0, total_stage_count: 0 })
     }
 
     pub fn setting(&self, key: &str) -> Result<Option<String>, String> {
@@ -531,60 +428,156 @@ impl Database {
         let conn = self.conn()?;
         let mut decks = {
             let mut stmt = conn.prepare(
-                r#"SELECT d.id,d.name,d.source_language,d.target_language,d.enabled_modes,d.current_round,
-                   COUNT(e.id),s.stage_label,d.increment_size,d.checkpoint_size
+                r#"SELECT d.id,d.name,d.source_language,d.target_language,d.enabled_modes,d.current_stage,
+                   COUNT(e.id),EXISTS(SELECT 1 FROM stage_states ss WHERE ss.deck_id=d.id AND ss.stage=d.current_stage),d.increment_size,d.checkpoint_size
                    FROM decks d LEFT JOIN entries e ON e.deck_id=d.id AND e.deleted_at IS NULL
-                   LEFT JOIN stage_states s ON s.deck_id=d.id
                    WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.created_at"#,
             ).map_err(|e| e.to_string())?;
             let rows = stmt.query_map([], |row| {
                 let modes: String = row.get(4)?;
+                let current_stage = row.get::<_, i64>(5)? as u32;
                 let entry_count = row.get::<_, i64>(6)? as usize;
+                let increment = row.get::<_, i64>(8)? as usize;
+                let checkpoint = row.get::<_, i64>(9)? as usize;
+                let ranges = study_ranges(entry_count, increment, checkpoint);
+                let active_range = if row.get::<_, i64>(7)? != 0 {
+                    ranges.get(current_stage.saturating_sub(1) as usize).map(|range| range.label.clone())
+                } else {
+                    None
+                };
                 Ok(DeckSummary {
                     id: row.get(0)?, name: row.get(1)?, source_language: row.get(2)?, target_language: row.get(3)?,
-                    enabled_modes: serde_json::from_str(&modes).unwrap_or_default(), current_round: row.get::<_, i64>(5)? as u32,
-                    entry_count, active_stage: row.get(7)?, study_ranges: study_ranges(entry_count, row.get::<_, i64>(8)? as usize, row.get::<_, i64>(9)? as usize),
-                    completed_range_count: 0,
+                    enabled_modes: parse_json_column(&modes, 4)?, current_stage,
+                    entry_count, active_range, study_ranges: ranges,
+                    completed_stage_count: 0,
+                    total_stage_count: 0,
                 })
             }).map_err(|e| e.to_string())?;
             rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?
         };
 
-        let mut completed_stmt = conn.prepare("SELECT stage_label FROM stage_completions WHERE deck_id=?1").map_err(|e| e.to_string())?;
         for deck in &mut decks {
-            let completed = completed_stmt
-                .query_map([&deck.id], |row| row.get::<_, String>(0))
-                .map_err(|e| e.to_string())?
-                .collect::<Result<HashSet<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            deck.completed_range_count = deck.study_ranges.iter().filter(|range| completed.contains(&range.label)).count();
+            let total_stages = self.total_stages(&deck.id)?;
+            deck.total_stage_count = total_stages as usize;
+            let mut completed_stage_count = 0usize;
+            for stage in 1..=total_stages {
+                completed_stage_count += usize::from(self.is_stage_completed(&deck.id, stage)?);
+            }
+            deck.completed_stage_count = completed_stage_count;
         }
         Ok(decks)
     }
 
-    pub fn mark_stage_completed(&self, deck_id: &str, stage_label: &str, round: u32) -> Result<(), String> {
+    pub fn mark_stage_completed(&self, deck_id: &str, stage: u32) -> Result<(), String> {
         let conn = self.conn()?;
+        let timestamp = now();
         conn.execute(
-            "INSERT OR IGNORE INTO stage_completions(deck_id,stage_label,first_completed_round,first_completed_at) VALUES(?1,?2,?3,?4)",
-            params![deck_id, stage_label, round as i64, now()],
+            "INSERT OR IGNORE INTO stage_completions(deck_id,stage,completed_at) VALUES(?1,?2,?3)",
+            params![deck_id, stage as i64, timestamp],
         ).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn is_stage_completed(&self, deck_id: &str, stage: u32) -> Result<bool, String> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stage_completions WHERE deck_id=?1 AND stage=?2)",
+            params![deck_id, stage as i64],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    pub fn total_stages(&self, deck_id: &str) -> Result<u32, String> {
+        let deck = self.deck(deck_id)?;
+        let live_stage_count = study_ranges(self.entries(deck_id)?.len(), deck.increment_size, deck.checkpoint_size).len() as u32;
+        let conn = self.conn()?;
+        let max_scheduled: Option<i64> = conn.query_row(
+            "SELECT MAX(stage) FROM stage_schedules WHERE deck_id=?1",
+            [deck_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let max_scheduled = max_scheduled.map(|value| value as u32).unwrap_or(0);
+        let available = live_stage_count.max(max_scheduled);
+        Ok(if available == 0 { 0 } else { available.max(deck.current_stage) })
+    }
+
+    pub fn select_stage(&self, deck_id: &str, stage: u32) -> Result<(), String> {
+        let total_stages = self.total_stages(deck_id)?;
+        if stage == 0 || stage > total_stages {
+            return Err("존재하지 않는 단계예요.".into());
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let current_stage: u32 = tx.query_row(
+            "SELECT current_stage FROM decks WHERE id=?1 AND deleted_at IS NULL",
+            [deck_id],
+            |row| row.get::<_, i64>(0),
+        ).map_err(|e| e.to_string())? as u32;
+        if current_stage == stage {
+            return Ok(());
+        }
+        let revision: i64 = tx.query_row(
+            "SELECT revision+1 FROM decks WHERE id=?1 AND deleted_at IS NULL",
+            [deck_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE decks SET current_stage=?1,updated_at=?2,revision=?3,device_id=?4 WHERE id=?5",
+            params![stage as i64, now(), revision, self.device_id, deck_id],
+        ).map_err(|e| e.to_string())?;
+        journal(&tx, deck_id, "deck", &self.device_id, revision, "update", &serde_json::json!({"current_stage":stage}))?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn ensure_stage_schedule(&self, deck_id: &str, stage: u32, live_entries: &[EntryRecord]) -> Result<Vec<Option<String>>, String> {
+        if let Some(slots) = self.load_stage_schedule(deck_id, stage)? {
+            return Ok(slots);
+        }
+        let deck = self.deck(deck_id)?;
+        if stage_study_range(live_entries.len(), deck.increment_size, deck.checkpoint_size, stage).is_none() {
+            return Err("존재하지 않는 단계예요.".into());
+        }
+        let slots: Vec<Option<String>> = live_entries.iter().map(|entry| Some(entry.id.clone())).collect();
+        self.save_stage_schedule_if_absent(deck_id, stage, &slots)?;
+        Ok(slots)
+    }
+
+    pub fn stage_schedule_summary(&self, deck_id: &str, stage: u32) -> Result<StageScheduleSummary, String> {
+        let deck = self.deck(deck_id)?;
+        let live_entries = self.entries(deck_id)?;
+        let slots = if let Some(slots) = self.load_stage_schedule(deck_id, stage)? {
+            slots
+        } else if stage_study_range(live_entries.len(), deck.increment_size, deck.checkpoint_size, stage).is_some() {
+            live_entries.iter().map(|entry| Some(entry.id.clone())).collect()
+        } else {
+            return Err("존재하지 않는 단계예요.".into());
+        };
+        let study_range = stage_study_range(slots.len(), deck.increment_size, deck.checkpoint_size, stage)
+            .ok_or("존재하지 않는 단계예요.")?;
+        let conn = self.conn()?;
+        let active: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stage_states WHERE deck_id=?1 AND stage=?2)",
+            params![deck_id, stage as i64],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let completed = self.is_stage_completed(deck_id, stage)?;
+        Ok(StageScheduleSummary { stage, study_range, completed, active })
     }
 
     pub fn deck(&self, id: &str) -> Result<DeckRecord, String> {
         let conn = self.conn()?;
         conn.query_row(
-            "SELECT id,name,source_language,target_language,enabled_modes,increment_size,checkpoint_size,recall_timeout_by_mode,adaptive_completion_timer_enabled,pitch_policy,strict_orthography,current_round FROM decks WHERE id=?1 AND deleted_at IS NULL",
+            "SELECT id,source_language,target_language,enabled_modes,increment_size,checkpoint_size,recall_timeout_by_mode,adaptive_completion_timer_enabled,pitch_policy,strict_orthography,current_stage FROM decks WHERE id=?1 AND deleted_at IS NULL",
             [id], |row| {
-                let modes: String = row.get(4)?;
-                let timeouts: String = row.get(7)?;
-                let recall_timeout_by_mode = serde_json::from_str::<RecallTimeoutByMode>(&timeouts).unwrap_or_default();
+                let modes: String = row.get(3)?;
+                let timeouts: String = row.get(6)?;
+                let recall_timeout_by_mode = parse_json_column(&timeouts, 6)?;
                 Ok(DeckRecord {
-                    id: row.get(0)?, name: row.get(1)?, source_language: row.get(2)?, target_language: row.get(3)?,
-                    enabled_modes: serde_json::from_str(&modes).unwrap_or_default(), increment_size: row.get::<_,i64>(5)? as usize,
-                    checkpoint_size: row.get::<_,i64>(6)? as usize, recall_timeout_by_mode,
-                    adaptive_completion_timer_enabled: row.get::<_,i64>(8)? != 0,
-                    pitch_policy: row.get(9)?, strict_orthography: row.get::<_,i64>(10)? != 0, current_round: row.get::<_,i64>(11)? as u32,
+                    id: row.get(0)?, source_language: row.get(1)?, target_language: row.get(2)?,
+                    enabled_modes: parse_json_column(&modes, 3)?, increment_size: row.get::<_,i64>(4)? as usize,
+                    checkpoint_size: row.get::<_,i64>(5)? as usize, recall_timeout_by_mode,
+                    adaptive_completion_timer_enabled: row.get::<_,i64>(7)? != 0,
+                    pitch_policy: row.get(8)?, strict_orthography: row.get::<_,i64>(9)? != 0, current_stage: row.get::<_,i64>(10)? as u32,
                 })
             },
         ).map_err(|e| e.to_string())
@@ -595,9 +588,57 @@ impl Database {
         let mut stmt = conn.prepare("SELECT id,term,meanings,reading FROM entries WHERE deck_id=?1 AND deleted_at IS NULL ORDER BY position").map_err(|e| e.to_string())?;
         let rows = stmt.query_map([deck_id], |row| {
             let meanings: String = row.get(2)?;
-            Ok(EntryRecord { id: row.get(0)?, term: row.get(1)?, meanings: serde_json::from_str(&meanings).unwrap_or_default(), reading: row.get(3)? })
+            Ok(EntryRecord { id: row.get(0)?, term: row.get(1)?, meanings: parse_json_column(&meanings, 2)?, reading: row.get(3)? })
         }).map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())
+    }
+
+    pub fn entry_list(&self, deck_id: &str) -> Result<Vec<EntryListRecord>, String> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT e.id,e.position,e.term,e.meanings,e.reading,COUNT(a.id) \
+             FROM entries e \
+             LEFT JOIN attempts a ON a.entry_id=e.id AND a.deck_id=e.deck_id \
+             WHERE e.deck_id=?1 AND e.deleted_at IS NULL \
+             GROUP BY e.id,e.position,e.term,e.meanings,e.reading \
+             ORDER BY e.position"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([deck_id], |row| {
+            let meanings: String = row.get(3)?;
+            Ok(EntryListRecord {
+                id: row.get(0)?,
+                position: row.get::<_, i64>(1)? as usize,
+                term: row.get(2)?,
+                meanings: parse_json_column(&meanings, 3)?,
+                reading: row.get(4)?,
+                attempts: row.get::<_, i64>(5)? as usize,
+            })
+        }).map_err(|e| e.to_string())?;
+        let mut entries = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        let current_stage: u32 = conn.query_row(
+            "SELECT current_stage FROM decks WHERE id=?1 AND deleted_at IS NULL",
+            [deck_id],
+            |row| row.get::<_, i64>(0),
+        ).map_err(|e| e.to_string())? as u32;
+        if let Some(slots) = self.load_stage_schedule(deck_id, current_stage)? {
+            let slot_by_id: HashMap<&str, usize> = slots.iter().enumerate()
+                .filter_map(|(index, entry_id)| entry_id.as_deref().map(|entry_id| (entry_id, index)))
+                .collect();
+            let mut next_unscheduled = slots.len();
+            for entry in &mut entries {
+                if let Some(position) = slot_by_id.get(entry.id.as_str()) {
+                    entry.position = *position;
+                } else {
+                    entry.position = next_unscheduled;
+                    next_unscheduled += 1;
+                }
+            }
+        } else {
+            for (position, entry) in entries.iter_mut().enumerate() {
+                entry.position = position;
+            }
+        }
+        Ok(entries)
     }
 
     pub fn import_entries(&self, deck_id: &str, target_language: &str, drafts: &[EntryDraft]) -> Result<ImportResult, String> {
@@ -626,6 +667,71 @@ impl Database {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(ImportResult { inserted, duplicates })
+    }
+
+    pub fn update_entry(&self, deck_id: &str, entry_id: &str, draft: &EntryDraft) -> Result<(), String> {
+        let term = draft.term.trim();
+        let meanings: Vec<String> = draft.meanings.iter().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).collect();
+        if term.is_empty() || meanings.is_empty() { return Err("단어와 뜻을 입력해주세요.".into()); }
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let revision: i64 = tx.query_row(
+            "SELECT revision+1 FROM entries WHERE id=?1 AND deck_id=?2 AND deleted_at IS NULL",
+            params![entry_id, deck_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let meanings_json = serde_json::to_string(&meanings).map_err(|e| e.to_string())?;
+        let reading = draft.reading.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        let timestamp = now();
+        tx.execute(
+            "UPDATE entries SET term=?1,meanings=?2,reading=?3,updated_at=?4,revision=?5,device_id=?6 WHERE id=?7 AND deck_id=?8 AND deleted_at IS NULL",
+            params![term, meanings_json, reading, timestamp, revision, self.device_id, entry_id, deck_id],
+        ).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO enrichment_jobs(id,entry_id,status,attempts,last_error,updated_at) VALUES(?1,?2,'queued',0,NULL,?3) \
+             ON CONFLICT(entry_id) DO UPDATE SET status='queued',attempts=0,last_error=NULL,updated_at=excluded.updated_at",
+            params![Uuid::new_v4().to_string(), entry_id, timestamp],
+        ).map_err(|e| e.to_string())?;
+        journal(
+            &tx,
+            entry_id,
+            "entry",
+            &self.device_id,
+            revision,
+            "update",
+            &serde_json::json!({"deck_id":deck_id,"term":term,"meanings":meanings,"reading":reading}),
+        )?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn delete_entry(&self, deck_id: &str, entry_id: &str) -> Result<(), String> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let revision: i64 = tx.query_row(
+            "SELECT revision+1 FROM entries WHERE id=?1 AND deck_id=?2 AND deleted_at IS NULL",
+            params![entry_id, deck_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let timestamp = now();
+        tx.execute(
+            "UPDATE entries SET deleted_at=?1,updated_at=?1,revision=?2,device_id=?3 WHERE id=?4 AND deck_id=?5 AND deleted_at IS NULL",
+            params![timestamp, revision, self.device_id, entry_id, deck_id],
+        ).map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE enrichment_jobs SET status='done',last_error=NULL,updated_at=?1 WHERE entry_id=?2",
+            params![timestamp, entry_id],
+        ).map_err(|e| e.to_string())?;
+        journal(
+            &tx,
+            entry_id,
+            "entry",
+            &self.device_id,
+            revision,
+            "delete",
+            &serde_json::json!({"deck_id":deck_id,"deleted_at":timestamp}),
+        )?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn update_deck(&self, deck_id: &str, name: &str, enabled_modes: &[StudyMode]) -> Result<(), String> {
@@ -706,7 +812,8 @@ impl Database {
         let mut meanings = conn.prepare("SELECT meanings FROM entries WHERE deleted_at IS NULL").map_err(|e| e.to_string())?;
         let rows = meanings.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
         for row in rows {
-            values.extend(serde_json::from_str::<Vec<String>>(&row.map_err(|e| e.to_string())?).unwrap_or_default());
+            let raw = row.map_err(|e| e.to_string())?;
+            values.extend(serde_json::from_str::<Vec<String>>(&raw).map_err(|e| format!("invalid entry meanings JSON: {e}"))?);
         }
         let mut aliases = conn.prepare("SELECT answer FROM entry_aliases WHERE deleted_at IS NULL").map_err(|e| e.to_string())?;
         let rows = aliases.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
@@ -719,11 +826,13 @@ impl Database {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let timestamp = now();
         tx.execute(
-            "INSERT INTO stage_states(deck_id,round,stage_index,stage_label,state_json,updated_at,device_id) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(deck_id) DO UPDATE SET round=excluded.round,stage_index=excluded.stage_index,stage_label=excluded.stage_label,state_json=excluded.state_json,updated_at=excluded.updated_at,device_id=excluded.device_id",
-            params![session.deck_id,session.round,session.stage_index as i64,session.stage().label(),serde_json::to_string(session).map_err(|e|e.to_string())?,timestamp,self.device_id],
+            "INSERT INTO stage_states(deck_id,stage,state_json,updated_at,device_id) VALUES(?1,?2,?3,?4,?5) \
+             ON CONFLICT(deck_id,stage) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at,device_id=excluded.device_id",
+            params![session.deck_id,session.stage,serde_json::to_string(session).map_err(|e|e.to_string())?,timestamp,self.device_id],
         ).map_err(|e|e.to_string())?;
-        let revision: i64 = tx.query_row("SELECT COALESCE(MAX(revision),0)+1 FROM sync_journal WHERE entity_id=?1 AND entity_type='stage_state'", [&session.deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
-        journal(&tx, &session.deck_id, "stage_state", &self.device_id, revision, "upsert", &serde_json::json!({"round":session.round,"stage_index":session.stage_index,"stage_label":session.stage().label()}))?;
+        let entity_id = format!("{}:{}", session.deck_id, session.stage);
+        let revision: i64 = tx.query_row("SELECT COALESCE(MAX(revision),0)+1 FROM sync_journal WHERE entity_id=?1 AND entity_type='stage_state'", [&entity_id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        journal(&tx, &entity_id, "stage_state", &self.device_id, revision, "upsert", &serde_json::json!({"deck_id":session.deck_id,"stage":session.stage,"range_label":session.range().label}))?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -740,33 +849,51 @@ impl Database {
         Ok(())
     }
 
-    pub fn load_session(&self, deck_id: &str) -> Result<Option<StudySession>, String> {
+    pub fn load_session(&self, deck_id: &str, stage: u32) -> Result<Option<StudySession>, String> {
         let conn = self.conn()?;
-        let state: Option<String> = conn.query_row("SELECT state_json FROM stage_states WHERE deck_id=?1",[deck_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        let state: Option<String> = conn.query_row(
+            "SELECT state_json FROM stage_states WHERE deck_id=?1 AND stage=?2",
+            params![deck_id, stage as i64],
+            |row| row.get(0),
+        ).optional().map_err(|e|e.to_string())?;
         state.map(|s|serde_json::from_str(&s).map_err(|e|e.to_string())).transpose()
     }
 
-    pub fn clear_session_and_advance_round(&self, deck_id: &str) -> Result<(), String> {
-        let mut conn=self.conn()?; let tx=conn.transaction().map_err(|e|e.to_string())?;
-        let stage_revision: i64 = tx.query_row("SELECT COALESCE(MAX(revision),0)+1 FROM sync_journal WHERE entity_id=?1 AND entity_type='stage_state'", [deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM stage_states WHERE deck_id=?1",[deck_id]).map_err(|e|e.to_string())?;
-        tx.execute("UPDATE decks SET current_round=current_round+1,updated_at=?1,revision=revision+1 WHERE id=?2",params![now(),deck_id]).map_err(|e|e.to_string())?;
-        let deck_revision: i64 = tx.query_row("SELECT revision FROM decks WHERE id=?1", [deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
-        journal(&tx, deck_id, "stage_state", &self.device_id, stage_revision, "delete", &serde_json::json!({}))?;
-        journal(&tx, deck_id, "deck", &self.device_id, deck_revision, "update", &serde_json::json!({"current_round_increment":1}))?;
-        tx.commit().map_err(|e|e.to_string())
+    pub fn load_stage_schedule(&self, deck_id: &str, stage: u32) -> Result<Option<Vec<Option<String>>>, String> {
+        let conn = self.conn()?;
+        let raw: Option<String> = conn.query_row(
+            "SELECT entry_slots_json FROM stage_schedules WHERE deck_id=?1 AND stage=?2",
+            params![deck_id, stage as i64],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        raw.map(|value| serde_json::from_str(&value).map_err(|e| e.to_string())).transpose()
+    }
+
+    pub fn save_stage_schedule_if_absent(&self, deck_id: &str, stage: u32, entry_slots: &[Option<String>]) -> Result<(), String> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO stage_schedules(deck_id,stage,entry_slots_json,created_at,device_id) VALUES(?1,?2,?3,?4,?5)",
+            params![deck_id, stage as i64, serde_json::to_string(entry_slots).map_err(|e| e.to_string())?, now(), self.device_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clear_stage_session(&self, deck_id: &str, stage: u32) -> Result<(), String> {
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM stage_states WHERE deck_id=?1 AND stage=?2", params![deck_id, stage as i64]).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn insert_attempt(&self, entry_id:&str, deck_id:&str, variant:StudyMode, round:u32, stage:&str, answer:&str, base_correct:bool, pitch_correct:Option<bool>, joint_correct:bool, grading_method:&str, semantic_score:Option<f64>, recall_latency_ms:u64, typing_duration_ms:u64, failure_type:Option<&str>) -> Result<(),String> {
+    pub fn insert_attempt(&self, entry_id:&str, deck_id:&str, variant:StudyMode, stage:u32, range_label:&str, answer:&str, base_correct:bool, pitch_correct:Option<bool>, joint_correct:bool, grading_method:&str, semantic_score:Option<f64>, recall_latency_ms:u64, typing_duration_ms:u64, failure_type:Option<&str>) -> Result<(),String> {
         let mut conn=self.conn()?;
         let tx=conn.transaction().map_err(|e|e.to_string())?;
         let id = Uuid::new_v4().to_string();
         tx.execute(
-            "INSERT INTO attempts(id,entry_id,deck_id,variant,round,stage,answer_text,base_correct,pitch_correct,joint_correct,grading_method,semantic_score,recall_latency_ms,typing_duration_ms,total_duration_ms,failure_type,timestamp,device_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-            params![id,entry_id,deck_id,variant.as_str(),round,stage,answer,base_correct,pitch_correct,joint_correct,grading_method,semantic_score,recall_latency_ms,typing_duration_ms,recall_latency_ms+typing_duration_ms,failure_type,now(),self.device_id],
+            "INSERT INTO attempts(id,entry_id,deck_id,variant,stage,range_label,answer_text,base_correct,pitch_correct,joint_correct,grading_method,semantic_score,recall_latency_ms,typing_duration_ms,total_duration_ms,failure_type,timestamp,device_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![id,entry_id,deck_id,variant.as_str(),stage,range_label,answer,base_correct,pitch_correct,joint_correct,grading_method,semantic_score,recall_latency_ms,typing_duration_ms,recall_latency_ms+typing_duration_ms,failure_type,now(),self.device_id],
         ).map_err(|e|e.to_string())?;
-        journal(&tx, &id, "attempt", &self.device_id, 1, "insert", &serde_json::json!({"entry_id":entry_id,"deck_id":deck_id,"variant":variant,"round":round,"stage":stage}))?;
+        journal(&tx, &id, "attempt", &self.device_id, 1, "insert", &serde_json::json!({"entry_id":entry_id,"deck_id":deck_id,"variant":variant,"stage":stage,"range_label":range_label}))?;
         tx.commit().map_err(|e|e.to_string())
     }
 
@@ -787,12 +914,19 @@ impl Database {
             "SELECT COALESCE(a.reading,''),a.analysis_json,p.patterns_json,p.confidence FROM japanese_analyses a JOIN pitch_patterns p ON p.analysis_id=a.id WHERE a.entry_id=?1 AND a.deleted_at IS NULL AND p.deleted_at IS NULL ORDER BY CASE p.confidence WHEN 'MANUAL' THEN 1 WHEN 'VERIFIED' THEN 2 WHEN 'CONSENSUS' THEN 3 ELSE 4 END LIMIT 1",
             [entry_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())?;
         let Some((reading,analysis_json,patterns_json,confidence))=row else{return Ok(None)};
-        let analysis:serde_json::Value=serde_json::from_str(&analysis_json).unwrap_or_default();
-        let patterns:Vec<Vec<u8>>=serde_json::from_str(&patterns_json).unwrap_or_default();
-        let confidence=match confidence.as_str(){"MANUAL"=>PitchConfidence::Manual,"VERIFIED"=>PitchConfidence::Verified,"CONSENSUS"=>PitchConfidence::Consensus,_=>PitchConfidence::Predicted};
+        let analysis:serde_json::Value=serde_json::from_str(&analysis_json).map_err(|e| format!("invalid Japanese analysis JSON: {e}"))?;
+        let patterns:Vec<Vec<u8>>=serde_json::from_str(&patterns_json).map_err(|e| format!("invalid pitch patterns JSON: {e}"))?;
+        let confidence=match confidence.as_str(){
+            "MANUAL"=>PitchConfidence::Manual,
+            "VERIFIED"=>PitchConfidence::Verified,
+            "CONSENSUS"=>PitchConfidence::Consensus,
+            "PREDICTED"=>PitchConfidence::Predicted,
+            value=>return Err(format!("invalid pitch confidence: {value}")),
+        };
         let gate=confidence.gates_by_default() || predicted_gate;
-        let morae:Vec<String>=analysis.get("morae").and_then(|v|v.as_array()).map(|a|a.iter().filter_map(|v|v.as_str().map(String::from)).collect()).unwrap_or_default();
-        let kind=analysis.get("scope").and_then(|v|v.as_str()).unwrap_or("lexical").to_string();
+        let morae_values=analysis.get("morae").and_then(Value::as_array).ok_or("Japanese analysis is missing morae")?;
+        let morae=morae_values.iter().map(|value| value.as_str().map(String::from).ok_or("Japanese analysis contains a non-string mora")).collect::<Result<Vec<_>,_>>()?;
+        let kind=analysis.get("scope").and_then(Value::as_str).ok_or("Japanese analysis is missing scope")?.to_string();
         if kind != "lexical" || morae.is_empty() || patterns.is_empty() || patterns.iter().any(|pattern| pattern.len()!=morae.len() || pattern.iter().any(|level| *level>1)) {
             return Ok(None);
         }
@@ -815,25 +949,6 @@ impl Database {
         ).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(Some(path))
-    }
-
-    pub fn relocate_audio_paths(&self, old_root: &Path, new_root: &Path) -> Result<(), String> {
-        let mut conn = self.conn()?;
-        let paths = {
-            let mut stmt = conn.prepare("SELECT id,path FROM audio_assets WHERE deleted_at IS NULL").map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
-        };
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        for (id, path) in paths {
-            let Ok(relative) = Path::new(&path).strip_prefix(old_root) else { continue; };
-            let relocated = new_root.join(relative).to_string_lossy().to_string();
-            tx.execute("UPDATE audio_assets SET path=?1,updated_at=?2 WHERE id=?3", params![relocated, now(), id]).map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(())
     }
 
     pub fn stats(&self, deck_id:&str)->Result<Vec<DeckStats>,String>{
@@ -859,7 +974,7 @@ impl Database {
         let conn = self.conn()?;
         let decks = {
             let mut stmt = conn.prepare(
-                "SELECT d.id,d.name,COUNT(e.id),d.current_round FROM decks d LEFT JOIN entries e ON e.deck_id=d.id AND e.deleted_at IS NULL WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.created_at",
+                "SELECT d.id,d.name,COUNT(e.id),d.current_stage FROM decks d LEFT JOIN entries e ON e.deck_id=d.id AND e.deleted_at IS NULL WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.created_at",
             ).map_err(|e| e.to_string())?;
             stmt.query_map([], |row| Ok((
                 row.get::<_, String>(0)?,
@@ -1002,13 +1117,13 @@ impl Database {
             .into_iter()
             .map(|mode| by_mode.remove(&mode).unwrap_or_default().deck_stats(mode))
             .collect();
-        let mut deck_stats = decks.into_iter().map(|(deck_id, deck_name, entry_count, current_round)| {
+        let mut deck_stats = decks.into_iter().map(|(deck_id, deck_name, entry_count, current_stage)| {
             let stats = by_deck.remove(&deck_id).unwrap_or_default();
             LibraryDeckStats {
                 deck_id,
                 deck_name,
                 entry_count,
-                current_round,
+                current_stage,
                 attempts: stats.attempts,
                 base_accuracy: ratio(stats.base_correct, stats.attempts),
                 joint_accuracy: ratio(stats.joint_correct, stats.attempts),
@@ -1042,23 +1157,23 @@ impl Database {
         let analysis_existed = analysis_id.is_some();
         let aid=analysis_id.unwrap_or_else(||Uuid::new_v4().to_string());
         tx.execute("INSERT INTO japanese_analyses(id,entry_id,normalized_text,reading,analysis_json,provider,source,confidence,model_version,created_at,updated_at,device_id) SELECT ?1,?2,term,?3,?4,?5,?6,?7,?8,?9,?9,?10 FROM entries WHERE id=?2 ON CONFLICT(entry_id) DO UPDATE SET reading=excluded.reading,analysis_json=excluded.analysis_json,provider=excluded.provider,source=excluded.source,confidence=excluded.confidence,model_version=excluded.model_version,updated_at=excluded.updated_at,revision=japanese_analyses.revision+1",params![aid,entry_id,reading,analysis_json.to_string(),provider,source,confidence,model_version,timestamp,self.device_id]).map_err(|e|e.to_string())?;
-        let old_pitch: Vec<(String, i64)> = {
+        let existing_pitch: Vec<(String, i64)> = {
             let mut stmt = tx.prepare("SELECT id,revision FROM pitch_patterns WHERE analysis_id=?1 AND confidence!='MANUAL'").map_err(|e| e.to_string())?;
             stmt.query_map([&aid], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
         };
         tx.execute("DELETE FROM pitch_patterns WHERE analysis_id=?1 AND confidence!='MANUAL'",[&aid]).map_err(|e|e.to_string())?;
-        for (id, revision) in old_pitch { journal(&tx, &id, "pitch_pattern", &self.device_id, revision + 1, "delete", &serde_json::json!({"analysis_id":aid}))?; }
+        for (id, revision) in existing_pitch { journal(&tx, &id, "pitch_pattern", &self.device_id, revision + 1, "delete", &serde_json::json!({"analysis_id":aid}))?; }
         if let Some(patterns)=pitch_patterns {
             let pitch_id = Uuid::new_v4().to_string();
             tx.execute("INSERT INTO pitch_patterns(id,analysis_id,scope,patterns_json,preferred_pattern,provider,source,confidence,created_at,updated_at,device_id) VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?8,?9)",params![pitch_id,aid,scope,serde_json::to_string(patterns).unwrap(),provider,source,confidence,timestamp,self.device_id]).map_err(|e|e.to_string())?;
             journal(&tx, &pitch_id, "pitch_pattern", &self.device_id, 1, "insert", &serde_json::json!({"analysis_id":aid,"scope":scope,"provider":provider,"source":source,"confidence":confidence}))?;
         }
-        let old_audio: Vec<(String, i64)> = {
+        let existing_audio: Vec<(String, i64)> = {
             let mut stmt = tx.prepare("SELECT id,revision FROM audio_assets WHERE entry_id=?1").map_err(|e| e.to_string())?;
             stmt.query_map([entry_id], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
         };
         tx.execute("DELETE FROM audio_assets WHERE entry_id=?1",[entry_id]).map_err(|e|e.to_string())?;
-        for (id, revision) in old_audio { journal(&tx, &id, "audio_asset", &self.device_id, revision + 1, "delete", &serde_json::json!({"entry_id":entry_id}))?; }
+        for (id, revision) in existing_audio { journal(&tx, &id, "audio_asset", &self.device_id, revision + 1, "delete", &serde_json::json!({"entry_id":entry_id}))?; }
         tx.execute("DELETE FROM audio_playback_state WHERE entry_id=?1",[entry_id]).map_err(|e|e.to_string())?;
         for asset in audio {
             let audio_id = Uuid::new_v4().to_string();
@@ -1077,8 +1192,8 @@ impl Database {
     }
 
     pub fn queued_enrichment(&self, limit:usize)->Result<Vec<EntryRecord>,String>{
-        let conn=self.conn()?; let mut stmt=conn.prepare("SELECT e.id,e.term,e.meanings,e.reading FROM enrichment_jobs j JOIN entries e ON e.id=j.entry_id WHERE j.status IN ('queued','failed') AND j.attempts<3 ORDER BY e.position LIMIT ?1").map_err(|e|e.to_string())?;
-        let rows=stmt.query_map([limit as i64],|r|{let m:String=r.get(2)?;Ok(EntryRecord{id:r.get(0)?,term:r.get(1)?,meanings:serde_json::from_str(&m).unwrap_or_default(),reading:r.get(3)?})}).map_err(|e|e.to_string())?;
+        let conn=self.conn()?; let mut stmt=conn.prepare("SELECT e.id,e.term,e.meanings,e.reading FROM enrichment_jobs j JOIN entries e ON e.id=j.entry_id WHERE e.deleted_at IS NULL AND j.status IN ('queued','failed') AND j.attempts<3 ORDER BY e.position LIMIT ?1").map_err(|e|e.to_string())?;
+        let rows=stmt.query_map([limit as i64],|r|{let m:String=r.get(2)?;Ok(EntryRecord{id:r.get(0)?,term:r.get(1)?,meanings:parse_json_column(&m,2)?,reading:r.get(3)?})}).map_err(|e|e.to_string())?;
         rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
     }
 
@@ -1090,7 +1205,10 @@ impl Database {
             "SELECT completion_distribution FROM typing_profiles WHERE deck_id=?1 AND input_language=?2 AND study_mode=?3 AND input_method='default'",
             params![deck_id, input_language, mode.as_str()], |r| r.get(0),
         ).optional().map_err(|e| e.to_string())?;
-        Ok(raw.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
+        match raw {
+            Some(value) => serde_json::from_str(&value).map_err(|error| format!("invalid typing profile JSON: {error}")),
+            None => Ok(TypingProfileState::default()),
+        }
     }
 
     pub fn update_typing_profile(&self, deck_id: &str, input_language: &str, mode: StudyMode, profile: &TypingProfileState) -> Result<(), String> {
@@ -1119,19 +1237,20 @@ impl Database {
             ("pitch_patterns", "SELECT p.* FROM pitch_patterns p JOIN japanese_analyses a ON a.id=p.analysis_id JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
             ("audio_assets", "SELECT a.* FROM audio_assets a JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
             ("audio_playback_state", "SELECT a.* FROM audio_playback_state a JOIN entries e ON e.id=a.entry_id WHERE e.deck_id=?1"),
-            ("stage_states", "SELECT * FROM stage_states WHERE deck_id=?1"),
-            ("stage_completions", "SELECT * FROM stage_completions WHERE deck_id=?1"),
+            ("stage_schedules", "SELECT * FROM stage_schedules WHERE deck_id=?1 ORDER BY stage"),
+            ("stage_states", "SELECT * FROM stage_states WHERE deck_id=?1 ORDER BY stage"),
+            ("stage_completions", "SELECT * FROM stage_completions WHERE deck_id=?1 ORDER BY stage"),
             ("attempts", "SELECT * FROM attempts WHERE deck_id=?1 ORDER BY timestamp"),
             ("typing_profiles", "SELECT * FROM typing_profiles WHERE deck_id=?1"),
             ("grading_decisions", "SELECT g.* FROM grading_decisions g JOIN entries e ON e.id=g.entry_id WHERE e.deck_id=?1"),
             ("enrichment_jobs", "SELECT j.* FROM enrichment_jobs j JOIN entries e ON e.id=j.entry_id WHERE e.deck_id=?1"),
-            ("sync_journal", "SELECT j.* FROM sync_journal j WHERE j.entity_id=?1 OR j.entity_id IN (SELECT id FROM entries WHERE deck_id=?1) OR j.entity_id IN (SELECT id FROM entry_aliases WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1)) OR j.entity_id IN (SELECT id FROM japanese_analyses WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1)) OR j.entity_id IN (SELECT id FROM pitch_patterns WHERE analysis_id IN (SELECT id FROM japanese_analyses WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1))) OR j.entity_id IN (SELECT id FROM audio_assets WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1)) OR j.entity_id IN (SELECT id FROM attempts WHERE deck_id=?1) ORDER BY j.timestamp"),
+            ("sync_journal", "SELECT j.* FROM sync_journal j WHERE j.entity_id=?1 OR (j.entity_type='stage_state' AND j.entity_id LIKE (?1 || ':%')) OR j.entity_id IN (SELECT id FROM entries WHERE deck_id=?1) OR j.entity_id IN (SELECT id FROM entry_aliases WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1)) OR j.entity_id IN (SELECT id FROM japanese_analyses WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1)) OR j.entity_id IN (SELECT id FROM pitch_patterns WHERE analysis_id IN (SELECT id FROM japanese_analyses WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1))) OR j.entity_id IN (SELECT id FROM audio_assets WHERE entry_id IN (SELECT id FROM entries WHERE deck_id=?1)) OR j.entity_id IN (SELECT id FROM attempts WHERE deck_id=?1) ORDER BY j.timestamp"),
         ];
         let mut tables = Map::new();
         for (name, sql) in queries { tables.insert(name.into(), Value::Array(query_json(&conn, sql, [deck_id])?)); }
         serde_json::to_string_pretty(&serde_json::json!({
             "format": "tanren-portable-deck",
-            "version": 1,
+            "version": 3,
             "exported_at": now(),
             "tables": tables,
         })).map_err(|e| e.to_string())
@@ -1139,7 +1258,9 @@ impl Database {
 
     pub fn import_deck_export(&self, payload: &str) -> Result<String, String> {
         let root: Value = serde_json::from_str(payload.trim_start_matches('\u{feff}')).map_err(|e| format!("invalid TANREN JSON: {e}"))?;
-        if root.get("format").and_then(Value::as_str) != Some("tanren-portable-deck") || root.get("version").and_then(Value::as_i64) != Some(1) {
+        if root.get("format").and_then(Value::as_str) != Some("tanren-portable-deck")
+            || root.get("version").and_then(Value::as_i64) != Some(3)
+        {
             return Err("unsupported TANREN export format/version".into());
         }
         let tables = root.get("tables").and_then(Value::as_object).ok_or("export is missing tables")?;
@@ -1150,7 +1271,7 @@ impl Database {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM decks WHERE id=?1)", [&deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
         if exists { return Err("this deck already exists; restore into a fresh TANREN database or delete the existing database first".into()); }
-        let order = ["decks", "entries", "entry_aliases", "japanese_analyses", "pitch_patterns", "audio_assets", "audio_playback_state", "stage_states", "stage_completions", "attempts", "typing_profiles", "grading_decisions", "enrichment_jobs", "sync_journal"];
+        let order = ["decks", "entries", "entry_aliases", "japanese_analyses", "pitch_patterns", "audio_assets", "audio_playback_state", "stage_schedules", "stage_states", "stage_completions", "attempts", "typing_profiles", "grading_decisions", "enrichment_jobs", "sync_journal"];
         for table in order {
             if let Some(rows) = tables.get(table).and_then(Value::as_array) {
                 for row in rows { insert_json_row(&tx, table, row)?; }
@@ -1186,12 +1307,20 @@ impl Database {
         }
         let source = Connection::open(path).map_err(|e| format!("백업 파일을 열 수 없어요: {e}"))?;
         let valid: bool = source.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='decks')",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_info') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='decks')",
             [],
             |row| row.get(0),
         ).map_err(|e| format!("TANREN 백업 파일이 아니에요: {e}"))?;
         if !valid {
             return Err("TANREN 백업 파일이 아니에요.".into());
+        }
+        let version: i64 = source.query_row(
+            "SELECT version FROM schema_info WHERE id=1",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| format!("백업 버전을 확인하지 못했어요: {e}"))?;
+        if version != SCHEMA_VERSION {
+            return Err("현재 버전과 맞지 않는 TANREN 백업이에요.".into());
         }
         let integrity: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(|e| e.to_string())?;
         if integrity != "ok" {
@@ -1202,10 +1331,16 @@ impl Database {
             let backup = rusqlite::backup::Backup::new(&source, &mut destination).map_err(|e| e.to_string())?;
             backup.run_to_completion(128, Duration::from_millis(5), None).map_err(|e| e.to_string())?;
         }
-        self.migrate()?;
+        self.initialize_schema()?;
         self.set_setting("device_id", Some(&self.device_id))?;
         Ok(())
     }
+}
+
+fn parse_json_column<T: serde::de::DeserializeOwned>(raw: &str, column_index: usize) -> rusqlite::Result<T> {
+    serde_json::from_str(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column_index, rusqlite::types::Type::Text, Box::new(error))
+    })
 }
 
 fn query_json<'a, const N: usize>(conn: &Connection, sql: &str, values: [&'a str; N]) -> Result<Vec<Value>, String> {
@@ -1265,7 +1400,7 @@ mod tests{
     use tempfile::tempdir;
 
     #[test]
-    fn migration_and_roundtrip_are_durable(){
+    fn schema_and_roundtrip_are_durable(){
         let dir=tempdir().unwrap(); let path=dir.path().join("tanren.db");
         let db=Database::open(&path).unwrap(); let deck=db.create_deck("日本語","ko-KR","ja-JP").unwrap();
         db.import_entries(&deck.id,"ja-JP",&[EntryDraft{term:"見据える".into(),meanings:vec!["내다보다".into()],reading:Some("みすえる".into())}]).unwrap();
@@ -1286,6 +1421,35 @@ mod tests{
     }
 
     #[test]
+    fn five_hundred_words_are_eleven_stages_with_one_range_per_stage() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("stages", "ko-KR", "ja-JP").unwrap();
+        let drafts = (1..=500).map(|index| EntryDraft {
+            term: format!("単語{index:03}"),
+            meanings: vec![format!("word {index:03}")],
+            reading: Some("たんご".into()),
+        }).collect::<Vec<_>>();
+        db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
+
+        let summary = db.list_decks().unwrap().remove(0);
+        assert_eq!(summary.total_stage_count, 11);
+        assert_eq!(summary.completed_stage_count, 0);
+        assert_eq!(db.stage_schedule_summary(&deck.id, 1).unwrap().study_range.label, "0~49");
+        assert_eq!(db.stage_schedule_summary(&deck.id, 2).unwrap().study_range.label, "0~99");
+        assert_eq!(db.stage_schedule_summary(&deck.id, 7).unwrap().study_range.label, "300~349");
+        assert_eq!(db.stage_schedule_summary(&deck.id, 11).unwrap().study_range.label, "0~499 · cumulative");
+
+        db.mark_stage_completed(&deck.id, 1).unwrap();
+        let summary = db.list_decks().unwrap().remove(0);
+        assert_eq!(summary.completed_stage_count, 1);
+        assert_eq!(summary.total_stage_count, 11);
+
+        db.select_stage(&deck.id, 7).unwrap();
+        assert_eq!(db.list_decks().unwrap().remove(0).current_stage, 7);
+    }
+
+    #[test]
     fn library_stats_aggregate_every_deck_and_keep_inactive_decks_visible() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
@@ -1297,8 +1461,8 @@ mod tests{
         db.import_entries(&listening_deck.id, "ja-JP", &[draft]).unwrap();
         let reading_entry = db.entries(&reading_deck.id).unwrap().remove(0);
         let listening_entry = db.entries(&listening_deck.id).unwrap().remove(0);
-        db.insert_attempt(&reading_entry.id, &reading_deck.id, StudyMode::Reading, 1, "0~1", "고양이", true, Some(true), true, "exact", None, 400, 100, None).unwrap();
-        db.insert_attempt(&listening_entry.id, &listening_deck.id, StudyMode::Listening, 1, "0~1", "猫", false, Some(false), false, "exact", None, 800, 100, None).unwrap();
+        db.insert_attempt(&reading_entry.id, &reading_deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, Some(true), true, "exact", None, 400, 100, None).unwrap();
+        db.insert_attempt(&listening_entry.id, &listening_deck.id, StudyMode::Listening, 1, "0~0", "猫", false, Some(false), false, "exact", None, 800, 100, None).unwrap();
         db.record_study_activity(&reading_deck.id, Some(StudyMode::Reading), 2_500).unwrap();
         db.record_study_activity(&listening_deck.id, Some(StudyMode::Listening), 3_500).unwrap();
         db.record_study_activity(&reading_deck.id, None, 500).unwrap();
@@ -1334,7 +1498,7 @@ mod tests{
         source.import_entries(&deck.id, "ja-JP", &[EntryDraft { term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()) }]).unwrap();
         let entry = source.entries(&deck.id).unwrap().remove(0);
         source.set_alias(&entry.id, "냥이", true).unwrap();
-        source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~1", "고양이", true, None, true, "exact", None, 500, 200, None).unwrap();
+        source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, None, true, "exact", None, 500, 200, None).unwrap();
         let session = StudySession::new(deck.id.clone(), 1, &[entry.clone()], &[StudyMode::Reading], 50, 300, 1).unwrap();
         source.save_session(&session).unwrap();
         source.set_entry_analysis(&entry.id, Some("ねこ"), &serde_json::json!({"scope":"lexical","morae":["ね","こ"]}), "fixture", "fixture", "VERIFIED", Some("1"), Some(&[vec![1,0]]), "lexical", &[]).unwrap();
@@ -1351,7 +1515,7 @@ mod tests{
         assert_eq!(destination.import_deck_export(&payload).unwrap(), deck.id);
         assert_eq!(destination.entries(&deck.id).unwrap().len(), 1);
         assert_eq!(destination.aliases(&entry.id).unwrap().0, vec!["냥이"]);
-        assert!(destination.load_session(&deck.id).unwrap().is_some());
+        assert!(destination.load_session(&deck.id, 1).unwrap().is_some());
         assert_eq!(destination.stats(&deck.id).unwrap()[0].attempts, 1);
         assert!(destination.pitch_question(&entry.id, false).unwrap().is_some());
     }
@@ -1365,7 +1529,7 @@ mod tests{
             term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()),
         }]).unwrap();
         let entry = source.entries(&deck.id).unwrap().remove(0);
-        source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~1", "고양이", true, Some(true), true, "exact", None, 420, 180, None).unwrap();
+        source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, Some(true), true, "exact", None, 420, 180, None).unwrap();
         source.record_study_activity(&deck.id, Some(StudyMode::Reading), 7_500).unwrap();
         source.set_setting("audio_volume", Some("0.65")).unwrap();
 
@@ -1446,17 +1610,17 @@ mod tests{
     }
 
     #[test]
-    fn legacy_numeric_pitch_rows_are_not_exposed_as_contours() {
+    fn invalid_numeric_pitch_patterns_are_rejected() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
-        let deck = db.create_deck("legacy", "ko-KR", "ja-JP").unwrap();
+        let deck = db.create_deck("invalid pitch", "ko-KR", "ja-JP").unwrap();
         db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
             term: "見据える".into(), meanings: vec!["내다보다".into()], reading: Some("みすえる".into()),
         }]).unwrap();
         let entry = db.entries(&deck.id).unwrap().remove(0);
         let analysis = serde_json::json!({"scope":"lexical","morae":["み","す","え","る"]});
         db.set_entry_analysis(
-            &entry.id, Some("みすえる"), &analysis, "fixture", "legacy fixture", "VERIFIED", None,
+            &entry.id, Some("みすえる"), &analysis, "fixture", "invalid fixture", "VERIFIED", None,
             Some(&[vec![3]]), "lexical", &[],
         ).unwrap();
         assert!(db.pitch_question(&entry.id, false).unwrap().is_none());

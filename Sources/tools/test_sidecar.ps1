@@ -97,11 +97,11 @@ Write-Host "PASS 3/5 kana-only + UTF-8 BOM"
 
 $audioDir = Join-Path ([System.IO.Path]::GetTempPath()) ("tanren-sidecar-smoke-{0}" -f [guid]::NewGuid().ToString("N"))
 $audioJson = @{ text = "かな"; audio_dir = $audioDir } | ConvertTo-Json -Compress
-$case4 = Assert-JsonSuccess "no legacy TTS fallback" (Invoke-Sidecar -Payload $audioJson)
+$case4 = Assert-JsonSuccess "no TTS fallback" (Invoke-Sidecar -Payload $audioJson)
 if ($case4.audio_written -or @($case4.audio_assets).Count -ne 0) {
     throw "sidecar synthesized audio without the managed VOICEVOX runtime"
 }
-Write-Host "PASS 4/5 no legacy TTS fallback"
+Write-Host "PASS 4/5 no TTS fallback"
 
 $case5 = Invoke-Sidecar -Payload '{not-json'
 if ($case5.ExitCode -eq 0) { throw "malformed JSON unexpectedly succeeded" }
