@@ -212,10 +212,9 @@ function App() {
     const onWheel = (event: WheelEvent) => {
       const target = event.target as HTMLElement | null;
 
-      // The growth plot owns wheel input anywhere inside its bounds.
-      // Do not let the home section snap handler turn the same gesture into
-      // navigation to the shelf/settings before the chart handles the zoom.
-      if (target?.closest(".stats-growth-chart")) {
+      // Ctrl + wheel is reserved for growth-plot zoom. Plain wheel input
+      // should keep navigating between the home sections even over the plot.
+      if (event.ctrlKey && target?.closest(".stats-growth-chart")) {
         event.preventDefault();
         return;
       }
@@ -2817,6 +2816,7 @@ function GrowthChart({ stats }: { stats: LibraryStats }) {
         event.currentTarget.classList.remove("is-panning");
       }}
       onWheel={(event) => {
+        if (!event.ctrlKey) return;
         event.preventDefault();
         event.stopPropagation();
         const rect = event.currentTarget.getBoundingClientRect();
