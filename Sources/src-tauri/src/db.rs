@@ -640,13 +640,19 @@ impl Database {
         Ok(entries)
     }
 
+    #[cfg(test)]
     pub fn import_entries(&self, deck_id: &str, target_language: &str, drafts: &[EntryDraft]) -> Result<ImportResult, String> {
+        self.import_entries_tracked(deck_id, target_language, drafts).map(|(result, _)| result)
+    }
+
+    pub fn import_entries_tracked(&self, deck_id: &str, target_language: &str, drafts: &[EntryDraft]) -> Result<(ImportResult, Vec<String>), String> {
         let mut conn = self.conn()?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let mut next_pos: i64 = tx.query_row("SELECT COALESCE(MAX(position)+1,0) FROM entries WHERE deck_id=?1", [deck_id], |r| r.get(0)).map_err(|e| e.to_string())?;
         let timestamp = now();
         let mut inserted = 0;
         let mut duplicates = 0;
+        let mut entry_ids = Vec::new();
         for draft in drafts.iter().filter(|d| !d.term.trim().is_empty() && !d.meanings.is_empty()) {
             let meanings = serde_json::to_string(&draft.meanings).map_err(|e| e.to_string())?;
             let exists: bool = tx.query_row(
@@ -661,11 +667,12 @@ impl Database {
             ).map_err(|e| e.to_string())?;
             tx.execute("INSERT INTO enrichment_jobs(id,entry_id,status,updated_at) VALUES(?1,?2,'queued',?3)", params![Uuid::new_v4().to_string(),id,timestamp]).map_err(|e| e.to_string())?;
             journal(&tx, &id, "entry", &self.device_id, 1, "insert", &serde_json::json!({"deck_id":deck_id,"term":draft.term,"meanings":draft.meanings}))?;
+            entry_ids.push(id);
             next_pos += 1;
             inserted += 1;
         }
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(ImportResult { inserted, duplicates })
+        Ok((ImportResult { inserted, duplicates }, entry_ids))
     }
 
     pub fn update_entry(&self, deck_id: &str, entry_id: &str, draft: &EntryDraft) -> Result<(), String> {
@@ -1139,6 +1146,30 @@ impl Database {
         let conn=self.conn()?; let mut stmt=conn.prepare("SELECT e.id,e.term,e.meanings,e.reading FROM enrichment_jobs j JOIN entries e ON e.id=j.entry_id WHERE e.deleted_at IS NULL AND j.status IN ('queued','failed') AND j.attempts<3 ORDER BY e.position LIMIT ?1").map_err(|e|e.to_string())?;
         let rows=stmt.query_map([limit as i64],|r|{let m:String=r.get(2)?;Ok(EntryRecord{id:r.get(0)?,term:r.get(1)?,meanings:parse_json_column(&m,2)?,reading:r.get(3)?})}).map_err(|e|e.to_string())?;
         rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+    }
+
+    pub fn enrichment_progress(&self, entry_ids: &[String]) -> Result<(usize, usize, usize, Option<String>), String> {
+        if entry_ids.is_empty() { return Ok((0, 0, 0, None)); }
+        let conn = self.conn()?;
+        let placeholders = std::iter::repeat_n("?", entry_ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT status,attempts,last_error FROM enrichment_jobs WHERE entry_id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params_from_iter(entry_ids.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?))
+        }).map_err(|e| e.to_string())?;
+        let mut completed = 0;
+        let mut failed = 0;
+        let mut last_error = None;
+        for row in rows {
+            let (status, attempts, error) = row.map_err(|e| e.to_string())?;
+            if status == "done" {
+                completed += 1;
+            } else if status == "failed" && attempts >= 3 {
+                failed += 1;
+                if error.is_some() { last_error = error; }
+            }
+        }
+        Ok((entry_ids.len(), completed, failed, last_error))
     }
 
     pub fn fail_enrichment(&self,entry_id:&str,error:&str)->Result<(),String>{let conn=self.conn()?;conn.execute("UPDATE enrichment_jobs SET status='failed',attempts=attempts+1,last_error=?1,updated_at=?2 WHERE entry_id=?3",params![error,now(),entry_id]).map_err(|e|e.to_string())?;Ok(())}

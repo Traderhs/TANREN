@@ -35,6 +35,16 @@ export interface StageScheduleSummary {
 export interface ImportResult {
   inserted: number;
   duplicates: number;
+  entry_ids: string[];
+}
+
+export interface EnrichmentProgress {
+  total: number;
+  completed: number;
+  failed: number;
+  pending: number;
+  last_error?: string | null;
+  runtime_phase: string;
 }
 
 export interface StudyCard {

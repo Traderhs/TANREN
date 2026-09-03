@@ -19,7 +19,7 @@ use db::Database;
 use grading::grade_form;
 use japanese::JapaneseAnalyzer;
 use model::{
-    DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, ImportResult, LibraryStats,
+    DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
     StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
 };
 use rand::random;
@@ -68,6 +68,23 @@ struct AudioSettings {
     playback_rate: f64,
 }
 
+#[derive(Serialize)]
+struct ImportEntriesResult {
+    inserted: usize,
+    duplicates: usize,
+    entry_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct EnrichmentProgress {
+    total: usize,
+    completed: usize,
+    failed: usize,
+    pending: usize,
+    last_error: Option<String>,
+    runtime_phase: String,
+}
+
 #[tauri::command]
 fn list_decks(state: State<'_, AppState>) -> Result<Vec<DeckSummary>, String> {
     state.db.list_decks()
@@ -95,9 +112,9 @@ fn create_deck(
 }
 
 #[tauri::command]
-fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<EntryDraft>) -> Result<ImportResult, String> {
+fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<EntryDraft>) -> Result<ImportEntriesResult, String> {
     let deck = state.db.deck(&deck_id)?;
-    let result = state.db.import_entries(&deck_id, &deck.target_language, &entries)?;
+    let (result, entry_ids) = state.db.import_entries_tracked(&deck_id, &deck.target_language, &entries)?;
     start_enrichment_worker(
         state.db.clone(),
         state.analyzer.clone(),
@@ -105,7 +122,25 @@ fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<Entr
     );
     let candidates = state.db.entries(&deck_id)?.into_iter().flat_map(|entry| entry.meanings).collect();
     start_semantic_precompute(Arc::clone(&state.semantic), candidates);
-    Ok(result)
+    Ok(ImportEntriesResult { inserted: result.inserted, duplicates: result.duplicates, entry_ids })
+}
+
+#[tauri::command]
+fn enrichment_progress(state: State<'_, AppState>, entry_ids: Vec<String>) -> Result<EnrichmentProgress, String> {
+    start_enrichment_worker(
+        state.db.clone(),
+        state.analyzer.clone(),
+        Arc::clone(&state.enrichment_running),
+    );
+    let (total, completed, failed, last_error) = state.db.enrichment_progress(&entry_ids)?;
+    Ok(EnrichmentProgress {
+        total,
+        completed,
+        failed,
+        pending: total.saturating_sub(completed + failed),
+        last_error,
+        runtime_phase: state.analyzer.audio_runtime_phase(),
+    })
 }
 
 #[tauri::command]
@@ -851,6 +886,7 @@ pub fn run() {
             stage_schedule,
             create_deck,
             import_entries,
+            enrichment_progress,
             update_entry,
             delete_entry,
             update_deck,
