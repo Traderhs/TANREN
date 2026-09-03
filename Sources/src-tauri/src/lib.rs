@@ -167,6 +167,14 @@ fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) 
     let slots = state.db.ensure_stage_schedule(&deck_id, selected_stage, &entries)?;
 
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
+    let stale_session = if let Some(session) = engine.session.as_ref() {
+        state.db.load_session(&session.deck_id, session.stage)?.is_none()
+    } else {
+        false
+    };
+    if stale_session {
+        engine.session = None;
+    }
     if engine.session.as_ref().is_some_and(|session| session.deck_id != deck_id || session.stage != selected_stage) {
         return Err("다른 책이나 단계를 학습 중이에요. 먼저 종료해주세요.".into());
     }
