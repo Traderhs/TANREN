@@ -74,6 +74,7 @@ pub struct StageScheduleSummary {
     pub study_range: StudyRange,
     pub completed: bool,
     pub active: bool,
+    pub clear_times_ms: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,32 +228,8 @@ impl SubmitResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeckStats {
-    pub mode: StudyMode,
-    pub base_accuracy: Option<f64>,
-    pub pitch_accuracy: Option<f64>,
-    pub joint_accuracy: Option<f64>,
-    pub median_recall_latency_ms: Option<u64>,
-    pub attempts: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LibraryDeckStats {
-    pub deck_id: String,
-    pub deck_name: String,
-    pub entry_count: usize,
-    pub current_stage: u32,
-    pub attempts: usize,
-    pub base_accuracy: Option<f64>,
-    pub joint_accuracy: Option<f64>,
-    pub median_recall_latency_ms: Option<u64>,
-    pub last_practiced_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryStats {
     pub deck_count: usize,
-    pub active_deck_count: usize,
     pub entry_count: usize,
     pub seen_entry_count: usize,
     pub attempts: usize,
@@ -261,8 +238,6 @@ pub struct LibraryStats {
     pub joint_accuracy: Option<f64>,
     pub median_recall_latency_ms: Option<u64>,
     pub study_time_ms: u64,
-    pub mode_stats: Vec<DeckStats>,
-    pub deck_stats: Vec<LibraryDeckStats>,
     pub history: Vec<LibraryStatsPoint>,
 }
 

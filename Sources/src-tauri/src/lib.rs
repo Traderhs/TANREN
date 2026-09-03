@@ -19,7 +19,7 @@ use db::Database;
 use grading::grade_form;
 use japanese::JapaneseAnalyzer;
 use model::{
-    DeckStats, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, ImportResult, LibraryStats,
+    DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, ImportResult, LibraryStats,
     StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
 };
 use rand::random;
@@ -191,7 +191,13 @@ fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) 
 
 #[tauri::command]
 fn record_study_activity(state: State<'_, AppState>, deck_id: String, mode: Option<StudyMode>, duration_ms: u64) -> Result<(), String> {
-    state.db.record_study_activity(&deck_id, mode, duration_ms)
+    state.db.record_study_activity(&deck_id, mode, duration_ms)?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
+    if let Some(session) = engine.session.as_mut().filter(|session| session.deck_id == deck_id) {
+        session.active_duration_ms = session.active_duration_ms.saturating_add(duration_ms);
+        state.db.save_session(session)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -405,13 +411,8 @@ fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
 }
 
 #[tauri::command]
-fn deck_stats(state: State<'_, AppState>, deck_id: String) -> Result<Vec<DeckStats>, String> {
-    state.db.stats(&deck_id)
-}
-
-#[tauri::command]
-fn library_stats(state: State<'_, AppState>) -> Result<LibraryStats, String> {
-    state.db.library_stats()
+fn library_stats(state: State<'_, AppState>, deck_id: Option<String>) -> Result<LibraryStats, String> {
+    state.db.library_stats(deck_id.as_deref())
 }
 
 #[tauri::command]
@@ -572,11 +573,11 @@ fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Res
 }
 
 fn complete_current_stage(state: &AppState, engine: &mut Engine) -> Result<SubmitResult, String> {
-    let (deck_id, stage) = {
+    let (deck_id, stage, duration_ms) = {
         let session = engine.session.as_ref().ok_or("진행 중인 학습이 없어요.")?;
-        (session.deck_id.clone(), session.stage)
+        (session.deck_id.clone(), session.stage, session.active_duration_ms)
     };
-    state.db.mark_stage_completed(&deck_id, stage)?;
+    state.db.mark_stage_completed(&deck_id, stage, duration_ms)?;
     state.db.clear_stage_session(&deck_id, stage)?;
     engine.session = None;
     let _ = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요.")?.restore();
@@ -855,7 +856,6 @@ pub fn run() {
             adjudicate_answer,
             submit_pitch,
             continue_review,
-            deck_stats,
             library_stats,
             semantic_status,
             voicevox_status,

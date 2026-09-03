@@ -1,18 +1,18 @@
 use std::{collections::{BTreeMap, HashMap, HashSet}, fs, path::{Path, PathBuf}};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use rusqlite::{params, params_from_iter, types::{Value as SqlValue, ValueRef}, Connection, OptionalExtension, Transaction};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    model::{AudioAssetDraft, DeckRecord, DeckStats, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImportResult, LibraryDeckStats, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageScheduleSummary, StudyMode},
+    model::{AudioAssetDraft, DeckRecord, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImportResult, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageScheduleSummary, StudyMode},
     study::{stage_study_range, study_ranges, StudySession},
     timers::TypingProfileState,
 };
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 #[derive(Default)]
 struct StatsAggregate {
@@ -22,11 +22,10 @@ struct StatsAggregate {
     pitch_correct: usize,
     joint_correct: usize,
     recall_latencies: Vec<u64>,
-    last_practiced_at: Option<String>,
 }
 
 impl StatsAggregate {
-    fn record(&mut self, base_correct: bool, pitch_correct: Option<bool>, joint_correct: bool, recall_latency_ms: u64, timestamp: &str) {
+    fn record(&mut self, base_correct: bool, pitch_correct: Option<bool>, joint_correct: bool, recall_latency_ms: u64) {
         self.attempts += 1;
         self.base_correct += usize::from(base_correct);
         self.joint_correct += usize::from(joint_correct);
@@ -35,9 +34,6 @@ impl StatsAggregate {
             self.pitch_correct += usize::from(correct);
         }
         self.recall_latencies.push(recall_latency_ms);
-        if self.last_practiced_at.as_deref().is_none_or(|latest| timestamp > latest) {
-            self.last_practiced_at = Some(timestamp.to_string());
-        }
     }
 
     fn median_recall_latency_ms(&self) -> Option<u64> {
@@ -47,16 +43,6 @@ impl StatsAggregate {
         Some(values[values.len() / 2])
     }
 
-    fn deck_stats(&self, mode: StudyMode) -> DeckStats {
-        DeckStats {
-            mode,
-            base_accuracy: ratio(self.base_correct, self.attempts),
-            pitch_accuracy: ratio(self.pitch_correct, self.pitch_attempts),
-            joint_accuracy: ratio(self.joint_correct, self.attempts),
-            median_recall_latency_ms: self.median_recall_latency_ms(),
-            attempts: self.attempts,
-        }
-    }
 }
 
 fn history_mode_points(
@@ -156,7 +142,7 @@ impl Database {
               target_language TEXT NOT NULL,
               enabled_modes TEXT NOT NULL,
               increment_size INTEGER NOT NULL DEFAULT 50,
-              checkpoint_size INTEGER NOT NULL DEFAULT 300,
+              checkpoint_size INTEGER NOT NULL DEFAULT 500,
               recall_timeout_by_mode TEXT NOT NULL DEFAULT '{"reading":3000,"listening":3000,"writing":3000}',
               adaptive_completion_timer_enabled INTEGER NOT NULL DEFAULT 1,
               pitch_policy TEXT NOT NULL DEFAULT 'verified_only',
@@ -287,11 +273,14 @@ impl Database {
             );
 
             CREATE TABLE IF NOT EXISTS stage_completions (
+              id TEXT PRIMARY KEY,
               deck_id TEXT NOT NULL REFERENCES decks(id),
               stage INTEGER NOT NULL,
+              duration_ms INTEGER NOT NULL,
               completed_at TEXT NOT NULL,
-              PRIMARY KEY(deck_id, stage)
+              device_id TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_stage_completions_deck_stage ON stage_completions(deck_id, stage, completed_at);
 
             CREATE TABLE IF NOT EXISTS attempts (
               id TEXT PRIMARY KEY,
@@ -468,12 +457,12 @@ impl Database {
         Ok(decks)
     }
 
-    pub fn mark_stage_completed(&self, deck_id: &str, stage: u32) -> Result<(), String> {
+    pub fn mark_stage_completed(&self, deck_id: &str, stage: u32, duration_ms: u64) -> Result<(), String> {
         let conn = self.conn()?;
         let timestamp = now();
         conn.execute(
-            "INSERT OR IGNORE INTO stage_completions(deck_id,stage,completed_at) VALUES(?1,?2,?3)",
-            params![deck_id, stage as i64, timestamp],
+            "INSERT INTO stage_completions(id,deck_id,stage,duration_ms,completed_at,device_id) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![Uuid::new_v4().to_string(), deck_id, stage as i64, duration_ms as i64, timestamp, self.device_id],
         ).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -560,8 +549,18 @@ impl Database {
             params![deck_id, stage as i64],
             |row| row.get(0),
         ).map_err(|e| e.to_string())?;
-        let completed = self.is_stage_completed(deck_id, stage)?;
-        Ok(StageScheduleSummary { stage, study_range, completed, active })
+        let clear_times_ms = {
+            let mut stmt = conn.prepare(
+                "SELECT duration_ms FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at,id",
+            ).map_err(|e| e.to_string())?;
+            stmt.query_map(params![deck_id, stage as i64], |row| row.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?
+                .map(|value| value.map(|value| value.max(0) as u64))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let completed = !clear_times_ms.is_empty();
+        Ok(StageScheduleSummary { stage, study_range, completed, active, clear_times_ms })
     }
 
     pub fn deck(&self, id: &str) -> Result<DeckRecord, String> {
@@ -840,7 +839,7 @@ impl Database {
         if duration_ms == 0 { return Ok(()); }
         let conn = self.conn()?;
         let timestamp = now();
-        let date = timestamp.get(..10).unwrap_or(timestamp.as_str());
+        let date = local_date(&timestamp)?;
         let mode = mode.map(StudyMode::as_str).unwrap_or("all");
         conn.execute(
             "INSERT INTO study_activity(date,deck_id,mode,duration_ms,updated_at,device_id) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(date,deck_id,mode,device_id) DO UPDATE SET duration_ms=study_activity.duration_ms+excluded.duration_ms,updated_at=excluded.updated_at",
@@ -914,19 +913,19 @@ impl Database {
             "SELECT COALESCE(a.reading,''),a.analysis_json,p.patterns_json,p.confidence FROM japanese_analyses a JOIN pitch_patterns p ON p.analysis_id=a.id WHERE a.entry_id=?1 AND a.deleted_at IS NULL AND p.deleted_at IS NULL ORDER BY CASE p.confidence WHEN 'MANUAL' THEN 1 WHEN 'VERIFIED' THEN 2 WHEN 'CONSENSUS' THEN 3 ELSE 4 END LIMIT 1",
             [entry_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())?;
         let Some((reading,analysis_json,patterns_json,confidence))=row else{return Ok(None)};
-        let analysis:serde_json::Value=serde_json::from_str(&analysis_json).map_err(|e| format!("invalid Japanese analysis JSON: {e}"))?;
-        let patterns:Vec<Vec<u8>>=serde_json::from_str(&patterns_json).map_err(|e| format!("invalid pitch patterns JSON: {e}"))?;
+        let Ok(analysis)=serde_json::from_str::<serde_json::Value>(&analysis_json) else{return Ok(None)};
+        let Ok(patterns)=serde_json::from_str::<Vec<Vec<u8>>>(&patterns_json) else{return Ok(None)};
         let confidence=match confidence.as_str(){
             "MANUAL"=>PitchConfidence::Manual,
             "VERIFIED"=>PitchConfidence::Verified,
             "CONSENSUS"=>PitchConfidence::Consensus,
             "PREDICTED"=>PitchConfidence::Predicted,
-            value=>return Err(format!("invalid pitch confidence: {value}")),
+            _=>return Ok(None),
         };
         let gate=confidence.gates_by_default() || predicted_gate;
-        let morae_values=analysis.get("morae").and_then(Value::as_array).ok_or("Japanese analysis is missing morae")?;
-        let morae=morae_values.iter().map(|value| value.as_str().map(String::from).ok_or("Japanese analysis contains a non-string mora")).collect::<Result<Vec<_>,_>>()?;
-        let kind=analysis.get("scope").and_then(Value::as_str).ok_or("Japanese analysis is missing scope")?.to_string();
+        let Some(morae_values)=analysis.get("morae").and_then(Value::as_array) else{return Ok(None)};
+        let Some(morae)=morae_values.iter().map(|value| value.as_str().map(String::from)).collect::<Option<Vec<_>>>() else{return Ok(None)};
+        let Some(kind)=analysis.get("scope").and_then(Value::as_str).map(String::from) else{return Ok(None)};
         if kind != "lexical" || morae.is_empty() || patterns.is_empty() || patterns.iter().any(|pattern| pattern.len()!=morae.len() || pattern.iter().any(|level| *level>1)) {
             return Ok(None);
         }
@@ -951,66 +950,37 @@ impl Database {
         Ok(Some(path))
     }
 
-    pub fn stats(&self, deck_id:&str)->Result<Vec<DeckStats>,String>{
-        let conn=self.conn()?;
-        let mut output=Vec::new();
-        for mode in [StudyMode::Reading,StudyMode::Listening,StudyMode::Writing]{
-            let mut stmt=conn.prepare("SELECT base_correct,pitch_correct,joint_correct,recall_latency_ms FROM attempts WHERE deck_id=?1 AND variant=?2").map_err(|e|e.to_string())?;
-            let rows=stmt.query_map(params![deck_id,mode.as_str()],|r|Ok((r.get::<_,i64>(0)?!=0,r.get::<_,Option<i64>>(1)?.map(|v|v!=0),r.get::<_,i64>(2)?!=0,r.get::<_,i64>(3)? as u64))).map_err(|e|e.to_string())?;
-            let data=rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
-            let attempts=data.len();
-            let base_accuracy=ratio(data.iter().filter(|r|r.0).count(),attempts);
-            let pitch_vals:Vec<bool>=data.iter().filter_map(|r|r.1).collect();
-            let pitch_accuracy=ratio(pitch_vals.iter().filter(|&&v|v).count(),pitch_vals.len());
-            let joint_accuracy=ratio(data.iter().filter(|r|r.2).count(),attempts);
-            let mut latency:Vec<u64>=data.iter().map(|r|r.3).collect(); latency.sort_unstable();
-            let median=if latency.is_empty(){None}else{Some(latency[latency.len()/2])};
-            output.push(DeckStats{mode,base_accuracy,pitch_accuracy,joint_accuracy,median_recall_latency_ms:median,attempts});
-        }
-        Ok(output)
-    }
-
-    pub fn library_stats(&self) -> Result<LibraryStats, String> {
+    pub fn library_stats(&self, deck_id: Option<&str>) -> Result<LibraryStats, String> {
         let conn = self.conn()?;
-        let decks = {
-            let mut stmt = conn.prepare(
-                "SELECT d.id,d.name,COUNT(e.id),d.current_stage FROM decks d LEFT JOIN entries e ON e.deck_id=d.id AND e.deleted_at IS NULL WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.created_at",
-            ).map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as usize,
-                row.get::<_, i64>(3)? as u32,
-            ))).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
-        };
+        let (deck_count, entry_count): (usize, usize) = conn.query_row(
+            "SELECT COUNT(DISTINCT d.id),COUNT(e.id) FROM decks d LEFT JOIN entries e ON e.deck_id=d.id AND e.deleted_at IS NULL WHERE d.deleted_at IS NULL AND (?1 IS NULL OR d.id=?1)",
+            params![deck_id],
+            |row| Ok((row.get::<_, i64>(0)? as usize, row.get::<_, i64>(1)? as usize)),
+        ).map_err(|e| e.to_string())?;
 
         let mut overall = StatsAggregate::default();
         let mut by_mode: HashMap<StudyMode, StatsAggregate> = HashMap::new();
-        let mut by_deck: HashMap<String, StatsAggregate> = decks.iter()
-            .map(|(id, _, _, _)| (id.clone(), StatsAggregate::default()))
-            .collect();
         let mut seen_entries = HashSet::new();
         let mut seen_entries_by_mode: HashMap<StudyMode, HashSet<String>> = HashMap::new();
         let mut history = Vec::new();
         let mut history_date: Option<String> = None;
 
         let mut stmt = conn.prepare(
-            "SELECT a.deck_id,a.entry_id,a.variant,a.base_correct,a.pitch_correct,a.joint_correct,a.recall_latency_ms,a.timestamp FROM attempts a JOIN decks d ON d.id=a.deck_id WHERE d.deleted_at IS NULL ORDER BY a.timestamp,a.id",
+            "SELECT a.entry_id,a.variant,a.base_correct,a.pitch_correct,a.joint_correct,a.recall_latency_ms,a.timestamp FROM attempts a JOIN decks d ON d.id=a.deck_id WHERE d.deleted_at IS NULL AND (?1 IS NULL OR a.deck_id=?1) ORDER BY a.timestamp,a.id",
         ).map_err(|e| e.to_string())?;
-        let rows = stmt.query_map([], |row| Ok((
+        let rows = stmt.query_map(params![deck_id], |row| Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)? != 0,
-            row.get::<_, Option<i64>>(4)?.map(|value| value != 0),
-            row.get::<_, i64>(5)? != 0,
-            row.get::<_, i64>(6)? as u64,
-            row.get::<_, String>(7)?,
+            row.get::<_, i64>(2)? != 0,
+            row.get::<_, Option<i64>>(3)?.map(|value| value != 0),
+            row.get::<_, i64>(4)? != 0,
+            row.get::<_, i64>(5)? as u64,
+            row.get::<_, String>(6)?,
         ))).map_err(|e| e.to_string())?;
 
         for row in rows {
-            let (deck_id, entry_id, variant, base_correct, pitch_correct, joint_correct, recall_latency_ms, timestamp) = row.map_err(|e| e.to_string())?;
-            let date = timestamp.get(..10).unwrap_or(timestamp.as_str()).to_string();
+            let (entry_id, variant, base_correct, pitch_correct, joint_correct, recall_latency_ms, timestamp) = row.map_err(|e| e.to_string())?;
+            let date = local_date(&timestamp)?;
             if history_date.as_deref().is_some_and(|previous| previous != date) {
                 history.push(LibraryStatsPoint {
                     date: history_date.take().unwrap(),
@@ -1032,11 +1002,8 @@ impl Database {
             };
             seen_entries.insert(entry_id.clone());
             seen_entries_by_mode.entry(mode).or_default().insert(entry_id);
-            overall.record(base_correct, pitch_correct, joint_correct, recall_latency_ms, &timestamp);
-            by_mode.entry(mode).or_default().record(base_correct, pitch_correct, joint_correct, recall_latency_ms, &timestamp);
-            if let Some(deck) = by_deck.get_mut(&deck_id) {
-                deck.record(base_correct, pitch_correct, joint_correct, recall_latency_ms, &timestamp);
-            }
+            overall.record(base_correct, pitch_correct, joint_correct, recall_latency_ms);
+            by_mode.entry(mode).or_default().record(base_correct, pitch_correct, joint_correct, recall_latency_ms);
         }
         if let Some(date) = history_date {
             history.push(LibraryStatsPoint {
@@ -1054,9 +1021,9 @@ impl Database {
         let mut activity_by_date: BTreeMap<String, HashMap<String, u64>> = BTreeMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT s.date,s.mode,SUM(s.duration_ms) FROM study_activity s JOIN decks d ON d.id=s.deck_id WHERE d.deleted_at IS NULL GROUP BY s.date,s.mode ORDER BY s.date",
+                "SELECT s.date,s.mode,SUM(s.duration_ms) FROM study_activity s JOIN decks d ON d.id=s.deck_id WHERE d.deleted_at IS NULL AND (?1 IS NULL OR s.deck_id=?1) GROUP BY s.date,s.mode ORDER BY s.date",
             ).map_err(|e| e.to_string())?;
-            let rows = stmt.query_map([], |row| Ok((
+            let rows = stmt.query_map(params![deck_id], |row| Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)? as u64,
@@ -1113,30 +1080,9 @@ impl Database {
             history.push(point);
         }
 
-        let mode_stats = [StudyMode::Reading, StudyMode::Listening, StudyMode::Writing]
-            .into_iter()
-            .map(|mode| by_mode.remove(&mode).unwrap_or_default().deck_stats(mode))
-            .collect();
-        let mut deck_stats = decks.into_iter().map(|(deck_id, deck_name, entry_count, current_stage)| {
-            let stats = by_deck.remove(&deck_id).unwrap_or_default();
-            LibraryDeckStats {
-                deck_id,
-                deck_name,
-                entry_count,
-                current_stage,
-                attempts: stats.attempts,
-                base_accuracy: ratio(stats.base_correct, stats.attempts),
-                joint_accuracy: ratio(stats.joint_correct, stats.attempts),
-                median_recall_latency_ms: stats.median_recall_latency_ms(),
-                last_practiced_at: stats.last_practiced_at,
-            }
-        }).collect::<Vec<_>>();
-        deck_stats.sort_by(|left, right| right.last_practiced_at.cmp(&left.last_practiced_at).then_with(|| left.deck_name.cmp(&right.deck_name)));
-
         Ok(LibraryStats {
-            deck_count: deck_stats.len(),
-            active_deck_count: deck_stats.iter().filter(|deck| deck.attempts > 0).count(),
-            entry_count: deck_stats.iter().map(|deck| deck.entry_count).sum(),
+            deck_count,
+            entry_count,
             seen_entry_count: seen_entries.len(),
             attempts: overall.attempts,
             base_accuracy: ratio(overall.base_correct, overall.attempts),
@@ -1144,8 +1090,6 @@ impl Database {
             joint_accuracy: ratio(overall.joint_correct, overall.attempts),
             median_recall_latency_ms: overall.median_recall_latency_ms(),
             study_time_ms: cumulative_study_time_ms,
-            mode_stats,
-            deck_stats,
             history,
         })
     }
@@ -1205,10 +1149,7 @@ impl Database {
             "SELECT completion_distribution FROM typing_profiles WHERE deck_id=?1 AND input_language=?2 AND study_mode=?3 AND input_method='default'",
             params![deck_id, input_language, mode.as_str()], |r| r.get(0),
         ).optional().map_err(|e| e.to_string())?;
-        match raw {
-            Some(value) => serde_json::from_str(&value).map_err(|error| format!("invalid typing profile JSON: {error}")),
-            None => Ok(TypingProfileState::default()),
-        }
+        Ok(raw.and_then(|value| serde_json::from_str(&value).ok()).unwrap_or_default())
     }
 
     pub fn update_typing_profile(&self, deck_id: &str, input_language: &str, mode: StudyMode, profile: &TypingProfileState) -> Result<(), String> {
@@ -1393,6 +1334,10 @@ fn journal(tx:&Transaction<'_>, entity_id:&str, entity_type:&str, device_id:&str
 }
 fn ratio(n:usize,d:usize)->Option<f64>{if d==0{None}else{Some(n as f64/d as f64)}}
 fn now()->String{Utc::now().to_rfc3339()}
+fn local_date(timestamp:&str)->Result<String,String>{
+    let parsed=DateTime::parse_from_rfc3339(timestamp).map_err(|e|format!("invalid RFC3339 timestamp '{timestamp}': {e}"))?;
+    Ok(parsed.with_timezone(&Local).format("%Y-%m-%d").to_string())
+}
 
 #[cfg(test)]
 mod tests{
@@ -1409,6 +1354,35 @@ mod tests{
     }
 
     #[test]
+    fn statistics_bucket_activity_and_attempts_by_system_local_date() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("local-day", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+
+        db.record_study_activity(&deck.id, Some(StudyMode::Reading), 1_000).unwrap();
+        let (activity_date, activity_updated_at): (String, String) = db.conn().unwrap().query_row(
+            "SELECT date,updated_at FROM study_activity WHERE deck_id=?1",
+            [&deck.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(activity_date, local_date(&activity_updated_at).unwrap());
+
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, None, true, "exact", None, 300, 100, None).unwrap();
+        let attempt_timestamp: String = db.conn().unwrap().query_row(
+            "SELECT timestamp FROM attempts WHERE deck_id=?1",
+            [&deck.id],
+            |row| row.get(0),
+        ).unwrap();
+        let stats = db.library_stats(None).unwrap();
+        let expected_attempt_date = local_date(&attempt_timestamp).unwrap();
+        assert_eq!(stats.history.last().map(|point| point.date.as_str()), Some(expected_attempt_date.as_str()));
+    }
+
+    #[test]
     fn imports_append_after_existing_cards_and_skip_exact_duplicates() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
@@ -1421,7 +1395,7 @@ mod tests{
     }
 
     #[test]
-    fn five_hundred_words_are_eleven_stages_with_one_range_per_stage() {
+    fn five_hundred_words_are_ten_stages_with_one_range_per_stage() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
         let deck = db.create_deck("stages", "ko-KR", "ja-JP").unwrap();
@@ -1433,24 +1407,29 @@ mod tests{
         db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
 
         let summary = db.list_decks().unwrap().remove(0);
-        assert_eq!(summary.total_stage_count, 11);
+        assert_eq!(summary.total_stage_count, 10);
         assert_eq!(summary.completed_stage_count, 0);
         assert_eq!(db.stage_schedule_summary(&deck.id, 1).unwrap().study_range.label, "0~49");
         assert_eq!(db.stage_schedule_summary(&deck.id, 2).unwrap().study_range.label, "0~99");
-        assert_eq!(db.stage_schedule_summary(&deck.id, 7).unwrap().study_range.label, "300~349");
-        assert_eq!(db.stage_schedule_summary(&deck.id, 11).unwrap().study_range.label, "0~499 · cumulative");
+        assert_eq!(db.stage_schedule_summary(&deck.id, 7).unwrap().study_range.label, "0~349");
+        assert_eq!(db.stage_schedule_summary(&deck.id, 10).unwrap().study_range.label, "0~499");
+        assert!(db.stage_schedule_summary(&deck.id, 11).is_err());
 
-        db.mark_stage_completed(&deck.id, 1).unwrap();
+        db.mark_stage_completed(&deck.id, 1, 4_320_000).unwrap();
+        db.mark_stage_completed(&deck.id, 1, 3_780_000).unwrap();
+        let stage_one = db.stage_schedule_summary(&deck.id, 1).unwrap();
+        assert!(stage_one.completed);
+        assert_eq!(stage_one.clear_times_ms, vec![4_320_000, 3_780_000]);
         let summary = db.list_decks().unwrap().remove(0);
         assert_eq!(summary.completed_stage_count, 1);
-        assert_eq!(summary.total_stage_count, 11);
+        assert_eq!(summary.total_stage_count, 10);
 
         db.select_stage(&deck.id, 7).unwrap();
         assert_eq!(db.list_decks().unwrap().remove(0).current_stage, 7);
     }
 
     #[test]
-    fn library_stats_aggregate_every_deck_and_keep_inactive_decks_visible() {
+    fn library_stats_can_scope_to_one_deck() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
         let reading_deck = db.create_deck("Reading", "ko-KR", "ja-JP").unwrap();
@@ -1467,9 +1446,8 @@ mod tests{
         db.record_study_activity(&listening_deck.id, Some(StudyMode::Listening), 3_500).unwrap();
         db.record_study_activity(&reading_deck.id, None, 500).unwrap();
 
-        let stats = db.library_stats().unwrap();
+        let stats = db.library_stats(None).unwrap();
         assert_eq!(stats.deck_count, 3);
-        assert_eq!(stats.active_deck_count, 2);
         assert_eq!(stats.entry_count, 2);
         assert_eq!(stats.seen_entry_count, 2);
         assert_eq!(stats.attempts, 2);
@@ -1486,8 +1464,17 @@ mod tests{
         assert_eq!(latest_history.modes.get(&StudyMode::Listening).map(|point| (point.attempts, point.seen_entry_count, point.base_accuracy)), Some((1, 1, Some(0.0))));
         assert_eq!(latest_history.modes.get(&StudyMode::Reading).map(|point| point.study_time_ms), Some(2_500));
         assert_eq!(latest_history.modes.get(&StudyMode::Listening).map(|point| point.study_time_ms), Some(3_500));
-        assert_eq!(stats.mode_stats.iter().map(|mode| mode.attempts).collect::<Vec<_>>(), vec![1, 1, 0]);
-        assert_eq!(stats.deck_stats.iter().filter(|deck| deck.attempts == 0).count(), 1);
+
+        let reading_stats = db.library_stats(Some(&reading_deck.id)).unwrap();
+        assert_eq!(reading_stats.deck_count, 1);
+        assert_eq!(reading_stats.entry_count, 1);
+        assert_eq!(reading_stats.seen_entry_count, 1);
+        assert_eq!(reading_stats.attempts, 1);
+        assert_eq!(reading_stats.base_accuracy, Some(1.0));
+        assert_eq!(reading_stats.pitch_accuracy, Some(1.0));
+        assert_eq!(reading_stats.study_time_ms, 3_000);
+        assert_eq!(reading_stats.history.last().map(|point| point.attempts), Some(1));
+        assert_eq!(reading_stats.history.last().map(|point| point.study_time_ms), Some(3_000));
     }
 
     #[test]
@@ -1499,7 +1486,10 @@ mod tests{
         let entry = source.entries(&deck.id).unwrap().remove(0);
         source.set_alias(&entry.id, "냥이", true).unwrap();
         source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, None, true, "exact", None, 500, 200, None).unwrap();
-        let session = StudySession::new(deck.id.clone(), 1, &[entry.clone()], &[StudyMode::Reading], 50, 300, 1).unwrap();
+        source.mark_stage_completed(&deck.id, 1, 61_000).unwrap();
+        source.mark_stage_completed(&deck.id, 1, 73_000).unwrap();
+        let mut session = StudySession::new(deck.id.clone(), 1, &[entry.clone()], &[StudyMode::Reading], 50, 500, 1).unwrap();
+        session.active_duration_ms = 47_000;
         source.save_session(&session).unwrap();
         source.set_entry_analysis(&entry.id, Some("ねこ"), &serde_json::json!({"scope":"lexical","morae":["ね","こ"]}), "fixture", "fixture", "VERIFIED", Some("1"), Some(&[vec![1,0]]), "lexical", &[]).unwrap();
 
@@ -1515,8 +1505,9 @@ mod tests{
         assert_eq!(destination.import_deck_export(&payload).unwrap(), deck.id);
         assert_eq!(destination.entries(&deck.id).unwrap().len(), 1);
         assert_eq!(destination.aliases(&entry.id).unwrap().0, vec!["냥이"]);
-        assert!(destination.load_session(&deck.id, 1).unwrap().is_some());
-        assert_eq!(destination.stats(&deck.id).unwrap()[0].attempts, 1);
+        assert_eq!(destination.load_session(&deck.id, 1).unwrap().unwrap().active_duration_ms, 47_000);
+        assert_eq!(destination.library_stats(Some(&deck.id)).unwrap().attempts, 1);
+        assert_eq!(destination.stage_schedule_summary(&deck.id, 1).unwrap().clear_times_ms, vec![61_000, 73_000]);
         assert!(destination.pitch_question(&entry.id, false).unwrap().is_some());
     }
 
@@ -1531,6 +1522,7 @@ mod tests{
         let entry = source.entries(&deck.id).unwrap().remove(0);
         source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, Some(true), true, "exact", None, 420, 180, None).unwrap();
         source.record_study_activity(&deck.id, Some(StudyMode::Reading), 7_500).unwrap();
+        source.mark_stage_completed(&deck.id, 1, 7_500).unwrap();
         source.set_setting("audio_volume", Some("0.65")).unwrap();
 
         let backup_path = source_dir.path().join("all-data.tanren");
@@ -1539,13 +1531,14 @@ mod tests{
         let destination_dir = tempdir().unwrap();
         let destination = Database::open(destination_dir.path().join("destination.db")).unwrap();
         destination.import_backup(&backup_path).unwrap();
-        let stats = destination.library_stats().unwrap();
+        let stats = destination.library_stats(None).unwrap();
         assert_eq!(stats.deck_count, 1);
         assert_eq!(stats.attempts, 1);
         assert_eq!(stats.seen_entry_count, 1);
         assert_eq!(stats.study_time_ms, 7_500);
         assert_eq!(stats.base_accuracy, Some(1.0));
         assert_eq!(stats.pitch_accuracy, Some(1.0));
+        assert_eq!(destination.stage_schedule_summary(&deck.id, 1).unwrap().clear_times_ms, vec![7_500]);
         assert_eq!(destination.setting("audio_volume").unwrap().as_deref(), Some("0.65"));
     }
 
@@ -1624,6 +1617,42 @@ mod tests{
             Some(&[vec![3]]), "lexical", &[],
         ).unwrap();
         assert!(db.pitch_question(&entry.id, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupted_optional_caches_do_not_block_study() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("cache recovery", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "見据える".into(), meanings: vec!["내다보다".into()], reading: Some("みすえる".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+        let analysis = serde_json::json!({"scope":"lexical","morae":["み","す","え","る"]});
+        db.set_entry_analysis(
+            &entry.id, Some("みすえる"), &analysis, "fixture", "fixture", "VERIFIED", None,
+            Some(&[vec![0,1,1,0]]), "lexical", &[],
+        ).unwrap();
+
+        let conn = db.conn().unwrap();
+        conn.execute("UPDATE japanese_analyses SET analysis_json='{' WHERE entry_id=?1", [&entry.id]).unwrap();
+        assert!(db.pitch_question(&entry.id, false).unwrap().is_none());
+        conn.execute("UPDATE japanese_analyses SET analysis_json=?1 WHERE entry_id=?2", params![analysis.to_string(), entry.id]).unwrap();
+        conn.execute("UPDATE pitch_patterns SET patterns_json='{' WHERE analysis_id=(SELECT id FROM japanese_analyses WHERE entry_id=?1)", [&entry.id]).unwrap();
+        assert!(db.pitch_question(&entry.id, false).unwrap().is_none());
+        conn.execute("UPDATE pitch_patterns SET patterns_json='[[0,1,1,0]]',confidence='BROKEN' WHERE analysis_id=(SELECT id FROM japanese_analyses WHERE entry_id=?1)", [&entry.id]).unwrap();
+        assert!(db.pitch_question(&entry.id, false).unwrap().is_none());
+
+        let mut profile = TypingProfileState::default();
+        profile.observe(&[100, 120], 1_000, 0, 4);
+        db.update_typing_profile(&deck.id, "ja-JP", StudyMode::Writing, &profile).unwrap();
+        conn.execute(
+            "UPDATE typing_profiles SET completion_distribution='{' WHERE deck_id=?1 AND input_language='ja-JP' AND study_mode='writing' AND input_method='default'",
+            [&deck.id],
+        ).unwrap();
+        let recovered = db.typing_profile(&deck.id, "ja-JP", StudyMode::Writing).unwrap();
+        assert_eq!(recovered.sample_count, 0);
+        assert!(recovered.interkey_gaps_ms.is_empty());
     }
 
     #[test]

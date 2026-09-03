@@ -155,6 +155,7 @@ pub struct StudySession {
     pub stage: u32,
     pub study_range: StudyRange,
     pub entry_slots: Vec<Option<String>>,
+    pub active_duration_ms: u64,
     pub queue: QueueState,
     pub current: Option<VariantKey>,
     pub range_total: usize,
@@ -190,6 +191,7 @@ impl StudySession {
             stage,
             study_range,
             entry_slots,
+            active_duration_ms: 0,
             queue: QueueState::new(variants, seed),
             current: None,
             range_total: total,
@@ -275,15 +277,18 @@ mod tests {
     use super::*;
     use crate::model::{PitchConfidence, SubmitStatus};
 
+    const INCREMENT: usize = 50;
+    const CHECKPOINT: usize = 500;
+
     fn labels(size: usize) -> Vec<String> {
-        study_ranges(size, 50, 300).into_iter().map(|range| range.label).collect()
+        study_ranges(size, INCREMENT, CHECKPOINT).into_iter().map(|range| range.label).collect()
     }
 
     #[test]
     fn exact_progression_ranges_cover_required_odd_sizes() {
-        let cases = [49, 50, 51, 299, 300, 301, 599, 600, 601, 3042];
+        let cases = [49, 50, 51, 499, 500, 501, 999, 1000, 1001, 3042];
         for size in cases {
-            let ranges = study_ranges(size, 50, 300);
+            let ranges = study_ranges(size, INCREMENT, CHECKPOINT);
             assert!(!ranges.is_empty(), "{size}");
             let last = ranges.last().unwrap();
             assert_eq!(last.end, size, "{size}: {}", last.label);
@@ -291,39 +296,39 @@ mod tests {
         assert_eq!(labels(49), vec!["0~48"]);
         assert_eq!(labels(50), vec!["0~49"]);
         assert_eq!(labels(51), vec!["0~49", "0~50"]);
-        assert_eq!(labels(300), vec!["0~49", "0~99", "0~149", "0~199", "0~249", "0~299"]);
-        assert_eq!(labels(301).last().unwrap(), "0~300 · cumulative");
-        assert_eq!(labels(601).last().unwrap(), "0~600 · cumulative");
+        assert_eq!(labels(500), vec!["0~49", "0~99", "0~149", "0~199", "0~249", "0~299", "0~349", "0~399", "0~449", "0~499"]);
+        assert_eq!(labels(501).last().unwrap(), "0~500 · cumulative");
+        assert_eq!(labels(1001).last().unwrap(), "0~1000 · cumulative");
         assert_eq!(labels(3042).last().unwrap(), "0~3041 · cumulative");
     }
 
     #[test]
     fn selectable_ranges_match_cardbook_progression() {
-        let labels: Vec<_> = study_ranges(600, 50, 300).into_iter().map(|range| range.label).collect();
+        let labels: Vec<_> = study_ranges(1000, INCREMENT, CHECKPOINT).into_iter().map(|range| range.label).collect();
         assert_eq!(labels, vec![
-            "0~49", "0~99", "0~149", "0~199", "0~249", "0~299",
-            "300~349", "300~399", "300~449", "300~499", "300~549", "300~599",
-            "0~599 · cumulative",
+            "0~49", "0~99", "0~149", "0~199", "0~249", "0~299", "0~349", "0~399", "0~449", "0~499",
+            "500~549", "500~599", "500~649", "500~699", "500~749", "500~799", "500~849", "500~899", "500~949", "500~999",
+            "0~999 · cumulative",
         ]);
     }
 
     #[test]
     fn each_stage_maps_to_exactly_one_progression_range() {
         let expected = [
-            "0~49", "0~99", "0~149", "0~199", "0~249", "0~299",
-            "300~349", "300~399", "300~449", "300~499", "0~499 · cumulative",
+            "0~49", "0~99", "0~149", "0~199", "0~249",
+            "0~299", "0~349", "0~399", "0~449", "0~499",
         ];
         for (index, label) in expected.into_iter().enumerate() {
-            assert_eq!(stage_study_range(500, 50, 300, index as u32 + 1).unwrap().label, label);
+            assert_eq!(stage_study_range(500, INCREMENT, CHECKPOINT, index as u32 + 1).unwrap().label, label);
         }
-        assert!(stage_study_range(500, 50, 300, 12).is_none());
+        assert!(stage_study_range(500, INCREMENT, CHECKPOINT, 11).is_none());
     }
 
     #[test]
     fn session_uses_exactly_the_range_owned_by_its_stage() {
         let values = entries(600);
-        let session = StudySession::new_for_stage("deck".into(), 8, &values, &[StudyMode::Reading], 50, 300, 1).unwrap();
-        assert_eq!(session.range().label, "300~399");
+        let session = StudySession::new_for_stage("deck".into(), 12, &values, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
+        assert_eq!(session.range().label, "500~599");
         assert_eq!(session.range_total, 100);
     }
 
@@ -389,7 +394,7 @@ mod tests {
 
     #[test]
     fn pass_review_then_exit_does_not_restore_variant() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         session.resolve_current(&variant, true).unwrap();
         session.recover_interrupted_card();
@@ -399,7 +404,7 @@ mod tests {
 
     #[test]
     fn fail_review_then_exit_keeps_variant_required() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         session.resolve_current(&variant, false).unwrap();
         session.recover_interrupted_card();
@@ -410,7 +415,7 @@ mod tests {
 
     #[test]
     fn unresolved_exit_and_restart_do_not_lose_variant() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         let persisted = serde_json::to_string(&session).unwrap();
         let mut restarted: StudySession = serde_json::from_str(&persisted).unwrap();
@@ -422,7 +427,7 @@ mod tests {
     #[test]
     fn deleting_a_boundary_word_does_not_pull_the_next_slot_forward() {
         let values = entries(51);
-        let mut session = StudySession::new("deck".into(), 1, &values, &[StudyMode::Reading], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &values, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         let remaining: Vec<_> = values.into_iter().filter(|entry| entry.id != "e49").collect();
 
         session.remove_entry("e49");
@@ -438,7 +443,7 @@ mod tests {
     #[test]
     fn words_added_mid_stage_wait_for_the_next_stage_snapshot() {
         let first_stage_entries = entries(50);
-        let mut session = StudySession::new("deck".into(), 1, &first_stage_entries, &[StudyMode::Reading], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &first_stage_entries, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         let with_new_word = entries(51);
 
         session.sync_entries(&with_new_word, &[StudyMode::Reading]);
@@ -446,7 +451,7 @@ mod tests {
         assert_eq!(session.range().label, "0~49");
         assert!(!session.queue.remaining.iter().any(|variant| variant.entry_id == "e50"));
 
-        let next_stage = StudySession::new("deck".into(), 2, &with_new_word, &[StudyMode::Reading], 50, 300, 2).unwrap();
+        let next_stage = StudySession::new("deck".into(), 2, &with_new_word, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 2).unwrap();
         assert_eq!(next_stage.scheduled_entry_count(), 51);
         assert_eq!(next_stage.range().label, "0~50");
         assert!(next_stage.queue.remaining.iter().any(|variant| variant.entry_id == "e50"));
@@ -454,7 +459,7 @@ mod tests {
 
     #[test]
     fn completed_stage_has_no_active_card() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         session.resolve_current(&variant, true).unwrap();
         assert!(session.current.is_none());
@@ -464,7 +469,7 @@ mod tests {
     #[test]
     fn pitch_review_then_exit_preserves_the_pitch_outcome() {
         for passed in [true, false] {
-            let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
+            let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
             let variant = session.next_variant(10).unwrap();
             session.resolve_current(&variant, passed).unwrap();
             session.recover_interrupted_card();
@@ -475,7 +480,7 @@ mod tests {
 
     #[test]
     fn pitch_failure_reappears_from_the_base_question_not_pitch_pending_state() {
-        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
+        let mut session = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         let variant = session.next_variant(10).unwrap();
         session.resolve_current(&variant, false).unwrap();
         session.pending = Some(PendingState::Review {
@@ -492,7 +497,7 @@ mod tests {
 
     #[test]
     fn restart_roundtrips_each_non_terminal_pending_state() {
-        let mut active = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], 50, 300, 1).unwrap();
+        let mut active = StudySession::new("deck".into(), 1, &entries(1), &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         let variant = active.next_variant(10).unwrap();
 
         active.pending = Some(PendingState::Ambiguous {
