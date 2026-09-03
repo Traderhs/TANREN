@@ -7,10 +7,13 @@ import re
 import sys
 import unicodedata
 import contextlib
+import math
+import time
 import urllib.parse
 import urllib.request
 import wave
 from array import array
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 
@@ -92,12 +95,119 @@ VOICE_PROFILES = [
 ]
 
 
+_VOICEVOX_METADATA_CACHE: dict[str, tuple[list[dict[str, Any]], str]] = {}
+_FUGASHI_TAGGER: Any = None
+_FUGASHI_VERSION: str | None = None
+_PYOPENJTALK_MODULE: Any = None
+
+
+class AdaptiveTtsScheduler:
+    """Self-tuning bounded concurrency for VOICEVOX synthesis.
+
+    The scheduler deliberately does not assume a particular CPU/GPU.  It uses
+    the host's logical CPU count only to derive a conservative exploration
+    ceiling, then adjusts the active concurrency from measured throughput and
+    request failures.  State lives for the lifetime of the sidecar process, so
+    later words reuse what the current machine/runtime has already learned.
+    """
+
+    def __init__(self) -> None:
+        self.limit = 0
+        self.best_rate = 0.0
+
+    @staticmethod
+    def ceiling(task_count: int) -> int:
+        logical_cpus = max(1, os.cpu_count() or 1)
+        # Sublinear growth prevents a high-core-count host from flooding a
+        # single VOICEVOX engine while still allowing faster machines to probe
+        # more parallelism.  Runtime measurements decide whether to keep it.
+        adaptive_cap = max(1, min(logical_cpus, int(math.sqrt(logical_cpus)) + 1))
+        return max(1, min(task_count, adaptive_cap))
+
+    def map(self, items: list[Any], operation) -> list[Any]:
+        if not items:
+            return []
+
+        ceiling = self.ceiling(len(items))
+        if self.limit <= 0:
+            self.limit = min(ceiling, max(2, (ceiling + 1) // 2))
+        self.limit = min(max(1, self.limit), ceiling)
+
+        pending = list(enumerate(items))
+        results: list[Any] = [None] * len(items)
+        attempts = [0] * len(items)
+
+        while pending:
+            target_width = min(self.limit, ceiling)
+            width = min(target_width, len(pending))
+            full_wave = width == target_width
+            wave = pending[:width]
+            pending = pending[width:]
+            started = time.perf_counter()
+            failures: list[tuple[int, Any, Exception]] = []
+
+            with ThreadPoolExecutor(max_workers=width, thread_name_prefix="tanren-tts") as executor:
+                future_to_item = {
+                    executor.submit(operation, item): (index, item)
+                    for index, item in wave
+                }
+                for future in as_completed(future_to_item):
+                    index, item = future_to_item[future]
+                    try:
+                        results[index] = future.result()
+                    except Exception as error:
+                        failures.append((index, item, error))
+
+            elapsed = max(time.perf_counter() - started, 1e-6)
+            successes = len(wave) - len(failures)
+            rate = successes / elapsed
+
+            if failures:
+                # Engine contention, memory pressure, or transient HTTP errors
+                # cause immediate backoff. Failed profiles are retried at the
+                # reduced width so a too-aggressive probe does not fail a word.
+                self.limit = max(1, width // 2)
+                for index, item, error in failures:
+                    attempts[index] += 1
+                    if attempts[index] >= 3:
+                        raise RuntimeError(
+                            f"VOICEVOX synthesis failed after adaptive retries: {error}"
+                        ) from error
+                    pending.append((index, item))
+                continue
+
+            # Additive exploration while throughput remains close to the best
+            # observed rate; retreat when extra parallelism hurts materially.
+            # The reference slowly decays so the tuner can relearn after the
+            # host's load or accelerator availability changes at runtime.
+            if not full_wave:
+                continue
+            reference_rate = self.best_rate
+            self.best_rate = max(rate, reference_rate * 0.96)
+            if width < ceiling and (reference_rate <= 0.0 or rate >= reference_rate * 1.03):
+                self.limit = width + 1
+            elif width > 1 and reference_rate > 0.0 and rate < reference_rate * 0.75:
+                self.limit = width - 1
+            else:
+                self.limit = width
+
+        return results
+
+
+_TTS_SCHEDULER = AdaptiveTtsScheduler()
+_VOICE_WARMUP_SCHEDULER = AdaptiveTtsScheduler()
+
+
 def import_pyopenjtalk():
+    global _PYOPENJTALK_MODULE
+    if _PYOPENJTALK_MODULE is not None:
+        return _PYOPENJTALK_MODULE
     # pyopenjtalk-plus may print optional-backend notices while importing.
     # Keep stdout reserved for the JSON RPC response.
     with contextlib.redirect_stdout(sys.stderr):
         import pyopenjtalk  # type: ignore
-    return pyopenjtalk
+    _PYOPENJTALK_MODULE = pyopenjtalk
+    return _PYOPENJTALK_MODULE
 
 
 def hira(text: str) -> str:
@@ -181,15 +291,18 @@ def all_kana(text: str) -> bool:
 
 
 def token_data(text: str) -> tuple[list[dict[str, Any]], list[int] | None, str | None]:
+    global _FUGASHI_TAGGER, _FUGASHI_VERSION
     try:
-        import fugashi  # type: ignore
-        tagger = fugashi.Tagger()
+        if _FUGASHI_TAGGER is None:
+            import fugashi  # type: ignore
+            _FUGASHI_TAGGER = fugashi.Tagger()
+            _FUGASHI_VERSION = getattr(fugashi, "__version__", None)
+        tagger = _FUGASHI_TAGGER
     except Exception:
         return [], None, None
 
     tokens: list[dict[str, Any]] = []
     accent: list[int] | None = None
-    version = getattr(fugashi, "__version__", None)
     words = list(tagger(text))
     for word in words:
         feat = word.feature
@@ -210,7 +323,7 @@ def token_data(text: str) -> tuple[list[dict[str, Any]], list[int] | None, str |
         tokens.append(token)
     if len(words) == 1:
         accent = parse_accent_types(tokens[0].get("accent_type"))
-    return tokens, accent, version
+    return tokens, accent, _FUGASHI_VERSION
 
 
 def reading_from_openjtalk(text: str) -> tuple[str | None, str | None]:
@@ -225,7 +338,8 @@ def voicevox_request(base_url: str, path: str, params: dict[str, Any] | None = N
     query = urllib.parse.urlencode(params or {})
     url = base_url.rstrip("/") + path + ("?" + query if query else "")
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url, data=data if data is not None else (b"" if path.startswith("/accent_") or path.startswith("/audio_") or path.startswith("/mora_") or path.startswith("/synthesis") else None), method="POST" if path in {"/accent_phrases", "/audio_query", "/mora_data", "/synthesis"} else "GET")
+    post_paths = {"/accent_phrases", "/audio_query", "/mora_data", "/synthesis", "/initialize_speaker"}
+    request = urllib.request.Request(url, data=data if data is not None else (b"" if path in post_paths else None), method="POST" if path in post_paths else "GET")
     if data is not None:
         request.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(request, timeout=120) as response:
@@ -298,17 +412,6 @@ def soften_wav_tail(wav_bytes: bytes) -> bytes:
         return wav_bytes
 
 
-def voicevox_kana_notation(expected_morae: list[str], accent_type: int) -> str:
-    if not expected_morae:
-        raise ValueError("VOICEVOX kana notation requires at least one mora")
-    nucleus = accent_type if accent_type > 0 else len(expected_morae)
-    if nucleus < 1 or nucleus > len(expected_morae):
-        raise ValueError(f"invalid accent type {accent_type} for {len(expected_morae)} morae")
-    parts = [kata(mora) for mora in expected_morae]
-    parts[nucleus - 1] += "'"
-    return "".join(parts)
-
-
 def resolve_voice_profiles(speakers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     resolved: list[dict[str, Any]] = []
     by_name = {str(speaker.get("name")): speaker for speaker in speakers}
@@ -322,6 +425,34 @@ def resolve_voice_profiles(speakers: list[dict[str, Any]]) -> list[dict[str, Any
         style = next((value for value in styles if str(value.get("name")) in {"ノーマル", "Normal"}), styles[0])
         resolved.append({**profile, "speaker_id": int(style["id"]), "style_name": str(style.get("name", ""))})
     return resolved
+
+
+def voicevox_metadata(base_url: str) -> tuple[list[dict[str, Any]], str]:
+    cached = _VOICEVOX_METADATA_CACHE.get(base_url)
+    if cached is not None:
+        return cached
+    speakers = voicevox_request(base_url, "/speakers")
+    profiles = resolve_voice_profiles(speakers)
+    if not profiles:
+        raise RuntimeError("VOICEVOX has none of TANREN's configured voice profiles")
+    version = str(voicevox_request(base_url, "/version"))
+    cached = (profiles, version)
+    _VOICEVOX_METADATA_CACHE[base_url] = cached
+    return cached
+
+
+def warm_voicevox_profiles(base_url: str) -> int:
+    profiles, _ = voicevox_metadata(base_url)
+
+    def initialize(profile: dict[str, Any]) -> None:
+        voicevox_request(
+            base_url,
+            "/initialize_speaker",
+            {"speaker": profile["speaker_id"], "skip_reinit": "true"},
+        )
+
+    _VOICE_WARMUP_SCHEDULER.map(profiles, initialize)
+    return len(profiles)
 
 
 def synthesize_voicevox(
@@ -338,22 +469,19 @@ def synthesize_voicevox(
         return
     reading_kata = kata(reading)
     nucleus = accent_type if accent_type > 0 else len(expected_morae)
-    kana_notation = voicevox_kana_notation(expected_morae, accent_type)
-    phrases = voicevox_request(
-        base_url,
-        "/accent_phrases",
-        {"text": kana_notation, "speaker": speaker_id, "is_kana": "true"},
-    )
+    query = voicevox_request(base_url, "/audio_query", {"text": reading_kata, "speaker": speaker_id})
+    phrases = query.get("accent_phrases", [])
     if len(phrases) != 1:
-        raise RuntimeError(f"VOICEVOX returned {len(phrases)} accent phrases for lexical reading {reading}")
+        raise RuntimeError(f"VOICEVOX audio query returned {len(phrases)} accent phrases for lexical reading {reading}")
     phrase = phrases[0]
     moras = phrase.get("moras", [])
     if len(moras) != len(expected_morae):
         raise RuntimeError(f"VOICEVOX mora mismatch for {reading}: expected={len(expected_morae)} actual={len(moras)}")
-    if int(phrase.get("accent", -1)) != nucleus:
-        raise RuntimeError(f"VOICEVOX kana accent mismatch for {reading}: expected={nucleus} actual={phrase.get('accent')}")
+    # TANREN's lexical accent analysis is authoritative.  audio_query already
+    # gives us the speaker-specific mora structure, so overwrite only the
+    # accent nucleus and ask VOICEVOX to recompute the dependent mora data.
+    phrase["accent"] = nucleus
     controlled = voicevox_request(base_url, "/mora_data", {"speaker": speaker_id}, phrases)
-    query = voicevox_request(base_url, "/audio_query", {"text": reading_kata, "speaker": speaker_id})
     query["accent_phrases"] = controlled
     query["speedScale"] = speed_scale
     query["pitchScale"] = pitch_scale
@@ -382,16 +510,20 @@ def generate_voicevox_assets(
     accent_type: int,
     audio_dir: str,
 ) -> list[dict[str, Any]]:
-    speakers = voicevox_request(base_url, "/speakers")
-    profiles = resolve_voice_profiles(speakers)
-    if not profiles:
-        raise RuntimeError("VOICEVOX has none of TANREN's configured voice profiles")
-    version = str(voicevox_request(base_url, "/version"))
-    assets: list[dict[str, Any]] = []
-    expected_paths: set[str] = set()
-    for profile in profiles:
-        path = os.path.join(audio_dir, f"{VOICE_AUDIO_REVISION}-{profile['voice_profile']}.wav")
-        expected_paths.add(os.path.normcase(os.path.abspath(path)))
+    profiles, version = voicevox_metadata(base_url)
+    paths = {
+        profile["voice_profile"]: os.path.join(
+            audio_dir, f"{VOICE_AUDIO_REVISION}-{profile['voice_profile']}.wav"
+        )
+        for profile in profiles
+    }
+    expected_paths = {
+        os.path.normcase(os.path.abspath(path))
+        for path in paths.values()
+    }
+
+    def synthesize_profile(profile: dict[str, Any]) -> dict[str, Any]:
+        path = paths[profile["voice_profile"]]
         synthesize_voicevox(
             base_url,
             reading,
@@ -402,7 +534,7 @@ def generate_voicevox_assets(
             float(profile.get("speed_scale", 1.0)),
             float(profile.get("pitch_scale", 0.0)),
         )
-        assets.append({
+        return {
             "cache_key": f"voicevox:{VOICE_AUDIO_REVISION}:{version}:{reading}:{accent_type}:{profile['voice_profile']}:{profile['speaker_id']}",
             "path": path,
             "provider": f"voicevox-{version}",
@@ -413,7 +545,15 @@ def generate_voicevox_assets(
             "speaker_name": profile["speaker_name"],
             "accent_type": accent_type,
             "age_basis": profile.get("age_basis", "character_or_voice_profile"),
-        })
+        }
+
+    missing_profiles = [
+        profile for profile in profiles
+        if not valid_wav(paths[profile["voice_profile"]])
+    ]
+    if missing_profiles:
+        _TTS_SCHEDULER.map(missing_profiles, synthesize_profile)
+    assets = [synthesize_profile(profile) for profile in profiles]
     if os.path.isdir(audio_dir):
         for name in os.listdir(audio_dir):
             stale = os.path.join(audio_dir, name)
@@ -425,12 +565,7 @@ def generate_voicevox_assets(
     return assets
 
 
-def main() -> None:
-    if len(sys.argv) > 1:
-        raw = sys.argv[1]
-    else:
-        raw = sys.stdin.buffer.read().decode("utf-8-sig")
-    req = json.loads(raw.lstrip("\ufeff"))
+def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
     text = unicodedata.normalize("NFKC", str(req["text"]).strip())
     hint = req.get("reading_hint")
     tokens, lexical_accent, fugashi_version = token_data(text)
@@ -476,7 +611,7 @@ def main() -> None:
             accent_types[0],
             str(audio_dir),
         )
-    result = {
+    return {
         "normalized_text": text,
         "reading": reading,
         "scope": scope,
@@ -492,7 +627,46 @@ def main() -> None:
         "audio_written": bool(audio_assets),
         "audio_assets": audio_assets,
     }
-    json.dump(result, sys.stdout, ensure_ascii=False)
+
+
+def handle_request(req: dict[str, Any]) -> dict[str, Any]:
+    if req.get("op") == "warm":
+        # Pay language-runtime initialization while the app is otherwise idle,
+        # not when the user is waiting for a newly added word.
+        token_data("かな")
+        import_pyopenjtalk()
+        voicevox_url = req.get("voicevox_url")
+        warmed_profiles = warm_voicevox_profiles(str(voicevox_url)) if voicevox_url else 0
+        return {"warm": True, "voicevox_profiles": warmed_profiles}
+    return analyze_request(req)
+
+
+def write_json_line(value: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def main() -> None:
+    if len(sys.argv) > 1:
+        req = json.loads(sys.argv[1].lstrip("\ufeff"))
+        json.dump(handle_request(req), sys.stdout, ensure_ascii=False)
+        return
+
+    # Line-delimited JSON keeps this process alive across words.  Imports,
+    # UniDic/OpenJTalk modules, VOICEVOX metadata, and adaptive TTS tuning are
+    # therefore reused instead of being paid for on every entry.
+    for raw in sys.stdin.buffer:
+        text = raw.decode("utf-8-sig").strip()
+        if not text:
+            continue
+        try:
+            req = json.loads(text.lstrip("\ufeff"))
+            write_json_line(handle_request(req))
+        except Exception as error:
+            # Application-level failures must not tear down the warm worker.
+            # The caller receives the error for this entry and can retry/fail
+            # its enrichment job while later requests keep using this process.
+            write_json_line({"error": str(error)})
 
 
 if __name__ == "__main__":

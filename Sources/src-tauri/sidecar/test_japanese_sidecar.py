@@ -69,17 +69,65 @@ class ScopeAndCacheFixtures(unittest.TestCase):
         self.assertNotIn("玄野武宏", speaker_names)
         self.assertIn("雀松朱司", speaker_names)
 
+    def test_voicevox_metadata_is_cached_for_the_lifetime_of_the_warm_sidecar(self):
+        jp._VOICEVOX_METADATA_CACHE.clear()
+        calls = []
+
+        def fake_request(base_url, path, params=None, body=None, binary=False):
+            calls.append(path)
+            if path == "/speakers":
+                return [
+                    {"name": profile["speaker_name"], "styles": [{"name": "ノーマル", "id": index}]}
+                    for index, profile in enumerate(jp.VOICE_PROFILES, start=1)
+                ]
+            if path == "/version":
+                return "test-version"
+            raise AssertionError(path)
+
+        with patch.object(jp, "voicevox_request", side_effect=fake_request):
+            first = jp.voicevox_metadata("http://voicevox")
+            second = jp.voicevox_metadata("http://voicevox")
+        self.assertIs(first, second)
+        self.assertEqual(calls, ["/speakers", "/version"])
+
+    def test_voicevox_warmup_initializes_every_configured_profile(self):
+        jp._VOICEVOX_METADATA_CACHE.clear()
+        initialized = []
+
+        def fake_request(base_url, path, params=None, body=None, binary=False):
+            if path == "/speakers":
+                return [
+                    {"name": profile["speaker_name"], "styles": [{"name": "ノーマル", "id": index}]}
+                    for index, profile in enumerate(jp.VOICE_PROFILES, start=1)
+                ]
+            if path == "/version":
+                return "test-version"
+            if path == "/initialize_speaker":
+                initialized.append(int(params["speaker"]))
+                return None
+            raise AssertionError(path)
+
+        with patch.object(jp, "voicevox_request", side_effect=fake_request), patch.object(jp.os, "cpu_count", return_value=8):
+            self.assertEqual(jp.warm_voicevox_profiles("http://voicevox"), 10)
+        self.assertEqual(sorted(initialized), list(range(1, 11)))
+
+    def test_adaptive_tts_ceiling_scales_with_runtime_hardware(self):
+        with patch.object(jp.os, "cpu_count", return_value=1):
+            self.assertEqual(jp.AdaptiveTtsScheduler.ceiling(10), 1)
+        with patch.object(jp.os, "cpu_count", return_value=16):
+            self.assertEqual(jp.AdaptiveTtsScheduler.ceiling(10), 5)
+        with patch.object(jp.os, "cpu_count", return_value=64):
+            self.assertEqual(jp.AdaptiveTtsScheduler.ceiling(3), 3)
+
     def test_voicevox_synthesis_uses_tanren_accent_as_authority(self):
         calls = []
 
         def fake_request(base_url, path, params=None, body=None, binary=False):
             calls.append((path, params, body))
-            if path == "/accent_phrases":
-                return [{"moras": [{"text": "ミ"}, {"text": "ス"}, {"text": "エ"}, {"text": "ル"}], "accent": 3, "pause_mora": None, "is_interrogative": False}]
             if path == "/mora_data":
                 return body
             if path == "/audio_query":
-                return {"accent_phrases": [], "speedScale": 1.0, "pitchScale": 0.0, "intonationScale": 1.0, "volumeScale": 1.0, "prePhonemeLength": 0.1, "postPhonemeLength": 0.1, "outputSamplingRate": 24000, "outputStereo": False, "kana": ""}
+                return {"accent_phrases": [{"moras": [{"text": "ミ"}, {"text": "ス"}, {"text": "エ"}, {"text": "ル"}], "accent": 1, "pause_mora": None, "is_interrogative": False}], "speedScale": 1.0, "pitchScale": 0.0, "intonationScale": 1.0, "volumeScale": 1.0, "prePhonemeLength": 0.1, "postPhonemeLength": 0.1, "outputSamplingRate": 24000, "outputStereo": False, "kana": ""}
             if path == "/synthesis":
                 return b"RIFF" + b"\0" * 4 + b"WAVE" + b"\0" * 40
             raise AssertionError(path)
@@ -89,10 +137,10 @@ class ScopeAndCacheFixtures(unittest.TestCase):
             jp.synthesize_voicevox("http://voicevox", "みすえる", ["み", "す", "え", "る"], 3, 7, path)
             self.assertTrue(jp.valid_wav(path))
         mora_call = next(call for call in calls if call[0] == "/mora_data")
-        accent_call = next(call for call in calls if call[0] == "/accent_phrases")
+        query_call = next(call for call in calls if call[0] == "/audio_query")
         synthesis_call = next(call for call in calls if call[0] == "/synthesis")
-        self.assertEqual(accent_call[1]["text"], "ミスエ'ル")
-        self.assertEqual(accent_call[1]["is_kana"], "true")
+        self.assertEqual(query_call[1]["text"], "ミスエル")
+        self.assertFalse(any(call[0] == "/accent_phrases" for call in calls))
         self.assertEqual(mora_call[2][0]["accent"], 3)
         self.assertEqual(synthesis_call[2]["accent_phrases"][0]["accent"], 3)
         self.assertGreaterEqual(synthesis_call[2]["postPhonemeLength"], jp.POST_PHONEME_LENGTH)
@@ -121,13 +169,11 @@ class ScopeAndCacheFixtures(unittest.TestCase):
         captured = {}
 
         def fake_request(base_url, path, params=None, body=None, binary=False):
-            if path == "/accent_phrases":
-                return [{"moras": [{"text": "ガ"}, {"text": "ッ"}, {"text": "コ"}, {"text": "ウ"}], "accent": 4}]
             if path == "/mora_data":
                 captured["accent"] = body[0]["accent"]
                 return body
             if path == "/audio_query":
-                return {"accent_phrases": []}
+                return {"accent_phrases": [{"moras": [{"text": "ガ"}, {"text": "ッ"}, {"text": "コ"}, {"text": "ウ"}], "accent": 1}]}
             if path == "/synthesis":
                 return b"RIFF" + b"\0" * 4 + b"WAVE" + b"\0" * 40
             raise AssertionError(path)
