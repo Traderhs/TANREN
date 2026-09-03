@@ -56,7 +56,7 @@ function OpenBook3D() {
   return <div className="book-3d book-3d-open" aria-hidden="true">
     <Canvas
       orthographic
-      camera={{ position: [0, 0.1, 10], zoom: 154 }}
+      camera={{ position: [0, 0.1, 10], zoom: 156 }}
       dpr={[1, 1.5]}
       gl={{ alpha: true, antialias: true }}
       resize={{ scroll: false }}
@@ -1397,9 +1397,9 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange }: {
         key={`opened-${openedDeck.id}-${bookOpenCycle}`}
         className={`open-book-stage ${bookSettled ? "is-settled" : ""}`}
         aria-label={`${openedDeck.name} deck`}
-        initial={reduceMotion ? false : { opacity: 0, scale: .965, y: 12 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={reduceMotion ? { opacity: 0 } : { opacity: 0, scale: .975, y: 8 }}
+        initial={reduceMotion ? false : { opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 8 }}
         transition={reduceMotion ? { duration: .01 } : { duration: .28, ease: [0.22, 1, 0.36, 1] }}
       >
         <OpenBook3D />
