@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AudioSettings, DeckSummary, EntryDraft, EntryListRecord, ImportResult, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
+import type { AudioSettings, DeckSummary, EnrichmentProgress, EntryDraft, EntryListRecord, ImportResult, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
 
 export const api = {
   listDecks: () => invoke<DeckSummary[]>("list_decks"),
@@ -13,6 +13,8 @@ export const api = {
     }),
   importEntries: (deckId: string, entries: EntryDraft[]) =>
     invoke<ImportResult>("import_entries", { deckId, entries }),
+  enrichmentProgress: (entryIds: string[]) =>
+    invoke<EnrichmentProgress>("enrichment_progress", { entryIds }),
   updateEntry: (deckId: string, entryId: string, entry: EntryDraft) =>
     invoke<void>("update_entry", { deckId, entryId, entry }),
   deleteEntry: (deckId: string, entryId: string) =>
