@@ -727,9 +727,17 @@ fn validate_timeout_variant(current: &VariantKey, variant_id: &str) -> Result<()
 fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Arc<AtomicBool>) {
     if running.swap(true, Ordering::AcqRel) { return; }
     tauri::async_runtime::spawn_blocking(move || {
+        let mut audio_warm_attempted = false;
         loop {
             match analyzer.audio_runtime_phase().as_str() {
-                "ready" => {}
+                "ready" => {
+                    if !audio_warm_attempted {
+                        audio_warm_attempted = true;
+                        if let Err(error) = analyzer.warm_audio() {
+                            eprintln!("TANREN VOICEVOX warm-up failed: {error}");
+                        }
+                    }
+                }
                 "unavailable" => break,
                 _ => {
                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -873,6 +881,12 @@ pub fn run() {
                 engine: Mutex::new(Engine::default()),
                 input: Mutex::new(WindowsInputAdapter::default()),
                 enrichment_running: Arc::clone(&enrichment_running),
+            });
+            let warm_analyzer = analyzer.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = warm_analyzer.warm() {
+                    eprintln!("TANREN language sidecar warm-up failed: {error}");
+                }
             });
             start_enrichment_worker(db, analyzer, enrichment_running);
             if let Ok(candidates) = app.state::<AppState>().db.semantic_candidates() {
