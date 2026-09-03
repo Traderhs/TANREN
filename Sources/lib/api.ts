@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AudioSettings, DeckStats, DeckSummary, EntryDraft, EntryListRecord, ImportResult, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
+import type { AudioSettings, DeckSummary, EntryDraft, EntryListRecord, ImportResult, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
 
 export const api = {
   listDecks: () => invoke<DeckSummary[]>("list_decks"),
@@ -42,8 +42,7 @@ export const api = {
   continueReview: () => invoke<SubmitResult>("continue_review"),
   adjudicate: (variantId: string, accept: boolean) =>
     invoke<SubmitResult>("adjudicate_answer", { variantId, accept }),
-  stats: (deckId: string) => invoke<DeckStats[]>("deck_stats", { deckId }),
-  libraryStats: () => invoke<LibraryStats>("library_stats"),
+  libraryStats: (deckId?: string) => invoke<LibraryStats>("library_stats", { deckId: deckId ?? null }),
   semanticStatus: () => invoke<SemanticRuntimeStatus>("semantic_status"),
   voicevoxStatus: () => invoke<VoicevoxRuntimeStatus>("voicevox_status"),
   storageSettings: () => invoke<StorageSettings>("storage_settings"),

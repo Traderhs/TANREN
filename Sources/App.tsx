@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, forwardRef, memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, forwardRef, memo, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
@@ -9,11 +9,11 @@ import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Too
 import { api } from "./lib/api";
 import { parseEntryText } from "./lib/importParser";
 import { japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime, type JapaneseImeSegment, type JapaneseImeSession } from "./lib/japaneseIme";
-import type { AudioSettings, DeckStats, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, PitchQuestion, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyCard, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./lib/types";
+import type { AudioSettings, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, PitchQuestion, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyCard, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./lib/types";
 import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, setPitchLevel, shouldAutoPlayAfterWrittenAnswer, type PitchLevel, type PitchSelection } from "./lib/studyFlow";
 import { completionDelayMs, firstMeaningfulInputAt, isMeaningfulInput, recallHasTimedOut } from "./lib/studyTimers";
 
-type View = "decks" | "editor" | "study" | "stats" | "settings";
+type View = "decks" | "editor" | "study" | "settings";
 
 const BOOK_FLUTTER_LEAF_COUNT = 8;
 const BOOK_CONTENT_PAGE = BOOK_FLUTTER_LEAF_COUNT + 1;
@@ -25,7 +25,6 @@ const STUDY_MODE_LABELS: Record<StudyMode, string> = {
 };
 const VIEW_LABELS: Record<Exclude<View, "decks" | "study">, string> = {
   editor: "책 편집",
-  stats: "통계",
   settings: "설정",
 };
 
@@ -109,8 +108,8 @@ function App() {
   const [selected, setSelected] = useState<DeckSummary | null>(null);
   const [card, setCard] = useState<StudyCard | null>(null);
   const [result, setResult] = useState<SubmitResult | null>(null);
-  const [stats, setStats] = useState<DeckStats[]>([]);
   const [libraryStats, setLibraryStats] = useState<LibraryStats | null>(null);
+  const [statsDeckId, setStatsDeckId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [semanticStatus, setSemanticStatus] = useState<SemanticRuntimeStatus | null>(null);
   const [voicevoxStatus, setVoicevoxStatus] = useState<VoicevoxRuntimeStatus | null>(null);
@@ -138,17 +137,21 @@ function App() {
     if (view !== "decks") return;
     let active = true;
     setLibraryStats(null);
-    void api.libraryStats()
+    void api.libraryStats(statsDeckId ?? undefined)
       .then((nextStats) => { if (active) setLibraryStats(nextStats); })
       .catch(() => { if (active) setLibraryStats(null); });
     return () => { active = false; };
-  }, [view, decks]);
+  }, [view, decks, statsDeckId]);
   useEffect(() => {
     if (view !== "decks") return;
     const scroller = homeScrollRef.current;
     if (!scroller) return;
 
     let unlockTimer: number | null = null;
+    let bookRangeScrollTarget: number | null = null;
+    let bookRangeScrollFrame: number | null = null;
+    let bookRangeScrollElement: HTMLElement | null = null;
+    let bookRangeWheelAt = 0;
     const normalizeWheelDelta = (event: WheelEvent, viewportHeight: number) => {
       if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) return event.deltaY * 40;
       if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) return event.deltaY * viewportHeight;
@@ -196,6 +199,55 @@ function App() {
       homeShelfScrollFrameRef.current = requestAnimationFrame(animate);
     };
 
+    const settleBookRangeAt = (rangeScroller: HTMLElement, scrollTop: number) => {
+      if (bookRangeScrollFrame !== null) {
+        cancelAnimationFrame(bookRangeScrollFrame);
+        bookRangeScrollFrame = null;
+      }
+      rangeScroller.scrollTop = scrollTop;
+      bookRangeScrollTarget = scrollTop;
+      bookRangeScrollElement = rangeScroller;
+    };
+
+    const smoothBookRangeScrollBy = (rangeScroller: HTMLElement, deltaY: number) => {
+      if (bookRangeScrollElement !== rangeScroller) {
+        if (bookRangeScrollFrame !== null) cancelAnimationFrame(bookRangeScrollFrame);
+        bookRangeScrollFrame = null;
+        bookRangeScrollTarget = rangeScroller.scrollTop;
+        bookRangeScrollElement = rangeScroller;
+      }
+
+      const maxScrollTop = Math.max(0, rangeScroller.scrollHeight - rangeScroller.clientHeight);
+      const base = bookRangeScrollFrame === null || bookRangeScrollTarget === null
+        ? rangeScroller.scrollTop
+        : bookRangeScrollTarget;
+      let nextTarget = Math.max(0, Math.min(maxScrollTop, base + deltaY));
+      const edgeSnapDistance = Math.max(32, Math.abs(deltaY) * 1.25);
+      if (deltaY < 0 && nextTarget <= edgeSnapDistance) nextTarget = 0;
+      if (deltaY > 0 && maxScrollTop - nextTarget <= edgeSnapDistance) nextTarget = maxScrollTop;
+      bookRangeScrollTarget = nextTarget;
+
+      if (bookRangeScrollFrame !== null) return;
+
+      const animate = () => {
+        const target = bookRangeScrollTarget ?? rangeScroller.scrollTop;
+        const diff = target - rangeScroller.scrollTop;
+        if (Math.abs(diff) < 0.5) {
+          settleBookRangeAt(rangeScroller, target);
+          return;
+        }
+        const previousScrollTop = rangeScroller.scrollTop;
+        rangeScroller.scrollTop = previousScrollTop + diff * 0.2;
+        if (rangeScroller.scrollTop === previousScrollTop) {
+          settleBookRangeAt(rangeScroller, target);
+          return;
+        }
+        bookRangeScrollFrame = requestAnimationFrame(animate);
+      };
+
+      bookRangeScrollFrame = requestAnimationFrame(animate);
+    };
+
     const shelfForSync = scroller.querySelector<HTMLElement>(".book-shelf");
     const syncShelfScrollTarget = () => {
       if (!shelfForSync || homeShelfScrollFrameRef.current !== null) return;
@@ -211,6 +263,18 @@ function App() {
 
     const onWheel = (event: WheelEvent) => {
       const target = event.target as HTMLElement | null;
+
+      const nestedWordScroller = target?.closest<HTMLElement>(".book-inline-word-list, .book-word-list");
+      const nestedWordDelta = nestedWordScroller
+        ? normalizeWheelDelta(event, nestedWordScroller.clientHeight)
+        : 0;
+      const nestedWordCanScroll = Boolean(nestedWordScroller) && (
+        (nestedWordDelta < 0 && nestedWordScroller!.scrollTop > 2)
+        || (nestedWordDelta > 0 && nestedWordScroller!.scrollHeight - nestedWordScroller!.clientHeight - nestedWordScroller!.scrollTop > 2)
+      );
+      if (nestedWordCanScroll) return;
+      if (target?.closest(".book-workspace-backdrop")) return;
+      const leavingInlineWordList = Boolean(nestedWordScroller?.matches(".book-inline-word-list"));
 
       // Ctrl + wheel is reserved for growth-plot zoom. Plain wheel input
       // should keep navigating between the home sections even over the plot.
@@ -229,9 +293,31 @@ function App() {
       const bookRangeScroller = target?.closest<HTMLElement>(".book-range-scroll");
       if (bookRangeScroller && bookRangeScroller.scrollHeight > bookRangeScroller.clientHeight) {
         const deltaY = normalizeWheelDelta(event, bookRangeScroller.clientHeight);
-        const canScrollUp = deltaY < 0 && bookRangeScroller.scrollTop > 2;
-        const canScrollDown = deltaY > 0 && bookRangeScroller.scrollHeight - bookRangeScroller.clientHeight - bookRangeScroller.scrollTop > 2;
-        if (canScrollUp || canScrollDown) return;
+        const now = performance.now();
+        const wheelGapMs = now - bookRangeWheelAt;
+        const maxScrollTop = Math.max(0, bookRangeScroller.scrollHeight - bookRangeScroller.clientHeight);
+        const effectiveScrollTop = bookRangeScrollElement === bookRangeScroller && bookRangeScrollTarget !== null
+          ? bookRangeScrollTarget
+          : bookRangeScroller.scrollTop;
+        const canScrollUp = deltaY < 0 && effectiveScrollTop > 2;
+        const canScrollDown = deltaY > 0 && maxScrollTop - effectiveScrollTop > 2;
+        const settlingAtEdge = bookRangeScrollElement === bookRangeScroller
+          && bookRangeScrollFrame !== null
+          && ((deltaY < 0 && effectiveScrollTop <= 2) || (deltaY > 0 && maxScrollTop - effectiveScrollTop <= 2));
+        if (canScrollUp || canScrollDown || settlingAtEdge) {
+          event.preventDefault();
+          smoothBookRangeScrollBy(bookRangeScroller, deltaY);
+          bookRangeWheelAt = now;
+          return;
+        }
+        const atEdge = (deltaY < 0 && effectiveScrollTop <= 2)
+          || (deltaY > 0 && maxScrollTop - effectiveScrollTop <= 2);
+        if (atEdge && wheelGapMs < 240) {
+          event.preventDefault();
+          bookRangeWheelAt = now;
+          return;
+        }
+        bookRangeWheelAt = now;
       }
 
       const statsScroller = target?.closest<HTMLElement>(".home-stats-section > .stats-dashboard");
@@ -255,7 +341,7 @@ function App() {
         }
       });
 
-      if (currentIndex === 0) {
+      if (currentIndex === 0 && !leavingInlineWordList) {
         const shelf = scroller.querySelector<HTMLElement>(".book-shelf");
         if (shelf) {
           const deltaY = normalizeWheelDelta(event, shelf.clientHeight);
@@ -349,6 +435,10 @@ function App() {
         cancelAnimationFrame(homeShelfScrollFrameRef.current);
         homeShelfScrollFrameRef.current = null;
       }
+      if (bookRangeScrollFrame !== null) cancelAnimationFrame(bookRangeScrollFrame);
+      bookRangeScrollFrame = null;
+      bookRangeScrollTarget = null;
+      bookRangeScrollElement = null;
       homeShelfScrollTargetRef.current = null;
       unlock();
     };
@@ -394,12 +484,6 @@ function App() {
     }
   };
 
-  const openStats = async (deck: DeckSummary) => {
-    setSelected(deck);
-    setStats(await api.stats(deck.id));
-    setView("stats");
-  };
-
   const scrollHomeSection = (index: number) => {
     const scroller = homeScrollRef.current;
     if (!scroller) return;
@@ -414,6 +498,7 @@ function App() {
       await exitStudyForDeckNavigation(view, api.exitStudy);
       setCard(null);
       setResult(null);
+      setStatsDeckId(null);
       await refresh();
       setView("decks");
     } catch (e) {
@@ -428,7 +513,7 @@ function App() {
           <span className="brand-mark">鍛</span>
           <strong>TANREN</strong>
         </button>
-        <div className="topbar-context">{view === "editor" || view === "stats" || view === "settings" ? VIEW_LABELS[view] : ""}</div>
+        <div className="topbar-context">{view === "editor" || view === "settings" ? VIEW_LABELS[view] : ""}</div>
         <div className="topbar-actions">
           <button className="ghost" onClick={() => void openDecks()}>← 책장</button>
         </div>
@@ -450,7 +535,7 @@ function App() {
               onRefresh={refresh}
               onEdit={(d) => { setSelected(d); setView("editor"); }}
               onStudy={openStudy}
-              onStats={openStats}
+              onOpenedDeckChange={setStatsDeckId}
             />
           </section>
           <section className="home-snap-section home-stats-section">
@@ -460,7 +545,10 @@ function App() {
               aria-label="책장으로 이동"
               onClick={() => scrollHomeSection(0)}
             />
-            <LibraryStatsView stats={libraryStats} />
+            <LibraryStatsView
+              stats={libraryStats}
+              deck={statsDeckId ? decks.find((deck) => deck.id === statsDeckId) ?? null : null}
+            />
             <button
               type="button"
               className="home-guide-arrow home-guide-arrow--down"
@@ -499,7 +587,6 @@ function App() {
           onExit={openDecks}
         />
       )}
-      {view === "stats" && selected && <DeckStatsView deck={selected} stats={stats} />}
       {view === "settings" && <SettingsView
         voicevoxStatus={voicevoxStatus}
         audioSettings={audioSettings}
@@ -701,6 +788,92 @@ function BookInlineWordManager({ deckId, onAdd, onImport, onEdit, onDelete }: {
     };
   }, [deckId]);
 
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+
+    let scrollTarget = list.scrollTop;
+    let scrollFrame: number | null = null;
+    let lastWheelAt = 0;
+
+    const settleAt = (scrollTop: number) => {
+      if (scrollFrame !== null) {
+        cancelAnimationFrame(scrollFrame);
+        scrollFrame = null;
+      }
+      list.scrollTop = scrollTop;
+      scrollTarget = scrollTop;
+    };
+
+    const smoothScrollBy = (deltaY: number) => {
+      const maxScrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+      const base = scrollFrame === null ? list.scrollTop : scrollTarget;
+      let nextTarget = Math.max(0, Math.min(maxScrollTop, base + deltaY));
+      const edgeSnapDistance = Math.max(32, Math.abs(deltaY) * 1.25);
+      if (deltaY < 0 && nextTarget <= edgeSnapDistance) nextTarget = 0;
+      if (deltaY > 0 && maxScrollTop - nextTarget <= edgeSnapDistance) nextTarget = maxScrollTop;
+      scrollTarget = nextTarget;
+
+      if (scrollFrame !== null) return;
+
+      const animate = () => {
+        const diff = scrollTarget - list.scrollTop;
+        if (Math.abs(diff) < 0.5) {
+          settleAt(scrollTarget);
+          return;
+        }
+        const previousScrollTop = list.scrollTop;
+        list.scrollTop = previousScrollTop + diff * 0.2;
+        if (list.scrollTop === previousScrollTop) {
+          settleAt(scrollTarget);
+          return;
+        }
+        scrollFrame = requestAnimationFrame(animate);
+      };
+
+      scrollFrame = requestAnimationFrame(animate);
+    };
+
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaY === 0) return;
+      const deltaY = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+        ? event.deltaY * 40
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? event.deltaY * list.clientHeight
+          : event.deltaY;
+      const now = performance.now();
+      const wheelGapMs = now - lastWheelAt;
+      const maxScrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+      const effectiveScrollTop = scrollFrame === null ? list.scrollTop : scrollTarget;
+      const canScrollUp = deltaY < 0 && effectiveScrollTop > 2;
+      const canScrollDown = deltaY > 0 && maxScrollTop - effectiveScrollTop > 2;
+      const settlingAtEdge = scrollFrame !== null
+        && ((deltaY < 0 && effectiveScrollTop <= 2) || (deltaY > 0 && maxScrollTop - effectiveScrollTop <= 2));
+      if (canScrollUp || canScrollDown || settlingAtEdge) {
+        smoothScrollBy(deltaY);
+        lastWheelAt = now;
+        if (event.cancelable) event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      const atEdge = (deltaY < 0 && effectiveScrollTop <= 2)
+        || (deltaY > 0 && maxScrollTop - effectiveScrollTop <= 2);
+      if (atEdge && wheelGapMs < 240) {
+        lastWheelAt = now;
+        if (event.cancelable) event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      lastWheelAt = now;
+    };
+
+    list.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      list.removeEventListener("wheel", onWheel);
+      if (scrollFrame !== null) cancelAnimationFrame(scrollFrame);
+    };
+  }, []);
+
   const query = search.trim().toLocaleLowerCase();
   const filteredEntries = query
     ? entries.filter((entry) => entry.term.toLocaleLowerCase().includes(query)
@@ -775,21 +948,165 @@ function BookInlineWordManager({ deckId, onAdd, onImport, onEdit, onDelete }: {
   </section>;
 }
 
-function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
+type BookTitleEditorHandle = {
+  beginRename: () => void;
+};
+
+const BookTitleEditor = memo(forwardRef<BookTitleEditorHandle, {
+  deck: DeckSummary;
+  onRefresh: () => Promise<void>;
+}>(({ deck, onRefresh }, ref) => {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(deck.name);
+  const [saving, setSaving] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useImperativeHandle(ref, () => ({
+    beginRename: () => {
+      setValue(deck.name);
+      setEditing(true);
+    },
+  }), [deck.name]);
+
+  useLayoutEffect(() => {
+    if (!editing) return;
+    const input = inputRef.current;
+    if (!input) return;
+    input.focus();
+    input.select();
+  }, [editing]);
+
+  useEffect(() => {
+    if (!editing) setValue(deck.name);
+  }, [deck.name, editing]);
+
+  const cancel = () => {
+    if (saving) return;
+    setEditing(false);
+    setValue(deck.name);
+  };
+
+  const save = async () => {
+    if (saving) return;
+    const nextName = value.trim();
+    if (!nextName || nextName === deck.name) {
+      cancel();
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.updateDeck(deck.id, nextName, deck.enabled_modes);
+      setEditing(false);
+      await onRefresh();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return editing ? <input
+    ref={inputRef}
+    className="book-title-rename-input"
+    value={value}
+    maxLength={MAX_DECK_NAME_LENGTH}
+    aria-label="책 이름 변경"
+    title="Enter 저장 · Esc 취소"
+    autoComplete="off"
+    onChange={(event) => setValue(event.target.value)}
+    onKeyDown={(event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void save();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        cancel();
+      }
+    }}
+    onBlur={cancel}
+    disabled={saving}
+  /> : <h2>{deck.name}</h2>;
+}), (previous, next) => (
+  previous.deck.id === next.deck.id
+  && previous.deck.name === next.deck.name
+  && previous.deck.enabled_modes === next.deck.enabled_modes
+));
+BookTitleEditor.displayName = "BookTitleEditor";
+
+const BookTopMenu = memo(function BookTopMenu({ deck, onRename, onDeleted }: {
+  deck: DeckSummary;
+  onRename: () => void;
+  onDeleted: () => Promise<void>;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) setIsOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setIsOpen(false);
+    };
+    window.addEventListener("pointerdown", closeOutside, true);
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => {
+      window.removeEventListener("pointerdown", closeOutside, true);
+      window.removeEventListener("keydown", closeOnEscape, true);
+    };
+  }, [isOpen]);
+
+  const remove = async () => {
+    if (deleting) return;
+    if (!window.confirm(`'${deck.name}' 책을 삭제할까요?\n책장에서 바로 사라져요.`)) return;
+    setDeleting(true);
+    try {
+      await api.deleteDeck(deck.id);
+      setIsOpen(false);
+      await onDeleted();
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return <div className="book-top-menu" ref={menuRef}>
+    <button
+      type="button"
+      className="book-top-menu-trigger ghost"
+      aria-label="책 관리"
+      aria-expanded={isOpen}
+      onClick={() => setIsOpen((open) => !open)}
+    >⋯</button>
+    <AnimatePresence>
+      {isOpen && <motion.div
+        className="stats-growth-select-menu book-top-menu-dropdown"
+        role="menu"
+        initial={{ opacity: 0, y: -5, scale: .985 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: -4, scale: .99 }}
+        transition={{ duration: .16, ease: [.4, 0, .2, 1] }}
+      >
+        <button type="button" role="menuitem" onClick={() => { setIsOpen(false); onRename(); }}>책 이름 변경</button>
+        <button type="button" className="book-top-menu-delete" role="menuitem" disabled={deleting} onClick={() => void remove()}>책 삭제</button>
+      </motion.div>}
+    </AnimatePresence>
+  </div>;
+}, (previous, next) => previous.deck.id === next.deck.id && previous.deck.name === next.deck.name);
+
+function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange }: {
   decks: DeckSummary[];
   onRefresh: () => Promise<void>;
   onEdit: (d: DeckSummary) => void;
   onStudy: (d: DeckSummary, stage?: number) => void;
-  onStats: (d: DeckSummary) => void;
+  onOpenedDeckChange: (deckId: string | null) => void;
 }) {
   const [name, setName] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [openedDeckId, setOpenedDeckId] = useState<string | null>(null);
   const [bookOpenCycle, setBookOpenCycle] = useState(0);
   const [bookSettled, setBookSettled] = useState(false);
-  const [bookPanel, setBookPanel] = useState<"study" | "words" | "stats">("study");
+  const [bookPanel, setBookPanel] = useState<"study" | "words">("study");
   const [bookEntries, setBookEntries] = useState<EntryRecord[]>([]);
-  const [bookStats, setBookStats] = useState<DeckStats[] | null>(null);
   const [bookPanelLoading, setBookPanelLoading] = useState(false);
   const [stageSchedules, setStageSchedules] = useState<Record<number, StageScheduleSummary>>({});
   const [wordSearch, setWordSearch] = useState("");
@@ -805,6 +1122,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
   const [wordSaving, setWordSaving] = useState(false);
   const reduceMotion = useReducedMotion();
   const flipBookRef = useRef<any>(null);
+  const bookTitleEditorRef = useRef<BookTitleEditorHandle>(null);
   const skipDeleteConfirmDeckIdsRef = useRef(new Set<string>());
   const flutterTimerRef = useRef<number | null>(null);
   const flutteringRef = useRef(false);
@@ -915,6 +1233,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
     setSkipDeleteConfirm(false);
     setWordMessage("");
     setOpenedDeckId(null);
+    onOpenedDeckChange(null);
   };
 
   const openWordPanel = async () => {
@@ -924,17 +1243,6 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
     setBookPanelLoading(true);
     try {
       setBookEntries(await api.listEntries(openedDeck.id));
-    } finally {
-      setBookPanelLoading(false);
-    }
-  };
-
-  const openStatsPanel = async () => {
-    if (!openedDeck) return;
-    setBookPanel("stats");
-    setBookPanelLoading(true);
-    try {
-      setBookStats(await api.stats(openedDeck.id));
     } finally {
       setBookPanelLoading(false);
     }
@@ -1157,7 +1465,15 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
               <div className="book-page-inner">
               <div className="book-page-topline">
                 <button className="book-close ghost" onClick={closeOpenedBook} aria-label="책장" title="책장" />
-                <button className="book-top-stats ghost" onClick={() => void openStatsPanel()}>통계</button>
+                <BookTopMenu
+                  deck={openedDeck}
+                  onRename={() => bookTitleEditorRef.current?.beginRename()}
+                  onDeleted={async () => {
+                    setOpenedDeckId(null);
+                    onOpenedDeckChange(null);
+                    await onRefresh();
+                  }}
+                />
                 </div>
                 <div className="book-title-summary">
                   <div className="book-title-page">
@@ -1167,11 +1483,11 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
                           : openedDeck.target_language === "en-US" ? "English"
                             : openedDeck.target_language}
                     </span>
-                    <h2>{openedDeck.name}</h2>
+                    <BookTitleEditor ref={bookTitleEditorRef} deck={openedDeck} onRefresh={onRefresh} />
                   </div>
                   <dl className="book-stats">
-                    <div><dt>Words</dt><dd>{openedDeck.entry_count.toLocaleString("ko-KR")}개</dd></div>
-                    <div><dt>단계</dt><dd>{openedDeck.total_stage_count.toLocaleString("ko-KR")}개</dd></div>
+                    <div><dt>수록 단어</dt><dd>{openedDeck.entry_count.toLocaleString("ko-KR")}개</dd></div>
+                    <div><dt>학습 단계</dt><dd>{openedDeck.total_stage_count.toLocaleString("ko-KR")}개</dd></div>
                   </dl>
                 </div>
                 <BookInlineWordManager
@@ -1187,7 +1503,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
             <FlipPage className="book-inside-page book-inside-right">
               <div className="book-page-inner book-page-inner-right">
                 <div className="range-heading">
-                  <div><span>CONTENTS</span><strong>학습 구간</strong></div>
+                  <div><span>CONTENTS</span><strong>학습 단계</strong></div>
                 </div>
                 <div className="book-range-scroll" aria-label={`${openedDeck.name} study ranges`}>
                   <div className="book-stage-list">
@@ -1196,6 +1512,8 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
                       const fallbackRange = openedDeck.study_ranges[stage - 1];
                       const schedule = stageSchedules[stage];
                       const range = schedule?.study_range ?? fallbackRange;
+                      const wordCount = range ? Math.max(0, range.end - range.start) : 0;
+                      const questionCount = wordCount * openedDeck.enabled_modes.length;
                       const completed = Boolean(schedule?.completed);
                       return <div className={`book-stage-group ${current ? "is-current-stage" : ""} ${completed ? "is-completed-stage" : ""}`} key={stage}>
                         <button
@@ -1203,14 +1521,28 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
                           className="ghost book-stage-card"
                           onClick={() => onStudy(openedDeck, stage)}
                         >
-                          <strong className="book-stage-title">{stage.toLocaleString("ko-KR")}단계</strong>
+                          <strong className={`book-stage-title ${range?.cumulative ? "is-cumulative" : ""}`}>
+                            {range?.cumulative && <small>총복습</small>}
+                            <span>{stage.toLocaleString("ko-KR")}단계</span>
+                          </strong>
 
-                          <span className="book-stage-middle">
-                            <span className="book-stage-range" aria-label={`${stage}단계 학습 구간`}>
-                              {range && <span
-                                className={`book-stage-range-link ${schedule?.active ? "is-current" : ""}`}
-                              >{formatStudyRangeLabel(range.label)}</span>}
+                          <span className={`book-stage-middle ${schedule?.clear_times_ms.length ? "has-clear-times" : ""}`}>
+                            <span className="book-stage-range" aria-label={`${stage}단계 학습 단계`}>
+                              {range && <>
+                                <span
+                                  className={`book-stage-range-link ${schedule?.active ? "is-current" : ""}`}
+                                >{formatStudyRangeLabel(range.label)}</span>
+                                <span className="book-stage-range-meta">
+                                  <span>{wordCount.toLocaleString("ko-KR")}단어</span>
+                                  <span>{questionCount.toLocaleString("ko-KR")}문항</span>
+                                </span>
+                              </>}
                             </span>
+                            {schedule?.clear_times_ms.length ? <span className="book-stage-clear-times" aria-label={`${stage}단계 클리어 기록`}>
+                              {schedule.clear_times_ms.map((durationMs, clearIndex) => <span className="book-stage-clear-time" key={`${stage}-${clearIndex}-${durationMs}`}>
+                                {clearIndex + 1}회독 {formatStudyTime(durationMs)}
+                              </span>)}
+                            </span> : null}
                           </span>
                           {completed && <span className="book-stage-complete" aria-label="클리어 완료">✓</span>}
                         </button>
@@ -1234,21 +1566,19 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
             if (event.target === event.currentTarget && !wordDialog) setBookPanel("study");
           }}
         >
-          <div className={`book-workspace ${bookPanel === "stats" ? "is-stats" : "is-words"}`} role="dialog" aria-modal="true" aria-label={bookPanel === "words" ? `${openedDeck.name} 단어 관리` : `${openedDeck.name} 통계`}>
+          <div className="book-workspace is-words" role="dialog" aria-modal="true" aria-label={`${openedDeck.name} 단어 관리`}>
             <header className="book-workspace-header">
               <div className="book-workspace-title">
-                <div><span>{bookPanel === "words" ? "WORDS" : "STATISTICS"}</span><strong>{openedDeck.name}</strong></div>
+                <div><span>WORDS</span><strong>{openedDeck.name}</strong></div>
               </div>
               <div className="book-workspace-actions">
-                {bookPanel === "words" && <>
-                  <button className="ghost" onClick={openAddWordDialog}>+ 단어 추가</button>
-                  <button className="ghost" onClick={openImportWordDialog}>파일에서 추가</button>
-                </>}
+                <button className="ghost" onClick={openAddWordDialog}>+ 단어 추가</button>
+                <button className="ghost" onClick={openImportWordDialog}>파일에서 추가</button>
                 <button className="ghost book-workspace-close" aria-label="닫기" onClick={() => setBookPanel("study")}>×</button>
               </div>
             </header>
 
-            {bookPanel === "words" ? <>
+            <>
               <div className="book-word-toolbar">
                 <label className="book-word-search">
                   <span aria-hidden="true">⌕</span>
@@ -1272,9 +1602,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
                       </div>)}
                 </div>
               </div>
-            </> : <div className="book-stats-workspace">
-              {bookPanelLoading || !bookStats ? <div className="book-workspace-empty">통계를 불러오고 있어요.</div> : <DeckStatsView deck={openedDeck} stats={bookStats} />}
-            </div>}
+            </>
 
             {wordDialog && <div className="book-word-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !wordSaving) closeWordDialog(); }}>
               {wordDialog === "single" ? <form className="book-word-dialog" onSubmit={(event) => void addSingleEntry(event)}>
@@ -1374,7 +1702,6 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
                   setBookSettled(false);
                   setBookPanel("study");
                   setBookEntries([]);
-                  setBookStats(null);
                   setWordSearch("");
                   setWordDialog(null);
                   setEditingEntryId(null);
@@ -1383,6 +1710,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onStats }: {
                   setWordMessage("");
                   setBookOpenCycle((cycle) => cycle + 1);
                   setOpenedDeckId(d.id);
+                  onOpenedDeckChange(d.id);
                 }}
                 whileHover={reduceMotion ? undefined : { y: -4 }}
                 whileTap={reduceMotion ? undefined : { y: -1, scale: .99 }}
@@ -1919,7 +2247,19 @@ function StudyView({ deckId, card, result, setCard, setResult, audioSettings, on
     }, delay);
   };
 
-  const nextFromReview = async () => advance(await api.continueReview());
+  const nextFromReview = async () => {
+    await flushStudyActivity(true);
+    try {
+      const next = await api.continueReview();
+      advance(next);
+      if (next.status !== "stage_complete" && studyViewIsActive()) {
+        studyActivityStartedAt.current = performance.now();
+      }
+    } catch (error) {
+      if (studyViewIsActive()) studyActivityStartedAt.current = performance.now();
+      throw error;
+    }
+  };
   const review = result?.status === "review" || result?.status === "fail";
   const ambiguous = result?.status === "ambiguous";
 
@@ -2261,14 +2601,7 @@ function PitchTrace({ morae, levels, tone }: { morae: string[]; levels: Array<nu
   </div>;
 }
 
-const MODE_DETAILS: Record<StudyMode, { label: string; description: string; mark: string }> = {
-  reading: { label: "Reading", description: "외국어를 보고 뜻을 떠올려요", mark: "読" },
-  listening: { label: "Listening", description: "소리를 듣고 뜻을 떠올려요", mark: "聴" },
-  writing: { label: "Writing", description: "뜻을 보고 외국어를 떠올려요", mark: "書" },
-};
-
 const numberFormat = new Intl.NumberFormat("ko-KR");
-const compactNumberFormat = new Intl.NumberFormat("ko-KR", { notation: "compact", maximumFractionDigits: 1 });
 
 function formatPercent(value: number | null) {
   return value == null ? "—" : `${(value * 100).toFixed(1)}%`;
@@ -2288,13 +2621,6 @@ function formatStudyTime(value: number | null) {
   if (hours > 0) return minutes > 0 ? `${hours}시간 ${minutes}분` : `${hours}시간`;
   if (minutes > 0) return seconds > 0 ? `${minutes}분 ${seconds}초` : `${minutes}분`;
   return `${seconds}초`;
-}
-
-function formatLastPracticed(value: string | null) {
-  if (!value) return "시작 전";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat("ko-KR", { month: "short", day: "numeric" }).format(date);
 }
 
 function StatsMetric({ label, value, help, featured = false }: { label: string; value: string; help: string; featured?: boolean }) {
@@ -2895,49 +3221,15 @@ function GrowthChart({ stats }: { stats: LibraryStats }) {
   </section>;
 }
 
-function ModeStatsGrid({ stats }: { stats: DeckStats[] }) {
-  const orderedStats = (["reading", "writing", "listening"] as StudyMode[])
-    .map((mode) => stats.find((item) => item.mode === mode))
-    .filter((mode): mode is DeckStats => mode != null);
-
-  return <div className="stats-mode-grid">
-    {orderedStats.map((mode) => {
-      const details = MODE_DETAILS[mode.mode];
-      return <article className="stats-mode-card" key={mode.mode}>
-        <header>
-          <span className="stats-mode-mark" aria-hidden="true">{details.mark}</span>
-          <div><h3>{details.label}</h3><p>{details.description}</p></div>
-          <strong>{formatPercent(mode.base_accuracy)}</strong>
-        </header>
-        <dl>
-          <div><dt>시도</dt><dd>{numberFormat.format(mode.attempts)}</dd></div>
-          <div><dt>억양 정확도</dt><dd>{formatPercent(mode.pitch_accuracy)}</dd></div>
-          <div><dt>통합 정확도</dt><dd>{formatPercent(mode.joint_accuracy)}</dd></div>
-          <div><dt>중앙 응답시간</dt><dd>{formatLatency(mode.median_recall_latency_ms)}</dd></div>
-        </dl>
-      </article>;
-    })}
-    <article className="stats-mode-card is-placeholder">
-      <header>
-        <span className="stats-mode-mark" aria-hidden="true">話</span>
-        <div><h3>Speaking</h3><p>말하기 훈련 준비 중</p></div>
-        <strong>—</strong>
-      </header>
-      <dl>
-        <div><dt>시도</dt><dd>—</dd></div>
-        <div><dt>억양 정확도</dt><dd>—</dd></div>
-        <div><dt>통합 정확도</dt><dd>—</dd></div>
-        <div><dt>중앙 응답시간</dt><dd>—</dd></div>
-      </dl>
-    </article>
-  </div>;
-}
-
-function LibraryStatsView({ stats }: { stats: LibraryStats | null }) {
+function LibraryStatsView({ stats, deck }: { stats: LibraryStats | null; deck: DeckSummary | null }) {
   return <section className="content stats-dashboard stats-dashboard-global">
     {!stats ? <div className="stats-loading" aria-live="polite"><span />통계를 불러오고 있어요.</div>
       : stats.deck_count === 0 ? <div className="stats-empty"><span>統</span><strong>아직 보여드릴 통계가 없어요.</strong><p>학습을 시작하면 기록이 여기에 쌓여요.</p></div>
         : <>
+          <div className="stats-context" aria-label={deck ? `${deck.name} 통계` : "전체 통계"}>
+            <span>{deck ? "BOOK" : "LIBRARY"}</span>
+            <strong>{deck ? `${deck.name} 통계` : "전체 통계"}</strong>
+          </div>
           <div className="stats-summary-grid">
             <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="지금까지 문제를 푼 횟수예요." />
             <StatsMetric label="누적 단어 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help="한 번이라도 학습한 단어 수예요." />
@@ -2945,33 +3237,13 @@ function LibraryStatsView({ stats }: { stats: LibraryStats | null }) {
             <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help="피치를 정확히 맞힌 비율이에요." />
             <StatsMetric label="중앙 응답시간" value={formatLatency(stats.median_recall_latency_ms)} help="문제를 보고 답을 입력하기 시작하기까지 걸린 시간이에요." />
             <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="학습 화면에서 실제로 공부한 시간을 기록해요." />
-            <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요." />
+            {deck
+              ? <StatsMetric label="수록 단어" value={`${numberFormat.format(stats.entry_count)}개`} help="이 책에 들어 있는 전체 단어 수예요." />
+              : <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요." />}
           </div>
 
           <GrowthChart stats={stats} />
         </>}
-  </section>;
-}
-
-function DeckStatsView({ deck, stats }: { deck: DeckSummary; stats: DeckStats[] }) {
-  const attempts = stats.reduce((sum, mode) => sum + mode.attempts, 0);
-  const weightedAccuracy = attempts === 0 ? null : stats.reduce((sum, mode) => sum + (mode.base_accuracy ?? 0) * mode.attempts, 0) / attempts;
-  const weightedJointAccuracy = attempts === 0 ? null : stats.reduce((sum, mode) => sum + (mode.joint_accuracy ?? 0) * mode.attempts, 0) / attempts;
-  return <section className="content stats-dashboard stats-dashboard-deck">
-    <header className="stats-dashboard-header">
-      <div><span className="stats-kicker">BOOK PERFORMANCE</span><h1>{deck.name}</h1><p>이 책에서 쌓인 학습 기록을 보여드려요.</p></div>
-      <div className="stats-scope"><strong>{numberFormat.format(deck.entry_count)}</strong><span>WORDS</span></div>
-    </header>
-    <div className="stats-summary-grid">
-      <StatsMetric featured label="전체 정확도" value={formatPercent(weightedAccuracy)} help={`통합 정답률 ${formatPercent(weightedJointAccuracy)}`} />
-      <StatsMetric label="누적 시도" value={compactNumberFormat.format(attempts)} help={`${numberFormat.format(attempts)}회 학습 기록`} />
-      <StatsMetric label="수록 단어" value={numberFormat.format(deck.entry_count)} help={`${deck.completed_stage_count}개 단계 완료`} />
-      <StatsMetric label="현재 단계" value={`${deck.current_stage}단계`} help={deck.active_range ? formatStudyRangeLabel(deck.active_range) : "새 단계 준비"} />
-    </div>
-    <section className="stats-dashboard-section">
-      <div className="stats-section-title"><div><span>TRAINING MODES</span><h2>훈련별 성과</h2></div><p>모드별 정확도와 응답 속도를 비교해요.</p></div>
-      <ModeStatsGrid stats={stats} />
-    </section>
   </section>;
 }
 

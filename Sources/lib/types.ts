@@ -29,6 +29,7 @@ export interface StageScheduleSummary {
   study_range: StudyRange;
   completed: boolean;
   active: boolean;
+  clear_times_ms: number[];
 }
 
 export interface ImportResult {
@@ -72,30 +73,8 @@ export interface SubmitResult {
   card?: StudyCard | null;
 }
 
-export interface DeckStats {
-  mode: StudyMode;
-  base_accuracy: number | null;
-  pitch_accuracy: number | null;
-  joint_accuracy: number | null;
-  median_recall_latency_ms: number | null;
-  attempts: number;
-}
-
-export interface LibraryDeckStats {
-  deck_id: string;
-  deck_name: string;
-  entry_count: number;
-  current_stage: number;
-  attempts: number;
-  base_accuracy: number | null;
-  joint_accuracy: number | null;
-  median_recall_latency_ms: number | null;
-  last_practiced_at: string | null;
-}
-
 export interface LibraryStats {
   deck_count: number;
-  active_deck_count: number;
   entry_count: number;
   seen_entry_count: number;
   attempts: number;
@@ -104,8 +83,6 @@ export interface LibraryStats {
   joint_accuracy: number | null;
   median_recall_latency_ms: number | null;
   study_time_ms: number;
-  mode_stats: DeckStats[];
-  deck_stats: LibraryDeckStats[];
   history: LibraryStatsPoint[];
 }
 
