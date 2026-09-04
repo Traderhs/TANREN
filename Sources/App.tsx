@@ -1210,7 +1210,14 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange }: {
         return;
       }
       flutteringRef.current = true;
+      if (pageFlip.getState?.() !== "read") {
+        scheduleBookFlutter(sessionKey, 16);
+        return;
+      }
       pageFlip.flipNext("top");
+      // Keep a session-scoped watchdog running even if react-pageflip drops an
+      // onFlip callback while the book is being mounted/unmounted quickly.
+      scheduleBookFlutter(sessionKey, 16);
     }, delayMs);
   };
 
@@ -1397,7 +1404,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange }: {
     scheduleBookFlutter(sessionKey, 4);
   };
   return <section className={`content home-content ${openedDeck ? "is-book-open" : ""}`}>
-    <AnimatePresence initial={false} mode="popLayout">
+    <AnimatePresence initial={false} mode="wait">
       {openedDeck ? <motion.section
         key={`opened-${openedDeck.id}-${bookOpenCycle}`}
         className={`open-book-stage ${bookSettled ? "is-settled" : ""}`}
