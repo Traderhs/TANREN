@@ -653,7 +653,7 @@ button.secondary {
   position: relative;
   z-index: 1;
   width: 100%;
-  max-width: 1240px;
+  max-width: 1400px;
 }
 
 .book-paper-center-edge {
@@ -4772,6 +4772,10 @@ textarea:focus {
   box-shadow: none;
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
+}
+
+.home-library-section>.home-content:has(.open-book-stage) {
+  padding: 0;
 }
 
 .home-stats-section>.content,
