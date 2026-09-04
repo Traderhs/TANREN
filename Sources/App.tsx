@@ -17,6 +17,11 @@ type View = "decks" | "editor" | "study" | "settings";
 
 const BOOK_FLUTTER_LEAF_COUNT = 8;
 const BOOK_CONTENT_PAGE = BOOK_FLUTTER_LEAF_COUNT + 1;
+const OPEN_BOOK_BASE_WIDTH = 1240;
+const OPEN_BOOK_TARGET_WIDTH = 1400;
+const OPEN_BOOK_SCALE = OPEN_BOOK_TARGET_WIDTH / OPEN_BOOK_BASE_WIDTH;
+const OPEN_BOOK_PAGE_MAX_WIDTH = OPEN_BOOK_TARGET_WIDTH / 2;
+const OPEN_BOOK_PAGE_MAX_HEIGHT = Math.ceil(OPEN_BOOK_PAGE_MAX_WIDTH * (690 / 590));
 const MAX_DECK_NAME_LENGTH = 20;
 const STUDY_MODE_LABELS: Record<StudyMode, string> = {
   reading: "Reading",
@@ -56,7 +61,7 @@ function OpenBook3D() {
   return <div className="book-3d book-3d-open" aria-hidden="true">
     <Canvas
       orthographic
-      camera={{ position: [0, 0.1, 10], zoom: 156 }}
+      camera={{ position: [0, 0.1, 10], zoom: 156 * OPEN_BOOK_SCALE }}
       dpr={[1, 1.5]}
       gl={{ alpha: true, antialias: true }}
       resize={{ scroll: false }}
@@ -64,7 +69,7 @@ function OpenBook3D() {
       <ambientLight intensity={0.92} />
       <directionalLight position={[2.4, 5.8, 7.5]} intensity={1.55} />
       <directionalLight position={[-4, -1, 4]} intensity={0.38} />
-      <group rotation={[-0.065, 0, 0]} position={[0, 0.02, -0.12]} scale={[1.15, 1.05, 1]}>
+      <group rotation={[-0.065, 0, 0]} position={[0, 0.01432, -0.12]} scale={[1.14836, 1.05, 1]}>
         <group position={[-1.76, 0, 0]} rotation={[0, -0.085, -0.008]}>
           <RoundedBox args={[3.36, 4.46, 0.27]} radius={0.04} smoothness={4} position={[-0.01, -0.005, -0.09]}><meshStandardMaterial color="#b1a68f" roughness={0.94} /></RoundedBox>
           <RoundedBox args={[0.075, 4.18, 0.20]} radius={0.018} smoothness={3} position={[-1.64, 0.01, 0.015]}><meshStandardMaterial color="#d0c4aa" roughness={0.96} /></RoundedBox>
@@ -1403,7 +1408,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange }: {
         transition={reduceMotion ? { duration: .01 } : { duration: .28, ease: [0.22, 1, 0.36, 1] }}
       >
         <OpenBook3D />
-        <div className="book-flip-stack">
+        <div className="book-flip-stack" style={{ maxWidth: OPEN_BOOK_TARGET_WIDTH }}>
           <span className="book-paper-center-edge" aria-hidden="true" />
           <HTMLFlipBook
             key={`${openedDeck.id}-${bookOpenCycle}`}
@@ -1414,9 +1419,9 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange }: {
             height={690}
             size="stretch"
             minWidth={390}
-            maxWidth={620}
+            maxWidth={OPEN_BOOK_PAGE_MAX_WIDTH}
             minHeight={500}
-            maxHeight={720}
+            maxHeight={OPEN_BOOK_PAGE_MAX_HEIGHT}
             startPage={reduceMotion || bookSettled ? BOOK_CONTENT_PAGE : 0}
             drawShadow={!reduceMotion}
             flippingTime={reduceMotion ? 1 : 125}
