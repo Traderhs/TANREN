@@ -23,6 +23,7 @@ Results/pyinstaller-spec/
 Results/sidecar/
 
 # Frontend/package caches and generated build output
+Results/debug/
 Results/npm-cache/
 Results/web-dist/
 Results/semantic/
