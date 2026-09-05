@@ -17,7 +17,7 @@ use std::{path::{Path, PathBuf}, process::Command};
 
 use db::Database;
 use grading::grade_form;
-use japanese::JapaneseAnalyzer;
+use japanese::{JapaneseAnalyzer, VOICE_AUDIO_REVISION};
 use model::{
     DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
     StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
@@ -197,7 +197,7 @@ fn import_deck_export(state: State<'_, AppState>, payload: String) -> Result<Dec
 fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) -> Result<SubmitResult, String> {
     let deck = state.db.deck(&deck_id)?;
     let entries = state.db.entries(&deck_id)?;
-    if entries.is_empty() { return Err("먼저 단어를 추가해주세요.".into()); }
+    if entries.is_empty() { return Err("먼저 표현을 추가해주세요.".into()); }
     let selected_stage = stage.unwrap_or(deck.current_stage);
     let slots = state.db.ensure_stage_schedule(&deck_id, selected_stage, &entries)?;
 
@@ -630,7 +630,7 @@ fn complete_current_stage(state: &AppState, engine: &mut Engine) -> Result<Submi
 fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) -> Result<StudyCard, String> {
     let deck = state.db.deck(&session.deck_id)?;
     let entries = state.db.entries(&session.deck_id)?;
-    let entry = entries.iter().find(|e| e.id == variant.entry_id).ok_or("단어를 찾지 못했어요.")?;
+    let entry = entries.iter().find(|e| e.id == variant.entry_id).ok_or("표현을 찾지 못했어요.")?;
     let question = match variant.mode {
         StudyMode::Reading => entry.term.clone(),
         StudyMode::Listening => entry.term.clone(),
@@ -710,7 +710,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
 }
 
 fn find_entry(db: &Database, deck_id: &str, entry_id: &str) -> Result<EntryRecord, String> {
-    db.entries(deck_id)?.into_iter().find(|e| e.id == entry_id).ok_or_else(|| "단어를 찾지 못했어요.".into())
+    db.entries(deck_id)?.into_iter().find(|e| e.id == entry_id).ok_or_else(|| "표현을 찾지 못했어요.".into())
 }
 
 fn record_successful_typing(db: &Database, deck: &model::DeckRecord, variant: &VariantKey, answer: &str, gaps: &[u64], duration_ms: u64, ime_ms: u64) -> Result<(), String> {
@@ -728,6 +728,7 @@ fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Ar
     if running.swap(true, Ordering::AcqRel) { return; }
     tauri::async_runtime::spawn_blocking(move || {
         let mut audio_warm_attempted = false;
+        let mut drained = false;
         loop {
             match analyzer.audio_runtime_phase().as_str() {
                 "ready" => {
@@ -748,7 +749,10 @@ fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Ar
                 Ok(jobs) => jobs,
                 Err(error) => { eprintln!("TANREN enrichment queue error: {error}"); break; }
             };
-            if jobs.is_empty() { break; }
+            if jobs.is_empty() {
+                drained = true;
+                break;
+            }
             for entry in jobs {
                 match analyzer.analyze(&entry) {
                     Ok((analysis, audio)) => {
@@ -772,6 +776,15 @@ fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Ar
             }
         }
         running.store(false, Ordering::Release);
+        if drained {
+            match db.queued_enrichment(1) {
+                Ok(jobs) if !jobs.is_empty() => {
+                    start_enrichment_worker(db, analyzer, running);
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("TANREN enrichment queue handoff error: {error}"),
+            }
+        }
     });
 }
 
@@ -862,6 +875,9 @@ pub fn run() {
             let app_data = std::env::var_os("TANREN_APP_DATA_HOME").map(PathBuf::from)
                 .unwrap_or(app.path().app_data_dir().map_err(|e| e.to_string())?);
             let db = Database::open(app_data.join("tanren.db"))?;
+            db.requeue_failed_enrichment()?;
+            db.requeue_incomplete_lexical_enrichment()?;
+            db.requeue_voice_audio_revision(VOICE_AUDIO_REVISION)?;
             let default_semantic_home = app_data.join("semantic");
             let semantic_home = configured_semantic_home(&db, &app_data)?;
             let voicevox = VoicevoxRuntime::install(semantic_home.join("voicevox"));
