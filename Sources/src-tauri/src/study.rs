@@ -133,6 +133,20 @@ impl QueueState {
         self.recent_entries.retain(|entry_id| active_ids.contains(entry_id.as_str()));
     }
 
+    fn add_variants(&mut self, variants: impl IntoIterator<Item = VariantKey>) {
+        let mut changed = false;
+        for variant in variants {
+            if self.remaining.contains(&variant) {
+                continue;
+            }
+            self.remaining.push(variant);
+            changed = true;
+        }
+        if changed {
+            self.rebuild_queue();
+        }
+    }
+
     #[cfg(test)]
     pub fn remove_entry(&mut self, entry_id: &str) {
         self.remaining.retain(|variant| variant.entry_id != entry_id);
@@ -227,6 +241,40 @@ impl StudySession {
         self.range_total = variants_for_slots(&self.entry_slots, entries, modes, &self.study_range).len();
     }
 
+    pub fn expand_schedule(
+        &mut self,
+        entry_slots: Vec<Option<String>>,
+        study_range: StudyRange,
+        entries: &[EntryRecord],
+        modes: &[StudyMode],
+    ) {
+        let old_ids: HashSet<String> = self.entry_slots
+            [self.study_range.start.min(self.entry_slots.len())..self.study_range.end.min(self.entry_slots.len())]
+            .iter()
+            .filter_map(|entry_id| entry_id.clone())
+            .collect();
+        let new_ids = entry_slots
+            [study_range.start.min(entry_slots.len())..study_range.end.min(entry_slots.len())]
+            .iter()
+            .filter_map(|entry_id| entry_id.clone())
+            .filter(|entry_id| !old_ids.contains(entry_id))
+            .collect::<HashSet<_>>();
+
+        self.entry_slots = entry_slots;
+        self.study_range = study_range;
+        let active_ids: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        self.queue.add_variants(
+            new_ids
+                .iter()
+                .filter(|entry_id| active_ids.contains(entry_id.as_str()))
+                .flat_map(|entry_id| modes.iter().map(move |mode| VariantKey {
+                    entry_id: entry_id.clone(),
+                    mode: *mode,
+                })),
+        );
+        self.sync_entries(entries, modes);
+    }
+
     #[cfg(test)]
     pub fn remove_entry(&mut self, entry_id: &str) {
         for slot in &mut self.entry_slots {
@@ -298,8 +346,12 @@ mod tests {
         assert_eq!(labels(51), vec!["0~49", "0~50"]);
         assert_eq!(labels(500), vec!["0~49", "0~99", "0~149", "0~199", "0~249", "0~299", "0~349", "0~399", "0~449", "0~499"]);
         assert_eq!(labels(501).last().unwrap(), "0~500 · cumulative");
+        assert_eq!(labels(999).last().unwrap(), "0~998 · cumulative");
+        assert_eq!(labels(1000).last().unwrap(), "0~999 · cumulative");
         assert_eq!(labels(1001).last().unwrap(), "0~1000 · cumulative");
+        assert_eq!(labels(3000).last().unwrap(), "0~2999 · cumulative");
         assert_eq!(labels(3042).last().unwrap(), "0~3041 · cumulative");
+        assert_eq!(labels(5999).last().unwrap(), "0~5998 · cumulative");
     }
 
     #[test]
@@ -425,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_boundary_word_does_not_pull_the_next_slot_forward() {
+    fn deleting_a_boundary_entry_does_not_pull_the_next_slot_forward() {
         let values = entries(51);
         let mut session = StudySession::new("deck".into(), 1, &values, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         let remaining: Vec<_> = values.into_iter().filter(|entry| entry.id != "e49").collect();
@@ -441,17 +493,17 @@ mod tests {
     }
 
     #[test]
-    fn words_added_mid_stage_wait_for_the_next_stage_snapshot() {
+    fn entries_added_mid_stage_wait_for_the_next_stage_snapshot() {
         let first_stage_entries = entries(50);
         let mut session = StudySession::new("deck".into(), 1, &first_stage_entries, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
-        let with_new_word = entries(51);
+        let with_new_entry = entries(51);
 
-        session.sync_entries(&with_new_word, &[StudyMode::Reading]);
+        session.sync_entries(&with_new_entry, &[StudyMode::Reading]);
         assert_eq!(session.scheduled_entry_count(), 50);
         assert_eq!(session.range().label, "0~49");
         assert!(!session.queue.remaining.iter().any(|variant| variant.entry_id == "e50"));
 
-        let next_stage = StudySession::new("deck".into(), 2, &with_new_word, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 2).unwrap();
+        let next_stage = StudySession::new("deck".into(), 2, &with_new_entry, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 2).unwrap();
         assert_eq!(next_stage.scheduled_entry_count(), 51);
         assert_eq!(next_stage.range().label, "0~50");
         assert!(next_stage.queue.remaining.iter().any(|variant| variant.entry_id == "e50"));
