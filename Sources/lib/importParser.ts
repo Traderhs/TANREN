@@ -39,12 +39,12 @@ export function parseEntryText(input: string): ParsedImport {
   rows.forEach((fields, index) => {
     const raw = fields.join(delimiter);
     if (fields.every((value) => !value.trim())) return;
-    if (index === 0 && /^(term|word|일본어)$/i.test(fields[0]?.trim() ?? "") && /^(meaning|meanings|뜻|한국어)$/i.test(fields[1]?.trim() ?? "")) return;
+    if (index === 0 && /^(term|entry|표현|일본어)$/i.test(fields[0]?.trim() ?? "") && /^(meaning|meanings|뜻|한국어)$/i.test(fields[1]?.trim() ?? "")) return;
     const term = fields[0]?.trim() ?? "";
     const meaningCell = fields[1]?.trim() ?? "";
     const reading = fields[2]?.trim() || undefined;
     if (!term || !meaningCell) {
-      issues.push({ row: index + 1, message: !term ? "단어가 비어 있습니다." : "뜻이 비어 있습니다.", raw });
+      issues.push({ row: index + 1, message: !term ? "표현이 비어 있습니다." : "뜻이 비어 있습니다.", raw });
       return;
     }
     const meanings = meaningCell.split("/").map((value) => value.trim()).filter(Boolean);
