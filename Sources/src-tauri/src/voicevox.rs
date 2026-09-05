@@ -11,6 +11,22 @@ use std::{
 
 use serde::Serialize;
 
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+#[cfg(windows)]
+use windows::{
+    core::PCWSTR,
+    Win32::{
+        Foundation::HANDLE,
+        System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+    },
+};
+
 const INSTALLER: &str = include_str!("../sidecar/install_voicevox.ps1");
 const ENGINE_VERSION: &str = "0.25.2";
 const REQUIRED_VOICE_MODELS: [&str; 7] = [
@@ -33,6 +49,8 @@ struct RuntimeState {
     phase: String,
     port: Option<u16>,
     child: Option<Child>,
+    #[cfg(windows)]
+    job: Option<OwnedHandle>,
     error: Option<String>,
 }
 
@@ -58,6 +76,8 @@ impl VoicevoxRuntime {
                 phase: "starting".into(),
                 port: None,
                 child: None,
+                #[cfg(windows)]
+                job: None,
                 error: None,
             }),
         });
@@ -128,11 +148,23 @@ impl VoicevoxRuntime {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        let child = command.spawn().map_err(|e| format!("VOICEVOX engine failed to start: {e}"))?;
+        let mut child = command.spawn().map_err(|e| format!("VOICEVOX engine failed to start: {e}"))?;
+        #[cfg(windows)]
+        let job = match attach_kill_on_close_job(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
         {
             let mut state = self.state.lock().map_err(|_| "VOICEVOX runtime lock poisoned")?;
             state.port = Some(port);
             state.child = Some(child);
+            #[cfg(windows)]
+            {
+                state.job = Some(job);
+            }
         }
 
         for _ in 0..300 {
@@ -205,6 +237,30 @@ impl Drop for VoicevoxRuntime {
                 let _ = child.kill();
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn attach_kill_on_close_job(child: &Child) -> Result<OwnedHandle, String> {
+    unsafe {
+        let job = CreateJobObjectW(None, PCWSTR::null())
+            .map_err(|error| format!("VOICEVOX job object creation failed: {error}"))?;
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Err(error) = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) {
+            let _ = windows::Win32::Foundation::CloseHandle(job);
+            return Err(format!("VOICEVOX job object setup failed: {error}"));
+        }
+        if let Err(error) = AssignProcessToJobObject(job, HANDLE(child.as_raw_handle())) {
+            let _ = windows::Win32::Foundation::CloseHandle(job);
+            return Err(format!("VOICEVOX process could not join TANREN job object: {error}"));
+        }
+        Ok(OwnedHandle::from_raw_handle(job.0))
     }
 }
 

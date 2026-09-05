@@ -81,13 +81,13 @@ function Assert-JsonSuccess {
     }
 }
 
-$case1 = Assert-JsonSuccess "word with reading hint" (Invoke-Sidecar -AsArgument -Payload '{"text":"見据える","reading_hint":"みすえる"}')
+$case1 = Assert-JsonSuccess "entry with reading hint" (Invoke-Sidecar -AsArgument -Payload '{"text":"見据える","reading_hint":"みすえる"}')
 if ($case1.reading -ne "みすえる") { throw "reading hint was not preserved" }
-Write-Host "PASS 1/5 word + reading hint"
+Write-Host "PASS 1/5 entry + reading hint"
 
-$case2 = Assert-JsonSuccess "word without reading hint" (Invoke-Sidecar -AsArgument -Payload '{"text":"見据える"}')
+$case2 = Assert-JsonSuccess "entry without reading hint" (Invoke-Sidecar -AsArgument -Payload '{"text":"見据える"}')
 if ([string]::IsNullOrWhiteSpace([string]$case2.reading)) { throw "reading was not generated" }
-Write-Host "PASS 2/5 word + no reading hint"
+Write-Host "PASS 2/5 entry + no reading hint"
 
 $case3 = Assert-JsonSuccess "kana-only BOM input" (Invoke-Sidecar -WithBom -Payload '{"text":"かな"}')
 if ($case3.normalized_text -ne "かな" -or [string]::IsNullOrWhiteSpace([string]$case3.reading)) {

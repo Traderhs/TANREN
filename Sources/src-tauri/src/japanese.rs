@@ -17,6 +17,7 @@ use crate::{
 };
 
 const SIDECAR_SOURCE: &str = include_str!("../sidecar/japanese_sidecar.py");
+pub const VOICE_AUDIO_REVISION: &str = "v8";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JapaneseEnrichment {
@@ -227,7 +228,12 @@ impl JapaneseAnalyzer {
         let response = self.request_sidecar(&request)?;
         let enrichment: JapaneseEnrichment = serde_json::from_value(response)
             .map_err(|error| format!("invalid language enrichment payload: {error}"))?;
-        let audio = enrichment.audio_assets.iter().filter(|asset| Path::new(&asset.path).exists()).cloned().collect();
+        let audio: Vec<AudioAssetDraft> = enrichment.audio_assets.iter().filter(|asset| Path::new(&asset.path).exists()).cloned().collect();
+        if enrichment.scope == "lexical" {
+            if audio.is_empty() {
+                return Err(format!("lexical enrichment completed without generated audio: {}", entry.term));
+            }
+        }
         Ok((enrichment, audio))
     }
 }

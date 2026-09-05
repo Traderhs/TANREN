@@ -10,6 +10,7 @@ import contextlib
 import math
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 import wave
 from array import array
@@ -18,7 +19,7 @@ from typing import Any
 
 
 SMALL = set("ゃゅょぁぃぅぇぉゎャュョァィゥェォヮ")
-VOICE_AUDIO_REVISION = "v5"
+VOICE_AUDIO_REVISION = "v8"
 POST_PHONEME_LENGTH = 0.42
 TAIL_SILENCE_SECONDS = 0.22
 VOICE_PROFILES = [
@@ -108,7 +109,7 @@ class AdaptiveTtsScheduler:
     the host's logical CPU count only to derive a conservative exploration
     ceiling, then adjusts the active concurrency from measured throughput and
     request failures.  State lives for the lifetime of the sidecar process, so
-    later words reuse what the current machine/runtime has already learned.
+    later entries reuse what the current machine/runtime has already learned.
     """
 
     def __init__(self) -> None:
@@ -165,7 +166,7 @@ class AdaptiveTtsScheduler:
             if failures:
                 # Engine contention, memory pressure, or transient HTTP errors
                 # cause immediate backoff. Failed profiles are retried at the
-                # reduced width so a too-aggressive probe does not fail a word.
+                # reduced width so a too-aggressive probe does not fail an entry.
                 self.limit = max(1, width // 2)
                 for index, item, error in failures:
                     attempts[index] += 1
@@ -195,7 +196,6 @@ class AdaptiveTtsScheduler:
 
 
 _TTS_SCHEDULER = AdaptiveTtsScheduler()
-_VOICE_WARMUP_SCHEDULER = AdaptiveTtsScheduler()
 
 
 def import_pyopenjtalk():
@@ -255,7 +255,7 @@ def accent_contour(mora_count: int, accent_type: int) -> list[int] | None:
     """Return canonical Tokyo lexical L/H levels (0=L, 1=H).
 
     UniDic aType is the mora after which the lexical accent falls; 0 is
-    heiban. Odaka therefore has the same within-word levels as heiban and is
+    heiban. Odaka therefore has the same within-token levels as heiban and is
     distinguished losslessly by downstep_after_mora in analysis metadata.
     """
     if mora_count <= 0 or accent_type < 0 or accent_type > mora_count:
@@ -278,6 +278,61 @@ def accent_contours(mora_count: int, accent_types: list[int] | None) -> list[lis
     return values or None
 
 
+def enforce_pitch_contour(accent_phrases: list[dict[str, Any]], contour: list[int]) -> list[dict[str, Any]]:
+    """Correct lexical pitch direction without exaggerating small model transitions.
+
+    Preserve the model's pitch distance when reversing an incorrect edge. A
+    fixed minimum on every L/H edge turns subtle movements into large jumps.
+    Only an exactly flat edge needs a small nonzero target.
+    """
+    if len(accent_phrases) != 1:
+        return accent_phrases
+    moras = accent_phrases[0].get("moras", [])
+    if len(moras) != len(contour):
+        return accent_phrases
+
+    pitches: list[float | None] = []
+    for mora in moras:
+        raw = mora.get("pitch")
+        try:
+            pitch = float(raw)
+        except (TypeError, ValueError):
+            pitch = None
+        pitches.append(pitch if pitch is not None and pitch > 0 else None)
+
+    target_gaps = [
+        abs(right - left) if left is not None and right is not None and right != left else 0.02
+        for left, right in zip(pitches, pitches[1:])
+    ]
+    for _ in range(max(1, len(contour))):
+        changed = False
+        for index in range(len(contour) - 1):
+            if contour[index] == contour[index + 1]:
+                continue
+            left = pitches[index]
+            right = pitches[index + 1]
+            if left is None or right is None:
+                continue
+            signed_gap = right - left if contour[index] < contour[index + 1] else left - right
+            if signed_gap >= target_gaps[index]:
+                continue
+            correction = (target_gaps[index] - signed_gap) / 2.0
+            if contour[index] < contour[index + 1]:
+                pitches[index] = max(0.01, left - correction)
+                pitches[index + 1] = right + correction
+            else:
+                pitches[index] = left + correction
+                pitches[index + 1] = max(0.01, right - correction)
+            changed = True
+        if not changed:
+            break
+
+    for mora, pitch in zip(moras, pitches):
+        if pitch is not None:
+            mora["pitch"] = pitch
+    return accent_phrases
+
+
 def scope_for(text: str, token_count: int) -> str:
     if re.search(r"[。！？!?]", text):
         return "sentence"
@@ -298,21 +353,23 @@ def token_data(text: str) -> tuple[list[dict[str, Any]], list[int] | None, str |
             _FUGASHI_TAGGER = fugashi.Tagger()
             _FUGASHI_VERSION = getattr(fugashi, "__version__", None)
         tagger = _FUGASHI_TAGGER
-    except Exception:
-        return [], None, None
+    except Exception as error:
+        raise RuntimeError(f"UniDic/Fugashi initialization failed: {error}") from error
 
     tokens: list[dict[str, Any]] = []
     accent: list[int] | None = None
-    words = list(tagger(text))
-    for word in words:
-        feat = word.feature
+    raw_tokens = list(tagger(text))
+    if text and not raw_tokens:
+        raise RuntimeError(f"UniDic/Fugashi returned no tokens for lexical input: {text}")
+    for tokenized in raw_tokens:
+        feat = tokenized.feature
         def f(name: str, default=None):
             return getattr(feat, name, default)
         atype = f("aType")
         if atype is None:
             atype = f("accentType")
         token = {
-            "surface": word.surface,
+            "surface": tokenized.surface,
             "lemma": f("lemma"),
             "reading": f("kana") or f("pron"),
             "pronunciation": f("pron"),
@@ -321,7 +378,7 @@ def token_data(text: str) -> tuple[list[dict[str, Any]], list[int] | None, str |
             "accent_type": atype,
         }
         tokens.append(token)
-    if len(words) == 1:
+    if len(raw_tokens) == 1:
         accent = parse_accent_types(tokens[0].get("accent_type"))
     return tokens, accent, _FUGASHI_VERSION
 
@@ -346,6 +403,8 @@ def voicevox_request(base_url: str, path: str, params: dict[str, Any] | None = N
         payload = response.read()
     if binary:
         return payload
+    if not payload:
+        return None
     return json.loads(payload.decode("utf-8"))
 
 
@@ -412,6 +471,17 @@ def soften_wav_tail(wav_bytes: bytes) -> bytes:
         return wav_bytes
 
 
+def voicevox_kana_notation(expected_morae: list[str], accent_type: int) -> str:
+    if not expected_morae:
+        raise ValueError("VOICEVOX kana notation requires at least one mora")
+    nucleus = accent_type if accent_type > 0 else len(expected_morae)
+    if nucleus < 1 or nucleus > len(expected_morae):
+        raise ValueError(f"invalid accent type {accent_type} for {len(expected_morae)} morae")
+    parts = [kata(mora) for mora in expected_morae]
+    parts[nucleus - 1] += "'"
+    return "".join(parts)
+
+
 def resolve_voice_profiles(speakers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     resolved: list[dict[str, Any]] = []
     by_name = {str(speaker.get("name")): speaker for speaker in speakers}
@@ -451,7 +521,11 @@ def warm_voicevox_profiles(base_url: str) -> int:
             {"speaker": profile["speaker_id"], "skip_reinit": "true"},
         )
 
-    _VOICE_WARMUP_SCHEDULER.map(profiles, initialize)
+    # Speaker initialization is intentionally serialized. DirectML can spike
+    # memory usage when several voice models initialize at once, which can kill
+    # the VOICEVOX engine before enrichment begins.
+    for profile in profiles:
+        initialize(profile)
     return len(profiles)
 
 
@@ -459,7 +533,7 @@ def synthesize_voicevox(
     base_url: str,
     reading: str,
     expected_morae: list[str],
-    accent_type: int,
+    accent_type: int | None,
     speaker_id: int,
     path: str,
     speed_scale: float = 1.0,
@@ -467,22 +541,46 @@ def synthesize_voicevox(
 ) -> None:
     if valid_wav(path):
         return
-    reading_kata = kata(reading)
-    nucleus = accent_type if accent_type > 0 else len(expected_morae)
-    query = voicevox_request(base_url, "/audio_query", {"text": reading_kata, "speaker": speaker_id})
-    phrases = query.get("accent_phrases", [])
-    if len(phrases) != 1:
-        raise RuntimeError(f"VOICEVOX audio query returned {len(phrases)} accent phrases for lexical reading {reading}")
-    phrase = phrases[0]
-    moras = phrase.get("moras", [])
-    if len(moras) != len(expected_morae):
-        raise RuntimeError(f"VOICEVOX mora mismatch for {reading}: expected={len(expected_morae)} actual={len(moras)}")
-    # TANREN's lexical accent analysis is authoritative.  audio_query already
-    # gives us the speaker-specific mora structure, so overwrite only the
-    # accent nucleus and ask VOICEVOX to recompute the dependent mora data.
-    phrase["accent"] = nucleus
-    controlled = voicevox_request(base_url, "/mora_data", {"speaker": speaker_id}, phrases)
-    query["accent_phrases"] = controlled
+    # Let the text frontend resolve Japanese long vowels and devoicing. Forcing
+    # katakana can turn e.g. おはよう's final long /o/ into a separate /u/.
+    reading_text = hira(reading)
+    query = voicevox_request(base_url, "/audio_query", {"text": reading_text, "speaker": speaker_id})
+    if accent_type is not None:
+        nucleus = accent_type if accent_type > 0 else len(expected_morae)
+        # Preserve the text frontend's devoicing and phoneme realization whenever
+        # its lexical segmentation matches. Kana parsing discards that context.
+        phrases = query["accent_phrases"]
+        if len(phrases) != 1 or len(phrases[0].get("moras", [])) != len(expected_morae):
+            kana_notation = voicevox_kana_notation(expected_morae, accent_type)
+            try:
+                phrases = voicevox_request(
+                    base_url,
+                    "/accent_phrases",
+                    {"text": kana_notation, "speaker": speaker_id, "is_kana": "true"},
+                )
+            except urllib.error.HTTPError as error:
+                if error.code != 400:
+                    raise
+                phrases = voicevox_request(
+                    base_url,
+                    "/accent_phrases",
+                    {"text": reading_text, "speaker": speaker_id, "is_kana": "false"},
+                )
+        if len(phrases) != 1:
+            raise RuntimeError(f"VOICEVOX kana query returned {len(phrases)} accent phrases for lexical reading {reading}")
+        phrase = phrases[0]
+        moras = phrase.get("moras", [])
+        if len(moras) != len(expected_morae):
+            raise RuntimeError(f"VOICEVOX mora mismatch for {reading}: expected={len(expected_morae)} actual={len(moras)}")
+        phrase["accent"] = nucleus
+        controlled = voicevox_request(base_url, "/mora_data", {"speaker": speaker_id}, phrases)
+        contour = accent_contour(len(expected_morae), accent_type)
+        if contour:
+            controlled = enforce_pitch_contour(controlled, contour)
+        # audio_query may split a dictionary entry into multiple accent phrases.
+        # TANREN's lexical analysis is authoritative when UniDic supplied an accent,
+        # so keep the query envelope but replace its segmentation with the explicit phrase.
+        query["accent_phrases"] = controlled
     query["speedScale"] = speed_scale
     query["pitchScale"] = pitch_scale
     query["postPhonemeLength"] = max(float(query.get("postPhonemeLength", 0.0)), POST_PHONEME_LENGTH)
@@ -507,7 +605,7 @@ def generate_voicevox_assets(
     base_url: str,
     reading: str,
     expected_morae: list[str],
-    accent_type: int,
+    accent_type: int | None,
     audio_dir: str,
 ) -> list[dict[str, Any]]:
     profiles, version = voicevox_metadata(base_url)
@@ -534,8 +632,9 @@ def generate_voicevox_assets(
             float(profile.get("speed_scale", 1.0)),
             float(profile.get("pitch_scale", 0.0)),
         )
+        accent_identity = str(accent_type) if accent_type is not None else "native"
         return {
-            "cache_key": f"voicevox:{VOICE_AUDIO_REVISION}:{version}:{reading}:{accent_type}:{profile['voice_profile']}:{profile['speaker_id']}",
+            "cache_key": f"voicevox:{VOICE_AUDIO_REVISION}:{version}:{reading}:{accent_identity}:{profile['voice_profile']}:{profile['speaker_id']}",
             "path": path,
             "provider": f"voicevox-{version}",
             "voice_profile": profile["voice_profile"],
@@ -579,9 +678,17 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
     scope = scope_for(text, len(tokens))
     mora_list = morae(reading or "")
     token_reading = None
+    token_pronunciation = None
     if len(tokens) == 1 and tokens[0].get("reading"):
         token_reading = hira(str(tokens[0]["reading"]))
-    reading_matches_lexicon = not reading or not token_reading or reading == token_reading
+    if len(tokens) == 1 and tokens[0].get("pronunciation"):
+        token_pronunciation = hira(str(tokens[0]["pronunciation"]))
+    reading_matches_lexicon = (
+        not reading
+        or not token_reading
+        or reading == token_reading
+        or reading == token_pronunciation
+    )
     accent_types = lexical_accent if scope == "lexical" and reading_matches_lexicon else None
     patterns = accent_contours(len(mora_list), accent_types)
     if patterns:
@@ -603,12 +710,12 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
     audio_assets: list[dict[str, Any]] = []
     audio_dir = req.get("audio_dir")
     voicevox_url = req.get("voicevox_url")
-    if audio_dir and voicevox_url and scope == "lexical" and reading and accent_types:
+    if audio_dir and voicevox_url and scope == "lexical" and reading:
         audio_assets = generate_voicevox_assets(
             str(voicevox_url),
             reading,
             mora_list,
-            accent_types[0],
+            accent_types[0] if accent_types else None,
             str(audio_dir),
         )
     return {
@@ -632,7 +739,7 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
 def handle_request(req: dict[str, Any]) -> dict[str, Any]:
     if req.get("op") == "warm":
         # Pay language-runtime initialization while the app is otherwise idle,
-        # not when the user is waiting for a newly added word.
+        # not when the user is waiting for a newly added entry.
         token_data("かな")
         import_pyopenjtalk()
         voicevox_url = req.get("voicevox_url")
@@ -652,7 +759,7 @@ def main() -> None:
         json.dump(handle_request(req), sys.stdout, ensure_ascii=False)
         return
 
-    # Line-delimited JSON keeps this process alive across words.  Imports,
+    # Line-delimited JSON keeps this process alive across entries.  Imports,
     # UniDic/OpenJTalk modules, VOICEVOX metadata, and adaptive TTS tuning are
     # therefore reused instead of being paid for on every entry.
     for raw in sys.stdin.buffer:
