@@ -1,6 +1,5 @@
-import { FormEvent, KeyboardEvent, forwardRef, memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { FormEvent, forwardRef, memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import HTMLFlipBook from "react-pageflip";
 import { Canvas } from "@react-three/fiber";
@@ -9,15 +8,17 @@ import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Too
 import { api } from "./lib/api";
 import { prepareBookClosing } from "./lib/bookClosing";
 import { parseEntryText } from "./lib/importParser";
-import { japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime, type JapaneseImeSegment, type JapaneseImeSession } from "./lib/japaneseIme";
-import type { AudioSettings, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, PitchQuestion, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyCard, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./lib/types";
-import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, setPitchLevel, shouldAutoPlayAfterWrittenAnswer, type PitchLevel, type PitchSelection } from "./lib/studyFlow";
-import { completionDelayMs, firstMeaningfulInputAt, isMeaningfulInput, recallHasTimedOut } from "./lib/studyTimers";
+import { BookStudy } from "./BookStudy";
+import { loadJapaneseImeRuntime } from "./lib/japaneseIme";
+import type { SubmitResult } from "./lib/types";
+import type { AudioSettings, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
 
-type View = "decks" | "editor" | "study" | "settings";
+type View = "decks" | "editor" | "settings";
 
 const BOOK_FLUTTER_LEAF_COUNT = 8;
 const BOOK_CONTENT_PAGE = BOOK_FLUTTER_LEAF_COUNT + 1;
+const BOOK_STUDY_FLUTTER_LEAF_COUNT = 8;
+const BOOK_STUDY_PAGE = BOOK_CONTENT_PAGE + 2 + BOOK_STUDY_FLUTTER_LEAF_COUNT;
 const BOOK_COVER_HOLD_MS = 380;
 const OPEN_BOOK_BASE_WIDTH = 1240;
 const OPEN_BOOK_TARGET_WIDTH = 1400;
@@ -31,7 +32,13 @@ const STUDY_MODE_LABELS: Record<StudyMode, string> = {
   listening: "Listening",
   writing: "Writing",
 };
-const VIEW_LABELS: Record<Exclude<View, "decks" | "study">, string> = {
+const BOOK_STUDY_NAVIGATION_LOCK_CLASS = "tanren-book-study-navigation-lock";
+
+function setBookStudyNavigationLocked(locked: boolean) {
+  document.documentElement.classList.toggle(BOOK_STUDY_NAVIGATION_LOCK_CLASS, locked);
+}
+
+const VIEW_LABELS: Record<Exclude<View, "decks">, string> = {
   editor: "책 편집",
   settings: "설정",
 };
@@ -125,15 +132,13 @@ function App() {
   const [view, setView] = useState<View>("decks");
   const [decks, setDecks] = useState<DeckSummary[]>([]);
   const [selected, setSelected] = useState<DeckSummary | null>(null);
-  const [card, setCard] = useState<StudyCard | null>(null);
-  const [result, setResult] = useState<SubmitResult | null>(null);
   const [libraryStats, setLibraryStats] = useState<LibraryStats | null>(null);
   const [statsDeckId, setStatsDeckId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [semanticStatus, setSemanticStatus] = useState<SemanticRuntimeStatus | null>(null);
   const [voicevoxStatus, setVoicevoxStatus] = useState<VoicevoxRuntimeStatus | null>(null);
   const [initialRuntimeReady, setInitialRuntimeReady] = useState(false);
-  const [audioSettings, setAudioSettings] = useState<AudioSettings>({ auto_play: true, volume: 1, playback_rate: 1 });
+  const [audioSettings, setAudioSettings] = useState<AudioSettings>({ volume: 1, playback_rate: 1 });
   const homeScrollRef = useRef<HTMLDivElement>(null);
   const homeWheelLockRef = useRef(false);
   const homeShelfWheelAtRef = useRef(0);
@@ -150,8 +155,8 @@ function App() {
   };
 
   useEffect(() => void refresh(), []);
-  useEffect(() => { void api.audioSettings().then(setAudioSettings); }, []);
   useEffect(() => { void loadJapaneseImeRuntime().catch(() => undefined); }, []);
+  useEffect(() => { void api.audioSettings().then(setAudioSettings); }, []);
   useEffect(() => {
     if (view !== "decks") return;
     let active = true;
@@ -282,6 +287,25 @@ function App() {
 
     const onWheel = (event: WheelEvent) => {
       const target = event.target as HTMLElement | null;
+
+      // Keep the library pinned while the blank study pages are active so a
+      // wheel gesture cannot hand off to stats/settings snap navigation.
+      if (
+        document.documentElement.classList.contains(BOOK_STUDY_NAVIGATION_LOCK_CLASS)
+        || scroller.querySelector(".open-book-stage.is-study-transitioning, .open-book-stage.is-book-study")
+      ) {
+        if (target?.closest(".learning-body")) {
+          event.stopPropagation();
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        const librarySection = scroller.querySelector<HTMLElement>(".home-library-section");
+        if (librarySection && Math.abs(scroller.scrollTop - librarySection.offsetTop) > 1) {
+          scroller.scrollTop = librarySection.offsetTop;
+        }
+        return;
+      }
 
       const importPreviewScroller = target?.closest<HTMLElement>(".book-entry-import-body");
 
@@ -421,6 +445,10 @@ function App() {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
       if (event.repeat) return;
+      if (
+        document.documentElement.classList.contains(BOOK_STUDY_NAVIGATION_LOCK_CLASS)
+        || scroller.querySelector(".open-book-stage.is-study-transitioning, .open-book-stage.is-book-study")
+      ) return;
       const target = event.target as HTMLElement | null;
       if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
       if (target?.closest(".deck-create-backdrop, .open-book-stage")) return;
@@ -502,18 +530,6 @@ function App() {
     };
   }, [initialRuntimeReady]);
 
-  const openStudy = async (deck: DeckSummary, stage?: number) => {
-    try {
-      setSelected(deck);
-      const started = await api.startStudy(deck.id, stage);
-      setCard(started.card ?? null);
-      setResult(started);
-      setView("study");
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
   const scrollHomeSection = (index: number) => {
     const scroller = homeScrollRef.current;
     if (!scroller) return;
@@ -525,9 +541,6 @@ function App() {
 
   const openDecks = async () => {
     try {
-      await exitStudyForDeckNavigation(view, api.exitStudy);
-      setCard(null);
-      setResult(null);
       setStatsDeckId(null);
       await refresh();
       setView("decks");
@@ -538,7 +551,7 @@ function App() {
 
   return (
     <main className={`app-shell ${view === "decks" ? "home-shell" : ""}`}>
-      {view !== "study" && view !== "decks" && <header className="topbar">
+      {view !== "decks" && <header className="topbar">
         <button className="brand" onClick={() => void openDecks()}>
           <span className="brand-mark">鍛</span>
           <strong>TANREN</strong>
@@ -564,9 +577,9 @@ function App() {
               decks={decks}
               onRefresh={refresh}
               onEdit={(d) => { setSelected(d); setView("editor"); }}
-              onStudy={openStudy}
               onOpenedDeckChange={setStatsDeckId}
               onRequestHomeSection={scrollHomeSection}
+              audioSettings={audioSettings}
             />
           </section>
           <section className="home-snap-section home-stats-section">
@@ -607,17 +620,6 @@ function App() {
         </div>
       )}
       {view === "editor" && selected && <DeckEditor deck={selected} onDone={refresh} />}
-      {view === "study" && (card || result) && (
-        <StudyView
-          deckId={selected?.id ?? ""}
-          card={card}
-          result={result}
-          setCard={setCard}
-          setResult={setResult}
-          audioSettings={audioSettings}
-          onExit={openDecks}
-        />
-      )}
       {view === "settings" && <SettingsView
         voicevoxStatus={voicevoxStatus}
         audioSettings={audioSettings}
@@ -746,15 +748,6 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
         <header><span>02</span><h2>음성</h2></header>
         <p className="settings-panel-help">학습 중 재생되는 음성을 조절해요.</p>
         <div className="settings-control-list">
-          <div className="settings-control-row">
-            <div><strong>자동 재생</strong><small>문제와 정답 음성을 자동으로 재생해요.</small></div>
-            <button
-              type="button"
-              className={`settings-toggle ${audioSettings.auto_play ? "is-on" : ""}`}
-              aria-pressed={audioSettings.auto_play}
-              onClick={() => updateAudio({ ...audioSettings, auto_play: !audioSettings.auto_play })}
-            ><span /></button>
-          </div>
           <label className="settings-range-row">
             <div><strong>음량</strong><span>{Math.round(audioSettings.volume * 100)}%</span></div>
             <input type="range" min="0" max="1" step="0.05" value={audioSettings.volume} onChange={(event) => updateAudio({ ...audioSettings, volume: Number(event.target.value) })} />
@@ -1110,17 +1103,18 @@ const BookDeleteButton = memo(function BookDeleteButton({ deck, onDeleted }: {
   </button>;
 }, (previous, next) => previous.deck.id === next.deck.id && previous.deck.name === next.deck.name);
 
-function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onRequestHomeSection }: {
+function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeSection, audioSettings }: {
   decks: DeckSummary[];
   onRefresh: () => Promise<void>;
   onEdit: (d: DeckSummary) => void;
-  onStudy: (d: DeckSummary, stage?: number) => void;
   onOpenedDeckChange: (deckId: string | null) => void;
   onRequestHomeSection: (index: number) => void;
+  audioSettings: AudioSettings;
 }) {
   const [name, setName] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [openedDeckId, setOpenedDeckId] = useState<string | null>(null);
+  const [bookLayoutOpen, setBookLayoutOpen] = useState(false);
   const [bookOpenCycle, setBookOpenCycle] = useState(0);
   const [bookSettled, setBookSettled] = useState(false);
   const [bookOpeningStarted, setBookOpeningStarted] = useState(false);
@@ -1131,6 +1125,10 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
   const [bookEntries, setBookEntries] = useState<EntryRecord[]>([]);
   const [bookPanelLoading, setBookPanelLoading] = useState(false);
   const [stageSchedules, setStageSchedules] = useState<Record<number, StageScheduleSummary>>({});
+  const [bookStudyActive, setBookStudyActive] = useState(false);
+  const [bookStudyExiting, setBookStudyExiting] = useState(false);
+  const [studyResult, setStudyResult] = useState<SubmitResult | null>(null);
+  const [bookStudyTransitioning, setBookStudyTransitioning] = useState(false);
   const [entrySearch, setEntrySearch] = useState("");
   const [entryDialog, setEntryDialog] = useState<"single" | "bulk" | null>(null);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
@@ -1157,6 +1155,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
   const importPreviewRef = useRef<HTMLDivElement>(null);
   const skipDeleteConfirmDeckIdsRef = useRef(new Set<string>());
   const flutterTimerRef = useRef<number | null>(null);
+  const studyFlutterTimerRef = useRef<number | null>(null);
   const flutteringRef = useRef(false);
   const activeBookSessionRef = useRef("");
   const flutterRetryRef = useRef(0);
@@ -1190,6 +1189,10 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
   const bulkPreviewHiddenCount = Math.max(0, parsedBulkEntries.entries.length - bulkPreviewEntries.length);
   const bookSessionKey = openedDeck ? `${openedDeck.id}:${bookOpenCycle}` : "";
   const bookVisualReady = Boolean(openedDeck && (reduceMotion || (book3DReady && bookFlipReady)));
+  const bookProgressRatio = (deck: DeckSummary) => deck.total_stage_count === 0
+    ? 0
+    : Math.min(1, deck.completed_stage_count / deck.total_stage_count);
+  const bookProgressPercent = (deck: DeckSummary) => bookProgressRatio(deck) * 100;
   activeBookSessionRef.current = bookSessionKey;
 
   const waitForEntryProcessing = async (entryIds: string[]) => {
@@ -1349,11 +1352,68 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
       setStageSchedules(next);
       });
     return () => { disposed = true; };
-  }, [openedDeck?.id, openedDeck?.entry_count, openedDeck?.current_stage, openedDeck?.total_stage_count]);
+  }, [openedDeck?.id, openedDeck?.entry_count, openedDeck?.current_stage, openedDeck?.total_stage_count, bookStudyActive]);
 
   const clearFlutterTimer = () => {
     if (flutterTimerRef.current !== null) window.clearTimeout(flutterTimerRef.current);
     flutterTimerRef.current = null;
+  };
+
+  const clearStudyFlutterTimer = () => {
+    if (studyFlutterTimerRef.current !== null) window.clearTimeout(studyFlutterTimerRef.current);
+    studyFlutterTimerRef.current = null;
+  };
+
+  const showBookStudy = () => {
+    clearStudyFlutterTimer();
+    setBookStudyExiting(false);
+    setBookStudyTransitioning(false);
+    setBookStudyActive(true);
+  };
+
+  const scheduleStudyFlutter = (sessionKey: string, delayMs = 8) => {
+    clearStudyFlutterTimer();
+    studyFlutterTimerRef.current = window.setTimeout(() => {
+      if (!sessionKey || activeBookSessionRef.current !== sessionKey || bookClosingRef.current) return;
+      const pageFlip = flipBookRef.current?.pageFlip?.();
+      if (!pageFlip) {
+        scheduleStudyFlutter(sessionKey, 16);
+        return;
+      }
+      const pageIndex = Number(pageFlip.getCurrentPageIndex?.() ?? BOOK_CONTENT_PAGE);
+      if (pageFlip.getState?.() !== "read") {
+        scheduleStudyFlutter(sessionKey, 16);
+        return;
+      }
+      if (pageIndex >= BOOK_STUDY_PAGE) {
+        showBookStudy();
+        return;
+      }
+      pageFlip.flipNext("top");
+      scheduleStudyFlutter(sessionKey, 16);
+    }, delayMs);
+  };
+
+  const startBookStudy = async (stage: number) => {
+    if (!openedDeck || bookStudyTransitioning || bookStudyActive || bookClosingRef.current) return;
+    setBookStudyExiting(false);
+    setBookStudyNavigationLocked(true);
+    onRequestHomeSection(0);
+    setBookStudyTransitioning(true);
+    setEntryMessage("");
+    try {
+      setStudyResult(await api.startStudy(openedDeck.id, stage));
+      if (reduceMotion) {
+        flipBookRef.current?.pageFlip?.().turnToPage(BOOK_STUDY_PAGE);
+        showBookStudy();
+        return;
+      }
+      scheduleStudyFlutter(bookSessionKey, 8);
+    } catch (error) {
+      setBookStudyNavigationLocked(false);
+      setBookStudyTransitioning(false);
+      setEntryMessage(String(error));
+    }
   };
 
   const scheduleBookFlutter = (sessionKey: string, delayMs: number) => {
@@ -1410,8 +1470,10 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
   };
 
   const finishClosingBook = () => {
+    setBookStudyNavigationLocked(false);
     activeBookSessionRef.current = "";
     clearFlutterTimer();
+    clearStudyFlutterTimer();
     flutteringRef.current = false;
     flutterRetryRef.current = 0;
     flutterStartedSessionRef.current = "";
@@ -1421,6 +1483,9 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
     setBook3DReady(false);
     setBookFlipReady(false);
     setBookSettled(false);
+    setBookStudyActive(false);
+    setBookStudyExiting(false);
+    setBookStudyTransitioning(false);
     setBookPanel("study");
     setEntryDialog(null);
     setEditingEntryId(null);
@@ -1619,7 +1684,9 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
     flutterStartedSessionRef.current = "";
     setBookSettled(Boolean(openedDeckId && reduceMotion));
     return () => {
+      setBookStudyNavigationLocked(false);
       clearFlutterTimer();
+      clearStudyFlutterTimer();
       flutteringRef.current = false;
     };
   }, [openedDeckId, bookOpenCycle]);
@@ -1639,12 +1706,16 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
     scheduleBookFlutter(sessionKey, 4);
   };
 
-  return <section className={`content home-content ${openedDeck ? "is-book-open" : ""}`}>
-    <AnimatePresence initial={false} mode="wait">
+  return <section className={`content home-content ${bookLayoutOpen ? "is-book-open" : ""}`}>
+    <AnimatePresence
+      initial={false}
+      mode="wait"
+      onExitComplete={() => setBookLayoutOpen(Boolean(openedDeck))}
+    >
       {openedDeck ? <motion.section
         key={`opened-${openedDeck.id}-${bookOpenCycle}`}
-        className={`open-book-stage ${bookSettled ? "is-settled" : ""} ${bookOpeningStarted ? "is-opening" : "is-cover-hold"} ${bookClosing ? "is-closing" : ""}`}
-        inert={bookClosing}
+        className={`open-book-stage ${bookSettled ? "is-settled" : ""} ${bookOpeningStarted ? "is-opening" : "is-cover-hold"} ${bookClosing ? "is-closing" : ""} ${bookStudyTransitioning ? "is-study-transitioning" : ""} ${bookStudyActive ? "is-book-study" : ""} ${bookStudyExiting ? "is-study-exiting" : ""}`}
+        inert={bookClosing || bookStudyTransitioning}
         aria-label={`${openedDeck.name} deck`}
         initial={reduceMotion ? false : { opacity: 0, y: 12 }}
         animate={{ opacity: bookVisualReady ? 1 : 0, y: bookVisualReady ? 0 : 12 }}
@@ -1706,7 +1777,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
                       <span className="ebook-current-stage">{openedDeck.current_stage}단계</span>
                       <span className="ebook-current-range">{formatStudyRangeLabel(openedDeck.active_range, " - ")}</span>
                     </span>
-                    <span className="ebook-progress" aria-hidden="true"><i style={{ width: `${openedDeck.total_stage_count === 0 ? 0 : Math.min(100, (openedDeck.completed_stage_count / openedDeck.total_stage_count) * 100)}%` }} /></span>
+                    <span className="ebook-progress" aria-hidden="true"><i style={{ width: `${bookProgressPercent(openedDeck)}%` }} /></span>
                   </span>
                 </span>
                 <span className="ebook-page-edge ebook-page-edge-right" aria-hidden="true" />
@@ -1722,7 +1793,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
             <FlipPage className="book-inside-page book-inside-left">
               <div className="book-page-inner">
               <div className="book-page-topline">
-                <button className="book-close ghost" onClick={closeOpenedBook} aria-label="책장" title="책장" />
+                <button className="book-close ghost" onClick={closeOpenedBook} aria-label="책장으로 돌아가기" title="책장으로 돌아가기" />
                 <BookDeleteButton
                   deck={openedDeck}
                   onDeleted={async () => {
@@ -1740,6 +1811,15 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
                           : openedDeck.target_language}
                   </span>
                   <BookTitleEditor deck={openedDeck} onRefresh={onRefresh} />
+                  <div className="book-progress-summary" aria-label="책 전체 진행률">
+                    <div className="book-progress-rate">
+                      <span>진행률</span>
+                      <strong>{Math.round(bookProgressPercent(openedDeck))}%</strong>
+                    </div>
+                    <div className="book-progress-count">
+                      {numberFormat.format(openedDeck.completed_stage_count)} / {numberFormat.format(openedDeck.total_stage_count)}단계
+                    </div>
+                  </div>
                 </div>
                 <BookInlineEntryManager
                   deckId={openedDeck.id}
@@ -1756,6 +1836,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
                 <div className="range-heading">
                   <div><span>CONTENTS</span><strong>학습 단계</strong></div>
                 </div>
+                {entryMessage && <p className="book-entry-message" role="alert">{entryMessage}</p>}
                 <div className="book-range-scroll" aria-label={`${openedDeck.name} study ranges`}>
                   <div className="book-stage-list">
                     {Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1).map((stage) => {
@@ -1770,7 +1851,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
                         <button
                           type="button"
                           className="ghost book-stage-card"
-                          onClick={() => onStudy(openedDeck, stage)}
+                          onClick={() => void startBookStudy(stage)}
                         >
                           <strong className={`book-stage-title ${range?.cumulative ? "is-cumulative" : ""}`}>
                             {range?.cumulative && <small>총복습</small>}
@@ -1804,10 +1885,49 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
             </div>
             </FlipPage>
 
+            {Array.from({ length: BOOK_STUDY_FLUTTER_LEAF_COUNT }, (_, index) => (
+              <FlipPage key={`study-flutter-${index}`} className="book-flutter-page book-study-flutter-page">
+                <span className="book-flutter-folio">{String(BOOK_FLUTTER_LEAF_COUNT + index + 1).padStart(2, "0")}</span>
+              </FlipPage>
+            ))}
+
+            <FlipPage className="book-flutter-page book-study-page"><span aria-hidden="true" /></FlipPage>
+            <FlipPage className="book-flutter-page book-study-page"><span aria-hidden="true" /></FlipPage>
+
             <FlipPage className="book-back-page" hard>
               <span>鍛錬</span>
             </FlipPage>
           </HTMLFlipBook>
+          {bookStudyActive && studyResult && <BookStudy
+            deck={openedDeck}
+            initialResult={studyResult}
+            audioSettings={audioSettings}
+            exiting={bookStudyExiting}
+            onExitFadeComplete={() => {
+              setBookStudyActive(false);
+              setBookStudyExiting(false);
+              setBookStudyTransitioning(false);
+              setStudyResult(null);
+              setBookStudyNavigationLocked(false);
+            }}
+            onExit={async () => {
+            await api.exitStudy();
+            if (reduceMotion) {
+              flipBookRef.current?.pageFlip?.().turnToPage(BOOK_CONTENT_PAGE);
+              setBookStudyActive(false);
+              setBookStudyExiting(false);
+              setBookStudyTransitioning(false);
+              setStudyResult(null);
+              setBookStudyNavigationLocked(false);
+            } else {
+              // Put the expression/stage spread underneath first, then simply
+              // fade the learning layer away to reveal it.
+              flipBookRef.current?.pageFlip?.().turnToPage(BOOK_CONTENT_PAGE);
+              setBookStudyExiting(true);
+              setBookStudyTransitioning(true);
+            }
+            await onRefresh();
+          }} />}
         </div>
 
         {bookPanel !== "study" && <div
@@ -1987,6 +2107,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
                   const face = event.currentTarget.querySelector<HTMLElement>(".ebook-cover-face");
                   bookCoverBackgroundRef.current = face ? getComputedStyle(face).background : undefined;
                   clearFlutterTimer();
+                  clearStudyFlutterTimer();
                   flutteringRef.current = false;
                   flutterRetryRef.current = 0;
                   flutterStartedSessionRef.current = "";
@@ -1995,6 +2116,9 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
                   setBook3DReady(false);
                   setBookFlipReady(false);
                   setBookSettled(false);
+                  setBookStudyActive(false);
+                  setBookStudyExiting(false);
+                  setBookStudyTransitioning(false);
                   bookClosingRef.current = false;
                   setBookClosing(false);
                   setBookPanel("study");
@@ -2027,7 +2151,7 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
                         <span className="ebook-current-stage">{d.current_stage}단계</span>
                         <span className="ebook-current-range">{formatStudyRangeLabel(d.active_range, " - ")}</span>
                       </span>
-                      <span className="ebook-progress" aria-hidden="true"><i style={{ width: `${d.total_stage_count === 0 ? 0 : Math.min(100, (d.completed_stage_count / d.total_stage_count) * 100)}%` }} /></span>
+                      <span className="ebook-progress" aria-hidden="true"><i style={{ width: `${bookProgressPercent(d)}%` }} /></span>
                     </span>
                   </span>
                   <span className="ebook-page-edge ebook-page-edge-right" aria-hidden="true" />
@@ -2042,7 +2166,10 @@ function DeckList({ decks, onRefresh, onEdit, onStudy, onOpenedDeckChange, onReq
   </section>;
 }
 
-const MemoDeckList = memo(DeckList, (previous, next) => previous.decks === next.decks);
+const MemoDeckList = memo(DeckList, (previous, next) => (
+  previous.decks === next.decks
+  && previous.audioSettings === next.audioSettings
+));
 
 function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise<void> }) {
   const [text, setText] = useState("見据える\t내다보다 / 전망하다\n躊躇う\t망설이다");
@@ -2092,821 +2219,6 @@ function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise
     {message && <p className="success">{message}</p>}
     <div className="editor-footer"><button className="ghost" onClick={() => void exportDeck()}>백업하기</button></div>
   </section>;
-}
-
-function StudyView({ deckId, card, result, setCard, setResult, audioSettings, onExit }: {
-  deckId: string;
-  card: StudyCard | null;
-  result: SubmitResult | null;
-  setCard: (c: StudyCard | null) => void;
-  setResult: (r: SubmitResult | null) => void;
-  audioSettings: AudioSettings;
-  onExit: () => Promise<void>;
-}) {
-  const [answer, setAnswer] = useState("");
-  const [imeSegments, setImeSegments] = useState<JapaneseImeSegment[]>([]);
-  const [imeCaret, setImeCaret] = useState(0);
-  const [japaneseImeReady, setJapaneseImeReady] = useState(false);
-  const [pitchLevels, setPitchLevels] = useState<PitchSelection>([]);
-  const [pitchCursor, setPitchCursor] = useState(0);
-  const [inputWarning, setInputWarning] = useState<string | null>(null);
-  const [timerNow, setTimerNow] = useState(performance.now());
-  const [submittedPitch, setSubmittedPitch] = useState<PitchSelection | null>(null);
-  const [submittedPitchQuestion, setSubmittedPitchQuestion] = useState<PitchQuestion | null>(null);
-  const shownAt = useRef(performance.now());
-  const answerRef = useRef("");
-  const firstInputAt = useRef<number | null>(null);
-  const lastActivityAt = useRef<number | null>(null);
-  const interkeyGaps = useRef<number[]>([]);
-  const composing = useRef(false);
-  const compositionStartedAt = useRef<number | null>(null);
-  const compositionEndedAt = useRef<number | null>(null);
-  const imeCompositionMs = useRef(0);
-  const recallTimer = useRef<number | null>(null);
-  const completionTimer = useRef<number | null>(null);
-  const completionDeadlineAt = useRef<number | null>(null);
-  const timeoutSent = useRef(false);
-  const studyActivityStartedAt = useRef<number | null>(null);
-  const studyActivityMode = useRef<StudyMode | null>(card?.mode ?? null);
-  const pendingStudyActivity = useRef(new Map<StudyMode | "all", number>());
-  const inputRef = useRef<HTMLInputElement>(null);
-  const japaneseImeRef = useRef<JapaneseImeSession | null>(null);
-  const imeCaretRef = useRef(0);
-  const imeCandidateListRef = useRef<HTMLDivElement>(null);
-  const pitchButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const speechAudio = useRef<HTMLAudioElement | null>(null);
-  const pitchQuestion = result?.pitch ?? null;
-  const timerActive = activeCardTimerRuns(card, result);
-  const reduceMotion = useReducedMotion();
-  const usesJapaneseIme = card?.answer_language === "ja-JP";
-  const imePreedit = imeSegments.map((segment) => segment.text).join("");
-  const imeHasInternalCaret = imeSegments.some((segment) => segment.kind === "yomi" && segment.caretOffset != null);
-
-  const playAudio = (path: string) => {
-    const src = convertFileSrc(path);
-    const previous = speechAudio.current;
-    if (previous && previous.src === src && !previous.paused && !previous.ended) return previous;
-    previous?.pause();
-    const audio = new Audio(src);
-    speechAudio.current = audio;
-    audio.volume = audioSettings.volume;
-    audio.playbackRate = audioSettings.playback_rate;
-    void audio.play().catch(() => {
-      if (speechAudio.current === audio) setInputWarning("음성을 재생하지 못했습니다. 다시 눌러주세요.");
-    });
-    return audio;
-  };
-
-  useEffect(() => () => { speechAudio.current?.pause(); }, []);
-
-  const studyViewIsActive = () => document.visibilityState === "visible" && document.hasFocus();
-
-  const collectStudyActivity = (stop = false) => {
-    const now = performance.now();
-    if (studyActivityStartedAt.current != null) {
-      const elapsed = Math.max(0, now - studyActivityStartedAt.current);
-      const key = studyActivityMode.current ?? "all";
-      pendingStudyActivity.current.set(key, (pendingStudyActivity.current.get(key) ?? 0) + elapsed);
-    }
-    studyActivityStartedAt.current = !stop && studyViewIsActive() ? now : null;
-  };
-
-  const flushStudyActivity = async (stop = false) => {
-    collectStudyActivity(stop);
-    const pending = [...pendingStudyActivity.current.entries()];
-    pendingStudyActivity.current.clear();
-    await Promise.all(pending.map(async ([mode, duration]) => {
-      const durationMs = Math.round(duration);
-      if (durationMs <= 0) return;
-      try {
-        await api.recordStudyActivity(deckId, mode === "all" ? null : mode, durationMs);
-      } catch {
-        pendingStudyActivity.current.set(mode, (pendingStudyActivity.current.get(mode) ?? 0) + duration);
-      }
-    }));
-  };
-
-  useEffect(() => {
-    if (studyViewIsActive()) studyActivityStartedAt.current = performance.now();
-    const syncActiveState = () => {
-      if (studyViewIsActive()) {
-        if (studyActivityStartedAt.current == null) studyActivityStartedAt.current = performance.now();
-      } else {
-        void flushStudyActivity(true);
-      }
-    };
-    const interval = window.setInterval(() => void flushStudyActivity(false), 5_000);
-    window.addEventListener("focus", syncActiveState);
-    window.addEventListener("blur", syncActiveState);
-    document.addEventListener("visibilitychange", syncActiveState);
-    return () => {
-      window.clearInterval(interval);
-      window.removeEventListener("focus", syncActiveState);
-      window.removeEventListener("blur", syncActiveState);
-      document.removeEventListener("visibilitychange", syncActiveState);
-      void flushStudyActivity(true);
-    };
-  }, []);
-
-  useEffect(() => {
-    const nextMode = card?.mode ?? studyActivityMode.current;
-    if (nextMode === studyActivityMode.current) return;
-    collectStudyActivity(false);
-    studyActivityMode.current = nextMode;
-  }, [card?.mode]);
-
-  const exitStudy = async () => {
-    await flushStudyActivity(true);
-    await onExit();
-  };
-
-  const setImeCaretPosition = (next: number) => {
-    const bounded = Math.max(0, Math.min(next, answerRef.current.length));
-    imeCaretRef.current = bounded;
-    setImeCaret(bounded);
-  };
-
-  const beginJapaneseComposition = () => {
-    if (composing.current) return;
-    composing.current = true;
-    compositionStartedAt.current = performance.now();
-    if (completionTimer.current) window.clearTimeout(completionTimer.current);
-    completionTimer.current = null;
-    completionDeadlineAt.current = null;
-  };
-
-  const endJapaneseComposition = () => {
-    if (!composing.current) return;
-    const now = performance.now();
-    composing.current = false;
-    if (compositionStartedAt.current != null) imeCompositionMs.current += now - compositionStartedAt.current;
-    compositionStartedAt.current = null;
-    compositionEndedAt.current = now;
-    lastActivityAt.current = now;
-  };
-
-  const insertJapaneseText = (text: string) => {
-    if (!text) return;
-    const current = answerRef.current;
-    const caret = imeCaretRef.current;
-    const next = `${current.slice(0, caret)}${text}${current.slice(caret)}`;
-    handleInput(next, false);
-    setImeCaretPosition(caret + text.length);
-  };
-
-  const previousTextIndex = (value: string, index: number) => {
-    let next = Math.max(0, index - 1);
-    if (next > 0) {
-      const code = value.charCodeAt(next);
-      const previous = value.charCodeAt(next - 1);
-      if (code >= 0xdc00 && code <= 0xdfff && previous >= 0xd800 && previous <= 0xdbff) next -= 1;
-    }
-    return next;
-  };
-
-  const nextTextIndex = (value: string, index: number) => {
-    let next = Math.min(value.length, index + 1);
-    if (index < value.length - 1) {
-      const code = value.charCodeAt(index);
-      const following = value.charCodeAt(index + 1);
-      if (code >= 0xd800 && code <= 0xdbff && following >= 0xdc00 && following <= 0xdfff) next += 1;
-    }
-    return next;
-  };
-
-  const handleJapaneseHostKey = (name: string) => {
-    const current = answerRef.current;
-    const caret = imeCaretRef.current;
-    if (name === "Backspace") {
-      if (caret <= 0) return;
-      const start = previousTextIndex(current, caret);
-      const next = `${current.slice(0, start)}${current.slice(caret)}`;
-      setImeCaretPosition(start);
-      handleInput(next, false);
-    } else if (name === "Delete") {
-      if (caret >= current.length) return;
-      const end = nextTextIndex(current, caret);
-      handleInput(`${current.slice(0, caret)}${current.slice(end)}`, false);
-    } else if (name === "ArrowLeft") {
-      setImeCaretPosition(previousTextIndex(current, caret));
-    } else if (name === "ArrowRight") {
-      setImeCaretPosition(nextTextIndex(current, caret));
-    } else if (name === "Home") {
-      setImeCaretPosition(0);
-    } else if (name === "End") {
-      setImeCaretPosition(current.length);
-    }
-  };
-
-  const moveJapaneseCaretFromPointer = (clientX: number, element: HTMLElement) => {
-    if (imeSegments.length > 0) return;
-    const value = answerRef.current;
-    if (!value) {
-      setImeCaretPosition(0);
-      return;
-    }
-
-    const style = getComputedStyle(element);
-    const canvas = document.createElement("canvas");
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-
-    const rect = element.getBoundingClientRect();
-    const totalWidth = context.measureText(value).width;
-    const startX = rect.left + (rect.width - totalWidth) / 2;
-    const target = Math.max(0, Math.min(totalWidth, clientX - startX));
-    let bestIndex = 0;
-    let bestDistance = Math.abs(target);
-    let index = 0;
-    while (index < value.length) {
-      index = nextTextIndex(value, index);
-      const distance = Math.abs(context.measureText(value.slice(0, index)).width - target);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestIndex = index;
-      }
-    }
-    setImeCaretPosition(bestIndex);
-  };
-
-  const recordJapaneseKeyActivity = (event: ReturnType<typeof japaneseImeKeyTap>) => {
-    if (!japaneseImeKeyStartsInput(event)) return;
-    const now = performance.now();
-    if (firstInputAt.current == null) {
-      firstInputAt.current = now;
-      if (recallTimer.current) window.clearTimeout(recallTimer.current);
-    }
-    if (lastActivityAt.current != null) interkeyGaps.current.push(Math.round(now - lastActivityAt.current));
-    lastActivityAt.current = now;
-  };
-
-  useEffect(() => {
-    if (!timerActive) return;
-    japaneseImeRef.current?.reset();
-    japaneseImeRef.current?.setActive(false);
-    japaneseImeRef.current = null;
-    shownAt.current = performance.now();
-    answerRef.current = "";
-    firstInputAt.current = null;
-    lastActivityAt.current = null;
-    interkeyGaps.current = [];
-    composing.current = false;
-    compositionStartedAt.current = null;
-    compositionEndedAt.current = null;
-    imeCompositionMs.current = 0;
-    timeoutSent.current = false;
-    setAnswer("");
-    setImeSegments([]);
-    imeCaretRef.current = 0;
-    setImeCaret(0);
-    setJapaneseImeReady(false);
-    setSubmittedPitch(null);
-    setSubmittedPitchQuestion(null);
-    setInputWarning(null);
-    setTimerNow(performance.now());
-    let current = true;
-    let nativeModeRetry: number | null = null;
-    const frame = requestAnimationFrame(() => {
-      if (!card) return;
-      if (card.answer_language === "ja-JP") {
-        void loadJapaneseImeRuntime()
-          .then((runtime) => {
-            if (!current) return;
-            const session = runtime.createSession({
-              show: (segments) => {
-                if (!current) return;
-                beginJapaneseComposition();
-                setImeSegments(segments);
-              },
-              hide: () => {
-                if (!current) return;
-                setImeSegments([]);
-                endJapaneseComposition();
-              },
-              commit: (text) => {
-                if (!current) return;
-                // Hechima's commit() clears its internal composition but does not
-                // guarantee a following hide() callback. Clear TANREN's mirrored
-                // preedit state here before inserting the committed text so the
-                // same surface text is never rendered twice.
-                setImeSegments([]);
-                endJapaneseComposition();
-                insertJapaneseText(text);
-              },
-              hostKey: (name) => {
-                if (!current) return;
-                handleJapaneseHostKey(name);
-              },
-            });
-            if (!current) {
-              session.reset();
-              session.setActive(false);
-              return;
-            }
-            session.setActive(true);
-            japaneseImeRef.current = session;
-            setJapaneseImeReady(true);
-            requestAnimationFrame(() => inputRef.current?.focus());
-          })
-          .catch(() => {
-            if (current) setInputWarning("내장 일본어 입력기를 불러오지 못했어요.");
-          });
-        return;
-      }
-
-      inputRef.current?.focus();
-      void api.activateInputProfile(card.answer_language)
-        .then((warning) => {
-          if (!current) return;
-          setInputWarning(warning);
-          nativeModeRetry = window.setTimeout(() => {
-            void api.activateInputProfile(card.answer_language)
-              .then((retryWarning) => { if (current) setInputWarning(retryWarning); })
-              .catch(() => { if (current) setInputWarning("입력 언어를 자동으로 바꾸지 못했어요."); });
-          }, 100);
-        })
-        .catch(() => {
-          if (current) setInputWarning("입력 언어를 자동으로 바꾸지 못했어요.");
-        });
-    });
-    return () => {
-      current = false;
-      cancelAnimationFrame(frame);
-      if (nativeModeRetry != null) window.clearTimeout(nativeModeRetry);
-      japaneseImeRef.current?.reset();
-      japaneseImeRef.current?.setActive(false);
-      japaneseImeRef.current = null;
-    };
-  }, [card?.variant_id, card?.answer_language, timerActive]);
-
-  useEffect(() => {
-    if (!timerActive || !card) return;
-    let frame = 0;
-    let lastPaint = 0;
-    const tick = (now: number) => {
-      if (now - lastPaint >= 48) {
-        setTimerNow(now);
-        lastPaint = now;
-      }
-      frame = requestAnimationFrame(tick);
-    };
-    frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
-  }, [card?.variant_id, timerActive]);
-
-  useEffect(() => {
-    if (!pitchQuestion) {
-      setPitchLevels([]);
-      setPitchCursor(0);
-      pitchButtonRefs.current = [];
-      return;
-    }
-    setPitchLevels(emptyPitchSelection(pitchQuestion.morae.length));
-    setPitchCursor(0);
-    pitchButtonRefs.current = [];
-    const frame = requestAnimationFrame(() => pitchButtonRefs.current[0]?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [card?.variant_id, pitchQuestion?.reading, pitchQuestion?.morae.join("|")]);
-
-  useEffect(() => {
-    if (recallTimer.current) window.clearTimeout(recallTimer.current);
-    if (completionTimer.current) window.clearTimeout(completionTimer.current);
-    if (timerActive && card) {
-      recallTimer.current = window.setTimeout(async () => {
-        if (recallHasTimedOut(firstInputAt.current) && !timeoutSent.current) {
-          timeoutSent.current = true;
-          advance(await api.timeoutCurrent(card.variant_id, "recall", "", card.recall_timeout_ms, 0));
-        }
-      }, card.recall_timeout_ms);
-    }
-    return () => {
-      if (recallTimer.current) window.clearTimeout(recallTimer.current);
-      if (completionTimer.current) window.clearTimeout(completionTimer.current);
-    };
-  }, [card?.variant_id, timerActive]);
-
-  useEffect(() => {
-    if (!audioSettings.auto_play || !timerActive || !card || card.mode !== "listening") return;
-    if (card.audio_path) {
-      playAudio(card.audio_path);
-    }
-  }, [card?.variant_id, timerActive, audioSettings.auto_play, audioSettings.volume, audioSettings.playback_rate]);
-
-  const advance = (r: SubmitResult) => {
-    setResult(r);
-    setCard(cardAfterResult(card, r));
-  };
-
-  const submit = async () => {
-    if (!card) return;
-    if (audioSettings.auto_play && card.audio_path && shouldAutoPlayAfterWrittenAnswer(card.mode)) {
-      playAudio(card.audio_path);
-    }
-    const now = performance.now();
-    const recall = firstInputAt.current == null ? Math.round(now - shownAt.current) : Math.round(firstInputAt.current - shownAt.current);
-    const typing = firstInputAt.current == null ? 0 : Math.round(now - firstInputAt.current);
-    advance(await api.submitAnswer(
-      card.variant_id,
-      answer,
-      recall,
-      typing,
-      interkeyGaps.current,
-      Math.round(imeCompositionMs.current),
-    ));
-  };
-
-  const handleInput = (value: string, recordKeyActivity = true) => {
-    const now = performance.now();
-    if (!isMeaningfulInput(value) && completionTimer.current) {
-      window.clearTimeout(completionTimer.current);
-      completionTimer.current = null;
-      completionDeadlineAt.current = null;
-    }
-    const nextFirstInputAt = firstMeaningfulInputAt(firstInputAt.current, value, now);
-    if (firstInputAt.current == null && nextFirstInputAt != null) {
-      firstInputAt.current = nextFirstInputAt;
-      if (recallTimer.current) window.clearTimeout(recallTimer.current);
-    }
-    if (isMeaningfulInput(value) && !composing.current) {
-      if (recordKeyActivity && lastActivityAt.current != null) interkeyGaps.current.push(Math.round(now - lastActivityAt.current));
-      lastActivityAt.current = now;
-      scheduleCompletionTimeout(value);
-    }
-    answerRef.current = value;
-    setAnswer(value);
-  };
-
-  const scheduleCompletionTimeout = (partialAnswer: string) => {
-    if (!card || !timerActive) return;
-    const delay = completionDelayMs(card.completion_idle_ms, composing.current, partialAnswer, compositionEndedAt.current, performance.now());
-    if (delay == null) return;
-    if (completionTimer.current) window.clearTimeout(completionTimer.current);
-    const variantId = card.variant_id;
-    const scheduledAt = performance.now();
-    completionDeadlineAt.current = scheduledAt + delay;
-    completionTimer.current = window.setTimeout(async () => {
-      if (composing.current || timeoutSent.current) return;
-      timeoutSent.current = true;
-      completionDeadlineAt.current = null;
-      const now = performance.now();
-      const typing = firstInputAt.current == null ? 0 : Math.round(now - firstInputAt.current);
-      advance(await api.timeoutCurrent(variantId, "completion", partialAnswer, Math.round(now - shownAt.current), typing));
-    }, delay);
-  };
-
-  const nextFromReview = async () => {
-    await flushStudyActivity(true);
-    try {
-      const next = await api.continueReview();
-      advance(next);
-      if (next.status !== "stage_complete" && studyViewIsActive()) {
-        studyActivityStartedAt.current = performance.now();
-      }
-    } catch (error) {
-      if (studyViewIsActive()) studyActivityStartedAt.current = performance.now();
-      throw error;
-    }
-  };
-  const review = result?.status === "review" || result?.status === "fail";
-  const ambiguous = result?.status === "ambiguous";
-
-  useEffect(() => {
-    if (!card || !review || pitchQuestion) return;
-    const frame = requestAnimationFrame(() => inputRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [card?.variant_id, review, pitchQuestion]);
-
-  const submitPitchContour = async () => {
-    if (!card) return;
-    const contour = pitchSubmission(pitchLevels);
-    if (!contour) return;
-    setSubmittedPitch([...pitchLevels]);
-    setSubmittedPitchQuestion(pitchQuestion);
-    advance(await api.submitPitch(card.variant_id, contour));
-  };
-
-  const focusPitch = (index: number) => {
-    const bounded = Math.max(0, Math.min(index, pitchLevels.length - 1));
-    setPitchCursor(bounded);
-    requestAnimationFrame(() => pitchButtonRefs.current[bounded]?.focus());
-  };
-
-  const choosePitch = (index: number, level: PitchLevel, advanceCursor = false) => {
-    setPitchLevels((current) => setPitchLevel(current, index, level));
-    focusPitch(advanceCursor ? Math.min(index + 1, pitchLevels.length - 1) : index);
-  };
-
-  const pitchKeydown = async (e: KeyboardEvent<HTMLButtonElement>, index: number) => {
-    if (e.key === "ArrowLeft") {
-      e.preventDefault();
-      focusPitch(index - 1);
-    } else if (e.key === "ArrowRight") {
-      e.preventDefault();
-      focusPitch(index + 1);
-    } else if (e.key === "ArrowUp" || e.key.toLowerCase() === "h" || e.key === "1") {
-      e.preventDefault();
-      choosePitch(index, 1, true);
-    } else if (e.key === "ArrowDown" || e.key.toLowerCase() === "l" || e.key === "0") {
-      e.preventDefault();
-      choosePitch(index, 0, true);
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      await submitPitchContour();
-    }
-  };
-
-  const playCachedAnswer = () => {
-    if (!card?.audio_path) return;
-    playAudio(card.audio_path);
-  };
-
-  const keydown = async (e: KeyboardEvent<HTMLInputElement>) => {
-    if (!card) return;
-    if (usesJapaneseIme) {
-      const session = japaneseImeRef.current;
-      if (!session || !japaneseImeReady) {
-        e.preventDefault();
-        return;
-      }
-      const tap = japaneseImeKeyTap(e.nativeEvent);
-      recordJapaneseKeyActivity(tap);
-      if (session.feed(tap)) {
-        e.preventDefault();
-        return;
-      }
-      if (!tap.ctrlKey && !tap.altKey && !tap.metaKey) {
-        if (["Backspace", "Delete", "ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
-          e.preventDefault();
-          handleJapaneseHostKey(e.key);
-          return;
-        }
-        if (e.key === " ") {
-          e.preventDefault();
-          insertJapaneseText(e.shiftKey ? " " : "　");
-          return;
-        }
-        if (tap.key.length === 1) {
-          e.preventDefault();
-          insertJapaneseText(tap.key);
-          return;
-        }
-      }
-    }
-    if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
-    e.preventDefault();
-    const action = enterAction(result);
-    if (action === "review") {
-      await nextFromReview();
-    } else if (action === "submit") {
-      await submit();
-    }
-  };
-
-  const keyup = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (!usesJapaneseIme || !japaneseImeReady) return;
-    if (japaneseImeRef.current?.feedUp(japaneseImeKeyTap(e.nativeEvent))) e.preventDefault();
-  };
-
-  const focusedImeSegment = imeSegments.find((segment) => segment.kind === "focus" && segment.candidates?.length);
-  const imeCandidates = focusedImeSegment?.candidates ?? [];
-  const imeCandidateIndex = focusedImeSegment?.candidateIndex ?? 0;
-  const selectJapaneseCandidate = (index: number) => {
-    if (!japaneseImeRef.current?.selectCandidate(index)) return;
-    requestAnimationFrame(() => inputRef.current?.focus());
-  };
-
-  useEffect(() => {
-    if (!imeCandidates.length) return;
-    const selected = imeCandidateListRef.current?.querySelector<HTMLElement>(".ime-candidate.is-selected");
-    selected?.scrollIntoView({ block: "nearest" });
-  }, [imeCandidateIndex, imeCandidates.length]);
-
-  const submittedPitchCorrect = submittedPitch && submittedPitchQuestion
-    ? submittedPitchQuestion.allowed_patterns.some((pattern) => pattern.length === submittedPitch.length && pattern.every((level, index) => level === submittedPitch[index]))
-    : null;
-  const feedbackTone = ambiguous
-    ? "check"
-    : review
-      ? ((submittedPitchCorrect ?? !result?.failure_type) ? "correct" : "incorrect")
-      : pitchQuestion
-        ? "correct"
-        : "neutral";
-  const feedbackLabel = feedbackTone === "correct" ? (pitchQuestion ? "✓ 뜻 정답" : "✓ 정답") : feedbackTone === "incorrect" ? "× 다시 확인" : feedbackTone === "check" ? "? 확인" : null;
-  const recallTotalMs = card?.recall_timeout_ms ?? 0;
-  const recallElapsedMs = card ? Math.max(0, (firstInputAt.current ?? timerNow) - shownAt.current) : 0;
-  const recallRemainingMs = timerActive && firstInputAt.current == null ? Math.max(0, recallTotalMs - recallElapsedMs) : 0;
-  const recallRatio = recallTotalMs > 0 ? Math.max(0, Math.min(1, recallRemainingMs / recallTotalMs)) : 0;
-  const inputTotalMs = card?.completion_idle_ms ?? 0;
-  const inputRemainingMs = timerActive && completionDeadlineAt.current != null ? Math.max(0, completionDeadlineAt.current - timerNow) : inputTotalMs;
-  const inputRatio = inputTotalMs > 0 && completionDeadlineAt.current != null ? Math.max(0, Math.min(1, inputRemainingMs / inputTotalMs)) : 0;
-  const expectedPitch = submittedPitchQuestion?.allowed_patterns[0] ?? null;
-
-  if (!card) {
-    return <section className="study">
-      <div className="study-top"><div className="study-brandmark">TANREN</div><div>단계 완료</div><button className="ghost" onClick={() => void exitStudy()}>나가기</button></div>
-      <div className="study-center complete-center">
-        <motion.div className="completion-card" initial={reduceMotion ? false : { opacity: 0, y: 18, scale: .985 }} animate={{ opacity: 1, y: 0, scale: 1 }}>
-          <span className="completion-kicker">단계 완료</span>
-          <div className="completion-title">이번 단계를 끝냈어요.</div>
-          <button autoFocus onClick={() => void exitStudy()}>책장으로</button>
-        </motion.div>
-      </div>
-    </section>;
-  }
-
-  return <section className={`study feedback-${feedbackTone}`}>
-    <div className="study-top">
-      <div className="mode"><strong>TANREN</strong><span>{card.mode.toUpperCase()} / {card.answer_language}</span></div>
-      <div className="study-stage">{card.stage.toLocaleString("ko-KR")}단계 · {formatStudyRangeLabel(card.range_label)}</div>
-      <div className="study-top-right"><span className="remaining"><strong>{card.total - card.remaining}</strong><i>/</i>{card.total}</span><button className="ghost" onClick={() => void exitStudy()}>ESC</button></div>
-    </div>
-    <div className="progress"><div style={{ width: `${100 * (1 - card.remaining / Math.max(card.total, 1))}%` }} /></div>
-    {(inputWarning ?? card.input_warning) && <div className="study-warning">{inputWarning ?? card.input_warning}</div>}
-    <div className="study-center">
-      <div className="study-card-viewport">
-        <AnimatePresence initial={false} mode="sync">
-          <motion.div
-            className={`study-card tone-${feedbackTone}`}
-            key={card.variant_id}
-            initial={reduceMotion ? false : { x: "68vw", opacity: 0, scale: .92, rotate: 3.5 }}
-            animate={{ x: 0, opacity: 1, scale: 1, rotate: 0 }}
-            exit={reduceMotion ? { opacity: 0 } : { x: "-74vw", opacity: 0, scale: .9, rotate: -4.5 }}
-            transition={reduceMotion ? { duration: .01 } : { duration: .34, ease: [0.22, 1, 0.36, 1] }}
-          >
-            <div className="study-card-head">
-              <span className="card-sequence">{String(card.total - card.remaining + 1).padStart(2, "0")}</span>
-              {feedbackLabel && <span className={`feedback-state ${feedbackTone}`}>{feedbackLabel}</span>}
-              <div className="timer-rack" aria-label="answer timers">
-                <div className={`timer-unit ${firstInputAt.current == null && timerActive ? "active" : "locked"}`}>
-                  <div className="timer-copy"><span>회상</span><strong>{firstInputAt.current == null && timerActive ? `${(recallRemainingMs / 1000).toFixed(1)}s` : `${(recallElapsedMs / 1000).toFixed(2)}s`}</strong></div>
-                  <div className="timer-track"><i style={{ transform: `scaleX(${firstInputAt.current == null ? recallRatio : 0})` }} /></div>
-                </div>
-                <div className={`timer-unit ${completionDeadlineAt.current != null && timerActive ? "active" : "waiting"}`}>
-                  <div className="timer-copy"><span>입력</span><strong>{inputTotalMs <= 0 ? "꺼짐" : completionDeadlineAt.current != null && timerActive ? `${(inputRemainingMs / 1000).toFixed(1)}s` : "—"}</strong></div>
-                  <div className="timer-track"><i style={{ transform: `scaleX(${inputRatio})` }} /></div>
-                </div>
-              </div>
-            </div>
-
-            <div className={card.mode === "listening" ? "question listening-question" : "question"}>{card.mode === "listening" ? <><span className="audio-orb" aria-hidden="true">▶</span><span>듣고 답을 입력해주세요</span></> : card.question}</div>
-
-            {pitchQuestion && <div className="pitch-panel">
-              <div className="pitch-panel-head"><span>PITCH</span><small>{pitchQuestion.confidence} · {pitchQuestion.gate_enabled ? "채점" : "참고"}</small></div>
-              <PitchTrace morae={pitchQuestion.morae} levels={pitchLevels} tone="neutral" />
-              <div className="pitch-contour" role="group" aria-label="mora pitch contour">
-                {pitchQuestion.morae.map((mora, index) => {
-                  const level = pitchLevels[index] ?? null;
-                  return <button
-                    key={`${mora}-${index}`}
-                    ref={(element) => { pitchButtonRefs.current[index] = element; }}
-                    type="button"
-                    className={`mora-toggle ${level === 1 ? "is-high" : level === 0 ? "is-low" : "is-unset"} ${pitchCursor === index ? "is-current" : ""}`}
-                    onFocus={() => setPitchCursor(index)}
-                    onClick={() => choosePitch(index, level === 1 ? 0 : 1)}
-                    onKeyDown={(event) => void pitchKeydown(event, index)}
-                    aria-label={`${mora}: ${level === 1 ? "HIGH" : level === 0 ? "LOW" : "unset"}`}
-                  >
-                    <span className="mora-label">{mora}</span>
-                    <span className="pitch-level">{level === 1 ? "HIGH" : level === 0 ? "LOW" : "SET"}</span>
-                  </button>;
-                })}
-              </div>
-              <div className="pitch-footer"><p>↑/↓ H/L · ←/→ 이동</p><button className="pitch-submit" type="button" disabled={!pitchSubmission(pitchLevels)} onClick={() => void submitPitchContour()}>Enter ↵</button></div>
-            </div>}
-
-            {review && submittedPitch && submittedPitchQuestion && expectedPitch && <motion.div className="pitch-review" initial={reduceMotion ? false : { opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
-              <div><span>정답</span><PitchTrace morae={submittedPitchQuestion.morae} levels={expectedPitch} tone="correct" /></div>
-              <div><span>내 답</span><PitchTrace morae={submittedPitchQuestion.morae} levels={submittedPitch} tone={submittedPitchCorrect ? "correct" : "incorrect"} /></div>
-            </motion.div>}
-
-            {review && <motion.div className={`review-card ${feedbackTone}`} initial={reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><span className="feedback-label">정답</span><strong>{result?.canonical_answer}</strong>{result?.reading && <span>{result.reading}</span>}<p>{result?.message}</p>{card.audio_path && <button className="compact-button" type="button" onClick={playCachedAnswer}>▶ 정답 듣기</button>}</motion.div>}
-            {ambiguous && <motion.div className="review-card ambiguous-card" initial={reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}><span className="feedback-label">확인</span><p>이 답을 정답으로 기억할까요?</p><div className="actions"><button onClick={async () => advance(await api.adjudicate(card.variant_id, true))}>정답이에요</button><button className="secondary" onClick={async () => advance(await api.adjudicate(card.variant_id, false))}>오답이에요</button></div></motion.div>}
-
-            {!pitchQuestion && (usesJapaneseIme ? <div
-              className={`answer-ime-shell ${japaneseImeReady ? "is-ready" : "is-loading"} ${review ? "is-review" : ""}`}
-              onMouseDown={(event) => {
-                event.preventDefault();
-                moveJapaneseCaretFromPointer(event.clientX, event.currentTarget);
-                inputRef.current?.focus();
-              }}
-            >
-              <div className="answer-ime-display" aria-live="polite">
-                {!answer && !imePreedit && <span className="answer-ime-placeholder">{review ? "Enter로 다음 문제" : japaneseImeReady ? "답을 입력해주세요" : "일본어 입력 준비 중..."}</span>}
-                {answer.slice(0, imeCaret)}
-                {imeSegments.map((segment, index) => {
-                  const chars = Array.from(segment.text);
-                  const caretOffset = segment.kind === "yomi" && segment.caretOffset != null
-                    ? Math.max(0, Math.min(segment.caretOffset, chars.length))
-                    : null;
-                  return <span
-                    key={`${segment.kind}-${segment.text}-${index}`}
-                    className={`answer-ime-preedit ${segment.kind}`}
-                  >{caretOffset == null
-                    ? segment.text
-                    : <>{chars.slice(0, caretOffset).join("")}<span className="answer-ime-caret" aria-hidden="true" />{chars.slice(caretOffset).join("")}</>}</span>;
-                })}
-                {!imeHasInternalCaret && <span className="answer-ime-caret" aria-hidden="true" />}
-                {answer.slice(imeCaret)}
-              </div>
-              <input
-                ref={inputRef}
-                className="answer-ime-capture"
-                value=""
-                onChange={() => undefined}
-                onKeyDown={keydown}
-                onKeyUp={keyup}
-                onBeforeInput={(event) => event.preventDefault()}
-                onPaste={(e) => {
-                  e.preventDefault();
-                  const text = e.clipboardData.getData("text");
-                  if (!text) return;
-                  japaneseImeRef.current?.reset();
-                  setImeSegments([]);
-                  endJapaneseComposition();
-                  insertJapaneseText(text);
-                }}
-                disabled={ambiguous}
-                aria-label="답 입력"
-                aria-busy={!japaneseImeReady}
-                autoComplete="off"
-                autoCorrect="off"
-                autoCapitalize="off"
-                spellCheck={false}
-              />
-              {!review && !ambiguous && imeCandidates.length > 0 && <div ref={imeCandidateListRef} className="ime-candidate-list" role="listbox" aria-label="일본어 변환 후보">
-                {imeCandidates.map((candidate, index) => <button
-                  key={`${candidate}-${index}`}
-                  type="button"
-                  role="option"
-                  aria-selected={index === imeCandidateIndex}
-                  className={`ime-candidate ${index === imeCandidateIndex ? "is-selected" : ""}`}
-                  onMouseDown={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                  }}
-                  onClick={() => selectJapaneseCandidate(index)}
-                ><span>{index < 9 ? index + 1 : ""}</span><strong>{candidate}</strong></button>)}
-              </div>}
-            </div> : <input
-              ref={inputRef}
-              className="answer-input"
-              value={answer}
-              onChange={(e) => handleInput(e.target.value)}
-              onKeyDown={keydown}
-              onCompositionStart={() => {
-                composing.current = true;
-                compositionStartedAt.current = performance.now();
-                if (completionTimer.current) window.clearTimeout(completionTimer.current);
-                completionTimer.current = null;
-                completionDeadlineAt.current = null;
-              }}
-              onCompositionEnd={(e) => {
-                const now = performance.now();
-                composing.current = false;
-                if (compositionStartedAt.current != null) imeCompositionMs.current += now - compositionStartedAt.current;
-                compositionStartedAt.current = null;
-                compositionEndedAt.current = now;
-                lastActivityAt.current = now;
-                scheduleCompletionTimeout(e.currentTarget.value);
-              }}
-              placeholder={review ? "Enter로 다음 문제" : "답을 입력해주세요"}
-              disabled={ambiguous}
-              autoComplete="off"
-              autoCorrect="off"
-              autoCapitalize="off"
-              spellCheck={false}
-            />)}
-            {!review && !ambiguous && !pitchQuestion && <div className="study-hint"><span><kbd>↵</kbd> 확인</span><span><kbd>빈 ↵</kbd> 모르면 넘어가기</span></div>}
-            {review && <div className="review-next"><kbd>ENTER</kbd><span>다음 문제</span><b>→</b></div>}
-          </motion.div>
-        </AnimatePresence>
-      </div>
-    </div>
-  </section>;
-}
-
-function PitchTrace({ morae, levels, tone }: { morae: string[]; levels: Array<number | null>; tone: "neutral" | "correct" | "incorrect" }) {
-  const count = Math.max(morae.length, 1);
-  const width = Math.max(220, count * 78);
-  const step = width / count;
-  const points = morae.map((_, index) => {
-    const level = levels[index];
-    const x = step * index + step / 2;
-    const y = level === 1 ? 25 : level === 0 ? 67 : 46;
-    return { x, y, level };
-  });
-  return <div className={`pitch-trace ${tone}`}>
-    <svg viewBox={`0 0 ${width} 112`} role="img" aria-label={`pitch contour ${morae.join(" ")}`}>
-      <line className="pitch-guide high" x1="0" y1="25" x2={width} y2="25" />
-      <line className="pitch-guide low" x1="0" y1="67" x2={width} y2="67" />
-      {points.length > 1 && <polyline className="pitch-line" points={points.map((point) => `${point.x},${point.y}`).join(" ")} />}
-      {points.map((point, index) => <g key={`${morae[index]}-${index}`}>
-        <circle className={point.level == null ? "pitch-node unset" : "pitch-node"} cx={point.x} cy={point.y} r="6" />
-        <text className="pitch-mora" x={point.x} y="104" textAnchor="middle">{morae[index]}</text>
-      </g>)}
-    </svg>
-  </div>;
 }
 
 const numberFormat = new Intl.NumberFormat("ko-KR");

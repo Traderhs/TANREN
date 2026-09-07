@@ -51,6 +51,7 @@ export interface StudyCard {
   entry_id: string;
   variant_id: string;
   stage: number;
+  active_duration_ms: number;
   mode: StudyMode;
   question: string;
   answer_language: string;
@@ -160,7 +161,6 @@ export interface StorageSettings {
 }
 
 export interface AudioSettings {
-  auto_play: boolean;
   volume: number;
   playback_rate: number;
 }

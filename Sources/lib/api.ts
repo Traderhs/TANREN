@@ -52,7 +52,6 @@ export const api = {
   setStorageDirectory: (path: string | null) => invoke<StorageSettings>("set_storage_directory", { path }),
   audioSettings: () => invoke<AudioSettings>("audio_settings"),
   setAudioSettings: (settings: AudioSettings) => invoke<AudioSettings>("set_audio_settings", {
-    autoPlay: settings.auto_play,
     volume: settings.volume,
     playbackRate: settings.playback_rate,
   }),
