@@ -153,6 +153,7 @@ pub struct StudyCard {
     pub entry_id: String,
     pub variant_id: String,
     pub stage: u32,
+    pub active_duration_ms: u64,
     pub mode: StudyMode,
     pub question: String,
     pub answer_language: String,

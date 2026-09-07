@@ -20,6 +20,7 @@ pub enum PendingState {
         score: Option<f64>,
     },
     Pitch { variant: VariantKey, question: PitchQuestion },
+    PitchCorrection { variant: VariantKey, question: PitchQuestion, failure: String },
 }
 
 pub fn study_ranges(deck_size: usize, increment: usize, checkpoint: usize) -> Vec<StudyRange> {
@@ -232,7 +233,8 @@ impl StudySession {
         let pending_entry_id = match self.pending.as_ref() {
             Some(PendingState::Review { variant, .. })
             | Some(PendingState::Ambiguous { variant, .. })
-            | Some(PendingState::Pitch { variant, .. }) => Some(variant.entry_id.as_str()),
+            | Some(PendingState::Pitch { variant, .. })
+            | Some(PendingState::PitchCorrection { variant, .. }) => Some(variant.entry_id.as_str()),
             None => None,
         };
         if pending_entry_id.is_some_and(|entry_id| !active_ids.contains(entry_id)) {
@@ -289,7 +291,8 @@ impl StudySession {
         let pending_matches = match self.pending.as_ref() {
             Some(PendingState::Review { variant, .. })
             | Some(PendingState::Ambiguous { variant, .. })
-            | Some(PendingState::Pitch { variant, .. }) => variant.entry_id == entry_id,
+            | Some(PendingState::Pitch { variant, .. })
+            | Some(PendingState::PitchCorrection { variant, .. }) => variant.entry_id == entry_id,
             None => false,
         };
         if pending_matches {

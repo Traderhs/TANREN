@@ -49,7 +49,6 @@ struct AppState {
 }
 
 const SEMANTIC_STORAGE_SETTING: &str = "semantic_storage_dir";
-const AUDIO_AUTO_PLAY_SETTING: &str = "audio_auto_play";
 const AUDIO_VOLUME_SETTING: &str = "audio_volume";
 const AUDIO_PLAYBACK_RATE_SETTING: &str = "audio_playback_rate";
 
@@ -63,7 +62,6 @@ struct StorageSettings {
 
 #[derive(Serialize)]
 struct AudioSettings {
-    auto_play: bool,
     volume: f64,
     playback_rate: f64,
 }
@@ -222,6 +220,14 @@ fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) 
                 deck.increment_size, deck.checkpoint_size, random(),
             ).ok_or("이 단계는 지금 시작할 수 없어요.")?
         };
+        if let Some(variant) = match session.pending.as_ref() {
+            Some(PendingState::Pitch { variant, .. }) | Some(PendingState::PitchCorrection { variant, .. }) => Some(variant.clone()),
+            _ => None,
+        } {
+            state.db.discard_pending_pitch_attempt(&session.deck_id, session.stage, &variant.entry_id, variant.mode)?;
+            session.recover_interrupted_card();
+            state.db.save_session(&session)?;
+        }
         session.sync_entries(&entries, &deck.enabled_modes);
         engine.session = Some(session);
         let mut input = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요.")?;
@@ -302,7 +308,7 @@ fn submit_answer(
             state.db.save_session(session)?;
             Ok(SubmitResult {
                 status: SubmitStatus::Ambiguous,
-                message: Some("이 답은 직접 확인이 필요해요.".into()),
+                message: Some("이 답은 직접 판정이 필요해요.".into()),
                 failure_type: None,
                 canonical_answer: Some(entry.meanings.join(" / ")),
                 reading: entry.reading,
@@ -410,14 +416,29 @@ fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
     let pending = session.pending.clone().ok_or("no pitch question is pending")?;
-    let PendingState::Pitch { variant, question } = pending else {
-        return Err("current state is not pitch grading".into());
+    let (variant, question, correction_failure) = match pending {
+        PendingState::Pitch { variant, question } => (variant, question, None),
+        PendingState::PitchCorrection { variant, question, failure } => (variant, question, Some(failure)),
+        _ => return Err("current state is not pitch grading".into()),
     };
     if variant.id() != variant_id {
         return Err("stale pitch submission".into());
     }
     let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
     let (correct, failed_gate) = grade_pitch_contour(&question, &patterns);
+
+    if let Some(failure) = correction_failure {
+        session.resolve_current(&variant, false)?;
+        let result = review_result(
+            &entry,
+            Some(&failure),
+            "오답이에요. 방금 피치는 연습용이며 피치 정확도에 포함되지 않아요.",
+        );
+        session.pending = Some(PendingState::Review { variant, result: result.clone() });
+        state.db.save_session(session)?;
+        return Ok(result);
+    }
+
     session.resolve_current(&variant, !failed_gate)?;
     state.db.update_attempt_pitch(
         &session.deck_id, &entry.id, variant.mode, correct, !failed_gate,
@@ -513,10 +534,9 @@ fn audio_settings(state: State<'_, AppState>) -> Result<AudioSettings, String> {
 }
 
 #[tauri::command]
-fn set_audio_settings(state: State<'_, AppState>, auto_play: bool, volume: f64, playback_rate: f64) -> Result<AudioSettings, String> {
+fn set_audio_settings(state: State<'_, AppState>, volume: f64, playback_rate: f64) -> Result<AudioSettings, String> {
     let volume = volume.clamp(0.0, 1.0);
     let playback_rate = playback_rate.clamp(0.5, 2.0);
-    state.db.set_setting(AUDIO_AUTO_PLAY_SETTING, Some(if auto_play { "1" } else { "0" }))?;
     state.db.set_setting(AUDIO_VOLUME_SETTING, Some(&volume.to_string()))?;
     state.db.set_setting(AUDIO_PLAYBACK_RATE_SETTING, Some(&playback_rate.to_string()))?;
     audio_settings_snapshot(&state)
@@ -586,8 +606,26 @@ fn fail_base(
         &entry.id, &session.deck_id, variant.mode, session.stage, &stage, &answer,
         false, None, false, grading_method, score, recall_latency_ms, typing_duration_ms, Some(failure.as_str()),
     )?;
+    let deck = db.deck(&session.deck_id)?;
+    if let Some(question) = db.pitch_question(&entry.id, deck.pitch_policy == "include_predicted")? {
+        session.pending = Some(PendingState::PitchCorrection {
+            variant,
+            question: question.clone(),
+            failure: failure.as_str().to_string(),
+        });
+        db.save_session(session)?;
+        return Ok(SubmitResult {
+            status: SubmitStatus::Pitch,
+            message: None,
+            failure_type: Some(failure.as_str().to_string()),
+            canonical_answer: Some(entry.term.clone()),
+            reading: entry.reading.clone(),
+            pitch: Some(question),
+            card: None,
+        });
+    }
     session.resolve_current(&variant, false)?;
-    let result = review_result(entry, Some(failure.as_str()), "정답을 확인하고 Enter를 눌러주세요.");
+    let result = review_result(entry, Some(failure.as_str()), "정답을 보고 다음 문제로 넘어가세요.");
     session.pending = Some(PendingState::Review { variant, result: result.clone() });
     db.save_session(session)?;
     Ok(result)
@@ -646,6 +684,7 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
         entry_id: entry.id.clone(),
         variant_id: variant.id(),
         stage: session.stage,
+        active_duration_ms: session.active_duration_ms,
         mode: variant.mode,
         question,
         answer_language,
@@ -673,7 +712,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
             let card = build_card(state, session, &variant)?;
             Ok(SubmitResult {
                 status: SubmitStatus::Ambiguous,
-                message: Some("이 답은 직접 확인이 필요해요.".into()),
+                message: Some("이 답은 직접 판정이 필요해요.".into()),
                 failure_type: None,
                 canonical_answer: Some(entry.meanings.join(" / ")),
                 reading: entry.reading,
@@ -689,6 +728,19 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 message: None,
                 failure_type: None,
                 canonical_answer: Some(entry.meanings.join(" / ")),
+                reading: entry.reading,
+                pitch: Some(question),
+                card: Some(card),
+            })
+        }
+        Some(PendingState::PitchCorrection { variant, question, failure }) => {
+            let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
+            let card = build_card(state, session, &variant)?;
+            Ok(SubmitResult {
+                status: SubmitStatus::Pitch,
+                message: None,
+                failure_type: Some(failure),
+                canonical_answer: Some(entry.term.clone()),
                 reading: entry.reading,
                 pitch: Some(question),
                 card: Some(card),
@@ -821,12 +873,11 @@ fn storage_settings_snapshot(state: &AppState) -> Result<StorageSettings, String
 }
 
 fn audio_settings_snapshot(state: &AppState) -> Result<AudioSettings, String> {
-    let auto_play = state.db.setting(AUDIO_AUTO_PLAY_SETTING)?.as_deref() != Some("0");
     let volume = state.db.setting(AUDIO_VOLUME_SETTING)?
         .and_then(|value| value.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.0, 1.0);
     let playback_rate = state.db.setting(AUDIO_PLAYBACK_RATE_SETTING)?
         .and_then(|value| value.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.5, 2.0);
-    Ok(AudioSettings { auto_play, volume, playback_rate })
+    Ok(AudioSettings { volume, playback_rate })
 }
 
 fn pick_backup_file(save: bool) -> Result<Option<PathBuf>, String> {
