@@ -36,8 +36,14 @@ export function activeCardTimerRuns(card: StudyCard | null, result: SubmitResult
   return card !== null && (result === null || result.status === "pass");
 }
 
-export function shouldAutoPlayAfterWrittenAnswer(mode: StudyMode): boolean {
-  return mode === "reading" || mode === "writing";
+export function reviewAnswerForMode(mode: StudyMode, canonicalAnswer: string | null | undefined): string {
+  if (!canonicalAnswer) return "";
+  const separator = "  ·  ";
+  const separatorIndex = canonicalAnswer.indexOf(separator);
+  if (separatorIndex < 0) return canonicalAnswer;
+  const term = canonicalAnswer.slice(0, separatorIndex).trim();
+  const meanings = canonicalAnswer.slice(separatorIndex + separator.length).trim();
+  return mode === "reading" ? meanings : term;
 }
 
 export async function exitStudyForDeckNavigation(
