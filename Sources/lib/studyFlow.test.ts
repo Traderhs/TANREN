@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { StudyCard, SubmitResult } from "./types";
-import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, setPitchLevel, shouldAutoPlayAfterWrittenAnswer } from "./studyFlow";
+import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, reviewAnswerForMode, setPitchLevel } from "./studyFlow";
 
 const card = (id = "entry:reading"): StudyCard => ({
-  entry_id: "entry", variant_id: id, stage: 1, mode: "reading", question: "問",
+  entry_id: "entry", variant_id: id, stage: 1, active_duration_ms: 0, mode: "reading", question: "問",
   answer_language: "ko-KR", remaining: 1, total: 1, range_label: "0~0",
   recall_timeout_ms: 3000,
 });
@@ -41,10 +41,12 @@ describe("writing study user actions", () => {
     }
   });
 
-  it("auto-plays pronunciation after Korean and Japanese written answers only", () => {
-    expect(shouldAutoPlayAfterWrittenAnswer("reading")).toBe(true);
-    expect(shouldAutoPlayAfterWrittenAnswer("writing")).toBe(true);
-    expect(shouldAutoPlayAfterWrittenAnswer("listening")).toBe(false);
+  it("shows only the answer side of the backend review payload", () => {
+    const reviewPayload = "いす  ·  의자 / 좌석";
+    expect(reviewAnswerForMode("reading", reviewPayload)).toBe("의자 / 좌석");
+    expect(reviewAnswerForMode("writing", reviewPayload)).toBe("いす");
+    expect(reviewAnswerForMode("listening", reviewPayload)).toBe("いす");
+    expect(reviewAnswerForMode("reading", "의자 / 좌석")).toBe("의자 / 좌석");
   });
 
   it("Decks navigation exits a study session but not non-study views", async () => {

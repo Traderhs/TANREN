@@ -216,3 +216,7 @@ export function japaneseImeKeyStartsInput(tap: JapaneseImeKeyTap) {
   return !tap.ctrlKey && !tap.altKey && !tap.metaKey && tap.key.length === 1 && tap.key.trim().length > 0;
 }
 
+export function japaneseImeEnterCommitsYomi(segments: JapaneseImeSegment[]) {
+  return segments.length > 0 && segments.every((segment) => segment.kind === "yomi");
+}
+
