@@ -454,11 +454,13 @@ impl Database {
                 .map(|session| session.range().label.clone());
             let total_stages = self.total_stages(&deck.id)?;
             deck.total_stage_count = total_stages as usize;
-            let mut completed_stage_count = 0usize;
-            for stage in 1..=total_stages {
-                completed_stage_count += usize::from(self.is_stage_completed(&deck.id, stage)?);
-            }
-            deck.completed_stage_count = completed_stage_count;
+            // Book-level progress is historical, like the stage ✓: restarting
+            // a cleared stage must not make the book look incomplete again.
+            deck.completed_stage_count = conn.query_row(
+                "SELECT COUNT(DISTINCT stage) FROM stage_completions WHERE deck_id=?1 AND stage BETWEEN 1 AND ?2",
+                params![deck.id, total_stages as i64],
+                |row| row.get::<_, i64>(0),
+            ).map_err(|e| e.to_string())? as usize;
         }
         Ok(decks)
     }
@@ -473,6 +475,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn is_stage_completed(&self, deck_id: &str, stage: u32) -> Result<bool, String> {
         let conn = self.conn()?;
         conn.query_row(
@@ -571,16 +574,11 @@ impl Database {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?
         };
-        let completed: bool = conn.query_row(
-            "SELECT EXISTS(\
-                SELECT 1 FROM stage_completions c \
-                LEFT JOIN stage_schedules s ON s.deck_id=c.deck_id AND s.stage=c.stage \
-                WHERE c.deck_id=?1 AND c.stage=?2 \
-                  AND (s.created_at IS NULL OR c.completed_at>=s.created_at)\
-            )",
-            params![deck_id, stage as i64],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
+        // The stage checkmark is historical: once a stage has been cleared at
+        // least once, starting another pass must not remove the ✓ indicator.
+        // is_stage_completed() intentionally remains stricter and answers
+        // whether the current schedule snapshot has been cleared.
+        let completed = !clear_times_ms.is_empty();
         Ok(StageScheduleSummary { stage, study_range, completed, active, clear_times_ms })
     }
 
@@ -1058,6 +1056,21 @@ impl Database {
             journal(&tx, &id, "attempt", &self.device_id, 2, "update", &serde_json::json!({"pitch_correct":correct,"joint_correct":joint_correct,"failure_type":failure_type}))?;
         }
         tx.commit().map_err(|e|e.to_string())
+    }
+
+    pub fn discard_pending_pitch_attempt(&self, deck_id: &str, stage: u32, entry_id: &str, variant: StudyMode) -> Result<(), String> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let id: Option<String> = tx.query_row(
+            "SELECT id FROM attempts WHERE deck_id=?1 AND stage=?2 AND entry_id=?3 AND variant=?4 AND pitch_correct IS NULL ORDER BY timestamp DESC LIMIT 1",
+            params![deck_id, stage as i64, entry_id, variant.as_str()],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        if let Some(id) = id {
+            tx.execute("DELETE FROM attempts WHERE id=?1", [&id]).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM sync_journal WHERE entity_type='attempt' AND entity_id=?1", [&id]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn pitch_question(&self, entry_id:&str, predicted_gate:bool) -> Result<Option<PitchQuestion>,String> {
@@ -1618,6 +1631,33 @@ mod tests{
     }
 
     #[test]
+    fn discarding_pending_pitch_attempt_removes_only_the_unfinished_turn() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("pitch-recovery", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, Some(true), true, "exact", None, 300, 100, None).unwrap();
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, None, false, "exact", None, 350, 120, None).unwrap();
+
+        db.discard_pending_pitch_attempt(&deck.id, 1, &entry.id, StudyMode::Reading).unwrap();
+
+        let stats = db.library_stats(Some(&deck.id)).unwrap();
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.pitch_accuracy, Some(1.0));
+        assert_eq!(stats.joint_accuracy, Some(1.0));
+        let journal_attempts: i64 = db.conn().unwrap().query_row(
+            "SELECT COUNT(*) FROM sync_journal WHERE entity_type='attempt'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(journal_attempts, 1);
+    }
+
+    #[test]
     fn imports_append_after_existing_cards_and_skip_exact_duplicates() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
@@ -1671,9 +1711,13 @@ mod tests{
 
         let stage = db.stage_schedule_summary(&deck.id, 1).unwrap();
         assert_eq!(stage.study_range.label, "0~1");
-        assert!(!stage.completed);
+        assert!(stage.completed);
+        assert!(!db.is_stage_completed(&deck.id, 1).unwrap());
         assert_eq!(stage.clear_times_ms, vec![1_000]);
         assert_eq!(db.load_stage_schedule(&deck.id, 1).unwrap().unwrap().len(), 2);
+        let summary = db.list_decks().unwrap().remove(0);
+        assert_eq!(summary.completed_stage_count, 1);
+        assert_eq!(summary.total_stage_count, 1);
     }
 
     #[test]
