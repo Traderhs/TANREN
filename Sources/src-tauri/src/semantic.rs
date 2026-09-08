@@ -13,7 +13,7 @@ use crate::{
 };
 
 const QUERY_INSTRUCTION: &str = "Instruct: 한국어 학습 답변과 사전의 한국어 의미가 같은 뜻인지 검색하세요.\nQuery: ";
-const CONTEXT_PASS_OFFSET: f64 = 0.05;
+const CONTEXT_PASS_OFFSET: f64 = 0.02;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendIdentity {
@@ -153,18 +153,16 @@ impl SemanticGrader {
         };
 
         let margin = best_negative.map(|negative| best_positive - negative).unwrap_or(f64::INFINITY);
-        if best_negative.is_some_and(|negative| negative >= best_positive && negative >= self.thresholds.fail) {
-            return GradeOutcome { decision: GradeDecision::Fail, method: "semantic_negative", score: Some(best_positive) };
-        }
         if best_positive >= self.thresholds.pass && margin >= self.thresholds.minimum_margin {
             GradeOutcome { decision: GradeDecision::Pass, method: "semantic_embedding", score: Some(best_positive) }
-        } else if let Ok((context_positive, context_negative)) = self.contextual_translation_scores(entry, &normalized_answer, &positives, &negatives, answer_language, expression_language) {
-            let context_margin = context_negative.map(|negative| context_positive - negative).unwrap_or(f64::INFINITY);
+        } else if let Ok(context_positive) = self.contextual_translation_score(entry, &normalized_answer, &positives, answer_language, expression_language) {
             let context_pass = (self.thresholds.pass + CONTEXT_PASS_OFFSET).min(1.0);
-            if context_positive >= context_pass && context_margin >= self.thresholds.minimum_margin {
+            if context_positive >= context_pass {
                 GradeOutcome { decision: GradeDecision::Pass, method: "semantic_context_embedding", score: Some(context_positive) }
             } else if context_positive >= self.thresholds.pass {
                 GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_context_embedding", score: Some(context_positive) }
+            } else if best_negative.is_some_and(|negative| negative >= best_positive && negative >= self.thresholds.fail) {
+                GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_negative", score: Some(best_positive) }
             } else if best_positive <= self.thresholds.fail {
                 GradeOutcome { decision: GradeDecision::Fail, method: "semantic_embedding", score: Some(best_positive) }
             } else {
@@ -177,7 +175,7 @@ impl SemanticGrader {
         }
     }
 
-    fn contextual_translation_scores(&self, entry: &EntryRecord, answer: &str, positives: &[String], negatives: &[String], answer_language: &str, expression_language: &str) -> Result<(f64, Option<f64>), String> {
+    fn contextual_translation_score(&self, entry: &EntryRecord, answer: &str, positives: &[String], answer_language: &str, expression_language: &str) -> Result<f64, String> {
         let answer_text = contextual_translation_text(entry, answer, answer_language, expression_language)?;
         let answer_embedding = self.embeddings(&[("context_query", answer_text)])?.remove(0);
         let positive_requests: Vec<_> = positives.iter()
@@ -185,15 +183,7 @@ impl SemanticGrader {
             .collect::<Result<_, _>>()?;
         let positive_embeddings = self.embeddings(&positive_requests)?;
         let best_positive = positive_embeddings.iter().map(|value| cosine(&answer_embedding, value)).fold(-1.0, f64::max);
-        if negatives.is_empty() {
-            return Ok((best_positive, None));
-        }
-        let negative_requests: Vec<_> = negatives.iter()
-            .map(|value| contextual_translation_text(entry, value, answer_language, expression_language).map(|text| ("context_document", text)))
-            .collect::<Result<_, _>>()?;
-        let negative_embeddings = self.embeddings(&negative_requests)?;
-        let best_negative = negative_embeddings.iter().map(|value| cosine(&answer_embedding, value)).fold(-1.0, f64::max);
-        Ok((best_positive, Some(best_negative)))
+        Ok(best_positive)
     }
 
     fn grade_multiple_meanings(&self, entry: &EntryRecord, answer: &str) -> GradeOutcome {
@@ -469,12 +459,13 @@ mod tests {
     fn source_term_and_reading_context_can_directly_accept_valid_translation() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend);
-        let related = grader.grade_reading(&shelf_entry(), "찬장", &[], &[], "ko-KR", "ja-JP");
+        let related = grader.grade_reading(&shelf_entry(), "찬장", &[], &["수납장".into()], "ko-KR", "ja-JP");
         assert_eq!(related.decision, GradeDecision::Pass);
         assert_eq!(related.method, "semantic_context_embedding");
         let nearby = grader.grade_reading(&shelf_entry(), "서랍장", &[], &[], "ko-KR", "ja-JP");
         assert_eq!(nearby.decision, GradeDecision::Ambiguous);
         assert_eq!(nearby.method, "semantic_context_embedding");
+        assert_eq!(grader.grade_reading(&shelf_entry(), "수납장", &[], &["수납장".into()], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
         assert_eq!(grader.grade_reading(&shelf_entry(), "냉장고", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
     }
 
