@@ -5286,9 +5286,9 @@ textarea:focus {
 }
 
 .home-shell .book-delete-button.ghost:hover:not(:disabled) {
-  border-color: rgba(188, 82, 82, .22) !important;
+  border-color: transparent !important;
   color: #d39a9a !important;
-  background: rgba(188, 82, 82, .07) !important;
+  background: transparent !important;
   transform: none !important;
 }
 
@@ -5596,13 +5596,13 @@ textarea:focus {
 }
 
 .book-inline-entry-delete {
-  color: #d39a9a !important;
+  color: #858782 !important;
 }
 
 .book-inline-entry-delete:hover {
   border: 0 !important;
   background: transparent !important;
-  color: #efb0b0 !important;
+  color: #d39a9a !important;
   transform: none !important;
 }
 
