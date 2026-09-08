@@ -6364,6 +6364,10 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
   text-align: center;
 }
 .learning-answer-review .learning-review-cue>strong { font-size: 52px; }
+.learning-adjudication-cue .learning-reading {
+  justify-content: center;
+  margin-top: 1px;
+}
 .learning-review-result-stack {
   width: min(680px, 100%);
   position: relative;

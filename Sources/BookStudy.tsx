@@ -588,10 +588,10 @@ export function BookStudy({
   }, [card?.variant_id, card?.audio_path, active, audioSettings]);
 
   useEffect(() => {
-    if (!(review || ambiguous) || pitchQuestion || !card?.audio_path) return;
+    if (!review || pitchQuestion || !card?.audio_path) return;
     const frame = requestAnimationFrame(() => playAudio(true));
     return () => cancelAnimationFrame(frame);
-  }, [card?.variant_id, card?.audio_path, review, ambiguous, pitchQuestion]);
+  }, [card?.variant_id, card?.audio_path, review, pitchQuestion]);
 
   useEffect(() => {
     if (!pitchCorrection || !card?.audio_path) return;
@@ -951,6 +951,10 @@ export function BookStudy({
         </div>}
 
         {ambiguous && <div className="learning-feedback learning-answer-review learning-adjudication" aria-live="polite">
+          <div className="learning-review-cue learning-adjudication-cue">
+            <strong lang={deck.target_language}>{card?.question}</strong>
+            {deck.target_language === "ja-JP" && result.reading && result.reading !== card?.question && <span className="learning-reading" lang="ja">{result.reading}</span>}
+          </div>
           <div className={`learning-review-result-stack ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
             <div className={`learning-answer-comparison ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
               <div className="learning-correct-answer"><span>기준 답</span><strong>{result.canonical_answer}</strong></div>
