@@ -1,2 +1,5 @@
 [build]
 target-dir = "../Results/cargo-target"
+
+[env]
+LINK = { value = "", force = true }
