@@ -16,7 +16,7 @@ use std::sync::{
 use std::{path::{Path, PathBuf}, process::Command};
 
 use db::Database;
-use grading::grade_form;
+use grading::grade_form_with_reading;
 use japanese::{JapaneseAnalyzer, VOICE_AUDIO_REVISION};
 use model::{
     DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
@@ -325,7 +325,10 @@ fn submit_answer(
     let (accepted, rejected) = state.db.aliases(&entry.id)?;
     let outcome = match variant.mode {
         StudyMode::Reading => state.semantic.grade_reading(&entry, &answer, &accepted, &rejected, &deck.source_language, &deck.target_language),
-        StudyMode::Listening | StudyMode::Writing => grade_form(&entry, &answer, deck.strict_orthography),
+        StudyMode::Listening | StudyMode::Writing => {
+            let orthographic_reading = state.db.japanese_orthographic_reading(&entry.id)?;
+            grade_form_with_reading(&entry, &answer, deck.strict_orthography, orthographic_reading.as_deref())
+        }
     };
     match outcome.decision {
         GradeDecision::Fail => fail_base(
@@ -1257,7 +1260,7 @@ pub fn run() {
                 .unwrap_or(app.path().app_data_dir().map_err(|e| e.to_string())?);
             let db = Database::open(app_data.join("tanren.db"))?;
             db.requeue_failed_enrichment()?;
-            db.requeue_incomplete_lexical_enrichment()?;
+            db.requeue_incomplete_japanese_enrichment()?;
             db.requeue_voice_audio_revision(VOICE_AUDIO_REVISION)?;
             let default_semantic_home = default_runtime_home()?;
             let semantic_home = configured_semantic_home(&db, &default_semantic_home)?;

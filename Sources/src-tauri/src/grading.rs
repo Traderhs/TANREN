@@ -87,7 +87,17 @@ fn reading_matches(expected: &str, answer: &str) -> bool {
         || expand_prolonged_sound_marks(&answer).iter().any(|variant| variant == &expected)
 }
 
+#[cfg(test)]
 pub fn grade_form(entry: &EntryRecord, answer: &str, strict_orthography: bool) -> GradeOutcome {
+    grade_form_with_reading(entry, answer, strict_orthography, None)
+}
+
+pub fn grade_form_with_reading(
+    entry: &EntryRecord,
+    answer: &str,
+    strict_orthography: bool,
+    orthographic_reading: Option<&str>,
+) -> GradeOutcome {
     let answer = normalize_japanese(answer);
     if answer == normalize_japanese(&entry.term) {
         return GradeOutcome { decision: GradeDecision::Pass, method: "exact_form", score: None };
@@ -97,6 +107,9 @@ pub fn grade_form(entry: &EntryRecord, answer: &str, strict_orthography: bool) -
             if reading_matches(reading, &answer) {
                 return GradeOutcome { decision: GradeDecision::Pass, method: "accepted_reading", score: None };
             }
+        }
+        if orthographic_reading.is_some_and(|reading| reading_matches(reading, &answer)) {
+            return GradeOutcome { decision: GradeDecision::Pass, method: "accepted_orthographic_reading", score: None };
         }
     }
     GradeOutcome { decision: GradeDecision::Fail, method: "form_mismatch", score: None }
@@ -207,5 +220,17 @@ mod tests {
         assert_eq!(grade_form(&value, "じゅういち", false).decision, GradeDecision::Pass);
         assert_eq!(grade_form(&value, "ジュウイチ", false).decision, GradeDecision::Pass);
         assert_eq!(grade_form(&value, "じゅういち", true).decision, GradeDecision::Fail);
+    }
+
+    #[test]
+    fn orthographic_reading_accepts_written_particle_spelling() {
+        let mut value = entry();
+        value.term = "今日はいい天気ですね".into();
+        value.reading = Some("きょーわいいてんきですね".into());
+        assert_eq!(
+            grade_form_with_reading(&value, "きょうはいいてんきですね", false, Some("キョウハイイテンキデスネ")).decision,
+            GradeDecision::Pass,
+        );
+        assert_eq!(grade_form(&value, "きょうはいいてんきですね", false).decision, GradeDecision::Fail);
     }
 }

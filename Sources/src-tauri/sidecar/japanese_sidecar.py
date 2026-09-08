@@ -610,8 +610,35 @@ def voicevox_pitch_contour(
         normalized = hira(mora)
         return {"を": "お", "は": "わ", "へ": "え"}.get(normalized, normalized)
 
-    normalized_actual = [pronunciation_key(mora) for mora in flattened_morae]
-    normalized_expected = [pronunciation_key(mora) for mora in expected_morae]
+    def mora_vowel(mora: str) -> str | None:
+        if not mora:
+            return None
+        last = mora[-1]
+        for vowel, kana in (
+            ("あ", "ぁあかがさざただなはばぱまゃやらわゎゕ"),
+            ("い", "ぃいきぎしじちぢにひびぴみりゐ"),
+            ("う", "ぅうくぐすずつづぬふぶぷむゅゆるゔ"),
+            ("え", "ぇえけげせぜてでねへべぺめれゑゖ"),
+            ("お", "ぉおこごそぞとどのほぼぽもょよろを"),
+        ):
+            if last in kana:
+                return vowel
+        return None
+
+    def pronunciation_keys(morae: list[str]) -> list[str]:
+        keys: list[str] = []
+        previous: str | None = None
+        for mora in morae:
+            normalized = pronunciation_key(mora)
+            if normalized == "ー" and previous:
+                normalized = mora_vowel(previous) or normalized
+            keys.append(normalized)
+            if normalized != "ー":
+                previous = normalized
+        return keys
+
+    normalized_actual = pronunciation_keys(flattened_morae)
+    normalized_expected = pronunciation_keys(expected_morae)
     if normalized_actual != normalized_expected:
         return None, version
     return contour, version

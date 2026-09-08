@@ -283,12 +283,12 @@ impl JapaneseAnalyzer {
         let enrichment: JapaneseEnrichment = serde_json::from_value(response)
             .map_err(|error| format!("invalid language enrichment payload: {error}"))?;
         let audio: Vec<AudioAssetDraft> = enrichment.audio_assets.iter().filter(|asset| Path::new(&asset.path).exists()).cloned().collect();
-        if enrichment.scope == "lexical" {
+        if matches!(enrichment.scope.as_str(), "lexical" | "phrase" | "sentence") {
             if enrichment.pitch_patterns.as_ref().is_none_or(|patterns| patterns.is_empty()) {
-                return Err(format!("lexical enrichment completed without generated pitch: {}", entry.term));
+                return Err(format!("Japanese enrichment completed without generated pitch: {}", entry.term));
             }
             if audio.is_empty() {
-                return Err(format!("lexical enrichment completed without generated audio: {}", entry.term));
+                return Err(format!("Japanese enrichment completed without generated audio: {}", entry.term));
             }
         }
         Ok((enrichment, audio))
