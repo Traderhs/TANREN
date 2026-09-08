@@ -22,14 +22,24 @@ def cosine(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b)) / (na * nb)
 
 
-def decision(pos: float, neg: float | None, pass_threshold: float, fail_threshold: float, margin: float) -> str:
+def decision(pos: float, neg: float | None, context_pos: float, context_neg: float | None, pass_threshold: float, fail_threshold: float, margin: float) -> str:
     if neg is not None and neg >= pos and neg >= fail_threshold:
         return "negative"
     if pos >= pass_threshold and (neg is None or pos - neg >= margin):
         return "positive"
+    if context_pos >= pass_threshold and (context_neg is None or context_pos - context_neg >= margin):
+        return "positive"
     if pos <= fail_threshold:
         return "negative"
     return "ambiguous"
+
+
+def contextual(group: dict, meaning: str) -> str:
+    source = group["term"]
+    reading = group.get("reading", "").strip()
+    if reading:
+        source += f"({reading})"
+    return f"{group['expression_language']} 표현 {source}의 {group['answer_language']} 뜻: {meaning}"
 
 
 def main() -> None:
@@ -42,6 +52,8 @@ def main() -> None:
 
     documents = sorted({text for group in groups for text in group["positives"] + group["confusables"]})
     answers = sorted({case["answer"] for group in groups for case in group["cases"]})
+    context_documents = sorted({contextual(group, text) for group in groups for text in group["positives"] + group["confusables"]})
+    context_answers = sorted({contextual(group, case["answer"]) for group in groups for case in group["cases"]})
     started = time.perf_counter()
     embed(args.url, [INSTRUCTION + answers[0]])
     first_embedding_ms = round((time.perf_counter() - started) * 1000, 1)
@@ -49,7 +61,12 @@ def main() -> None:
     document_vectors = embed(args.url, documents)
     canonical_batch_ms = round((time.perf_counter() - started) * 1000, 1)
     answer_vectors = embed(args.url, [INSTRUCTION + answer for answer in answers])
-    lookup = dict(zip(documents + answers, document_vectors + answer_vectors))
+    context_document_vectors = embed(args.url, context_documents)
+    context_answer_vectors = embed(args.url, [INSTRUCTION + answer for answer in context_answers])
+    document_lookup = dict(zip(documents, document_vectors))
+    answer_lookup = dict(zip(answers, answer_vectors))
+    context_document_lookup = dict(zip(context_documents, context_document_vectors))
+    context_answer_lookup = dict(zip(context_answers, context_answer_vectors))
     warmed = []
     for answer in answers[:10]:
         started = time.perf_counter()
@@ -59,18 +76,26 @@ def main() -> None:
     rows = []
     for group in groups:
         for case in group["cases"]:
-            query = lookup[case["answer"]]
-            positive = max(cosine(query, lookup[text]) for text in group["positives"])
-            negative = max(cosine(query, lookup[text]) for text in group["confusables"])
-            rows.append({"entry": group["id"], **case, "positive_score": positive, "negative_score": negative, "margin": positive - negative})
+            query = answer_lookup[case["answer"]]
+            positive = max(cosine(query, document_lookup[text]) for text in group["positives"])
+            negative = max(cosine(query, document_lookup[text]) for text in group["confusables"])
+            context_query = context_answer_lookup[contextual(group, case["answer"])]
+            context_positive = max(cosine(context_query, context_document_lookup[contextual(group, text)]) for text in group["positives"])
+            context_negative = max(cosine(context_query, context_document_lookup[contextual(group, text)]) for text in group["confusables"])
+            rows.append({
+                "entry": group["id"], **case,
+                "positive_score": positive, "negative_score": negative, "margin": positive - negative,
+                "context_positive_score": context_positive, "context_negative_score": context_negative,
+                "context_margin": context_positive - context_negative,
+            })
 
     best = None
     for pass_i in range(55, 96):
         for fail_i in range(30, pass_i):
             for margin_i in range(0, 31):
                 thresholds = (pass_i / 100, fail_i / 100, margin_i / 100)
-                predictions = [decision(row["positive_score"], row["negative_score"], *thresholds) for row in rows]
-                no_negative_predictions = [decision(row["positive_score"], None, *thresholds) for row in rows]
+                predictions = [decision(row["positive_score"], row["negative_score"], row["context_positive_score"], row["context_negative_score"], *thresholds) for row in rows]
+                no_negative_predictions = [decision(row["positive_score"], None, row["context_positive_score"], None, *thresholds) for row in rows]
                 false_pass = sum(row["expected"] != "positive" and pred == "positive" for row, pred in zip(rows, predictions))
                 no_negative_false_pass = sum(row["expected"] != "positive" and pred == "positive" for row, pred in zip(rows, no_negative_predictions))
                 false_fail = sum(row["expected"] == "positive" and pred == "negative" for row, pred in zip(rows, predictions))
@@ -102,7 +127,7 @@ def main() -> None:
         "clear_negative_rejection_rate": sum(row["predicted"] == "negative" for row in negatives) / len(negatives),
         "ambiguous_rate": sum(row["predicted"] == "ambiguous" for row in rows) / len(rows),
         "antonym_confusable_false_pass_count": sum(row["category"] in {"antonym", "confusable"} and row["predicted"] == "positive" for row in rows),
-        "no_explicit_negative_false_pass_count": sum(row["expected"] != "positive" and decision(row["positive_score"], None, *thresholds) == "positive" for row in rows),
+        "no_explicit_negative_false_pass_count": sum(row["expected"] != "positive" and decision(row["positive_score"], None, row["context_positive_score"], None, *thresholds) == "positive" for row in rows),
         "false_positive_examples": [row for row in rows if row["expected"] != "positive" and row["predicted"] == "positive"],
         "false_negative_examples": [row for row in rows if row["expected"] == "positive" and row["predicted"] == "negative"],
         "ambiguous_accuracy": sum(row["predicted"] == "ambiguous" for row in ambiguous) / len(ambiguous),

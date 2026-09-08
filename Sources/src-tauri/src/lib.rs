@@ -324,7 +324,7 @@ fn submit_answer(
 
     let (accepted, rejected) = state.db.aliases(&entry.id)?;
     let outcome = match variant.mode {
-        StudyMode::Reading => state.semantic.grade_reading(&entry, &answer, &accepted, &rejected),
+        StudyMode::Reading => state.semantic.grade_reading(&entry, &answer, &accepted, &rejected, &deck.source_language, &deck.target_language),
         StudyMode::Listening | StudyMode::Writing => grade_form(&entry, &answer, deck.strict_orthography),
     };
     match outcome.decision {
