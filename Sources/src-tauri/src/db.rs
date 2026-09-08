@@ -12,7 +12,7 @@ use crate::{
     timers::TypingProfileState,
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 fn contains_han(value: &str) -> bool {
     value.chars().any(|character| matches!(character as u32,
@@ -130,7 +130,18 @@ impl Database {
                 [],
                 |row| row.get(0),
             ).map_err(|e| e.to_string())?;
-            if version != SCHEMA_VERSION {
+            if version == 13 {
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                tx.execute(
+                    "ALTER TABLE stage_completions ADD COLUMN cycle_count INTEGER NOT NULL DEFAULT 1",
+                    [],
+                ).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE schema_info SET version=?1 WHERE id=1",
+                    [SCHEMA_VERSION],
+                ).map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+            } else if version != SCHEMA_VERSION {
                 return Err("현재 버전과 호환되지 않는 TANREN 데이터예요.".into());
             }
         } else {
@@ -295,6 +306,7 @@ impl Database {
               deck_id TEXT NOT NULL REFERENCES decks(id),
               stage INTEGER NOT NULL,
               duration_ms INTEGER NOT NULL,
+              cycle_count INTEGER NOT NULL,
               completed_at TEXT NOT NULL,
               device_id TEXT NOT NULL
             );
@@ -482,12 +494,12 @@ impl Database {
         Ok(decks)
     }
 
-    pub fn mark_stage_completed(&self, deck_id: &str, stage: u32, duration_ms: u64) -> Result<(), String> {
+    pub fn mark_stage_completed(&self, deck_id: &str, stage: u32, duration_ms: u64, cycle_count: u32) -> Result<(), String> {
         let conn = self.conn()?;
         let timestamp = now();
         conn.execute(
-            "INSERT INTO stage_completions(id,deck_id,stage,duration_ms,completed_at,device_id) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![Uuid::new_v4().to_string(), deck_id, stage as i64, duration_ms as i64, timestamp, self.device_id],
+            "INSERT INTO stage_completions(id,deck_id,stage,duration_ms,cycle_count,completed_at,device_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![Uuid::new_v4().to_string(), deck_id, stage as i64, duration_ms as i64, cycle_count as i64, timestamp, self.device_id],
         ).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -581,22 +593,27 @@ impl Database {
             params![deck_id, stage as i64],
             |row| row.get(0),
         ).map_err(|e| e.to_string())?;
-        let clear_times_ms = {
+        let (clear_times_ms, clear_cycles): (Vec<u64>, Vec<u32>) = {
             let mut stmt = conn.prepare(
-                "SELECT duration_ms FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at,id",
+                "SELECT duration_ms,cycle_count FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at,id",
             ).map_err(|e| e.to_string())?;
-            stmt.query_map(params![deck_id, stage as i64], |row| row.get::<_, i64>(0))
+            let rows = stmt.query_map(params![deck_id, stage as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
                 .map_err(|e| e.to_string())?
-                .map(|value| value.map(|value| value.max(0) as u64))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            (
+                rows.iter().map(|(duration, _)| (*duration).max(0) as u64).collect(),
+                rows.iter().map(|(_, cycles)| (*cycles).max(1) as u32).collect(),
+            )
         };
         // The stage checkmark is historical: once a stage has been cleared at
         // least once, starting another pass must not remove the ✓ indicator.
         // is_stage_completed() intentionally remains stricter and answers
         // whether the current schedule snapshot has been cleared.
         let completed = !clear_times_ms.is_empty();
-        Ok(StageScheduleSummary { stage, study_range, completed, active, clear_times_ms })
+        Ok(StageScheduleSummary { stage, study_range, completed, active, clear_times_ms, clear_cycles })
     }
 
     fn effective_stage_slots(&self, deck_id: &str) -> Result<Vec<Option<String>>, String> {
@@ -1800,7 +1817,7 @@ mod tests{
         }]).unwrap();
         let entries = db.entries(&deck.id).unwrap();
         db.ensure_stage_schedule(&deck.id, 1, &entries).unwrap();
-        db.mark_stage_completed(&deck.id, 1, 1_000).unwrap();
+        db.mark_stage_completed(&deck.id, 1, 1_000, 1).unwrap();
         assert!(db.stage_schedule_summary(&deck.id, 1).unwrap().completed);
 
         db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
@@ -1829,7 +1846,7 @@ mod tests{
         db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
         let entries = db.entries(&deck.id).unwrap();
         db.ensure_stage_schedule(&deck.id, 1, &entries).unwrap();
-        db.mark_stage_completed(&deck.id, 1, 1_000).unwrap();
+        db.mark_stage_completed(&deck.id, 1, 1_000, 1).unwrap();
 
         db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
             term: "追加".into(), meanings: vec!["추가".into()], reading: Some("ついか".into()),
@@ -2158,11 +2175,12 @@ mod tests{
         assert_eq!(db.stage_schedule_summary(&deck.id, 10).unwrap().study_range.label, "0~499");
         assert!(db.stage_schedule_summary(&deck.id, 11).is_err());
 
-        db.mark_stage_completed(&deck.id, 1, 4_320_000).unwrap();
-        db.mark_stage_completed(&deck.id, 1, 3_780_000).unwrap();
+        db.mark_stage_completed(&deck.id, 1, 4_320_000, 2).unwrap();
+        db.mark_stage_completed(&deck.id, 1, 3_780_000, 3).unwrap();
         let stage_one = db.stage_schedule_summary(&deck.id, 1).unwrap();
         assert!(stage_one.completed);
         assert_eq!(stage_one.clear_times_ms, vec![4_320_000, 3_780_000]);
+        assert_eq!(stage_one.clear_cycles, vec![2, 3]);
         let summary = db.list_decks().unwrap().remove(0);
         assert_eq!(summary.completed_stage_count, 1);
         assert_eq!(summary.total_stage_count, 10);
@@ -2229,8 +2247,8 @@ mod tests{
         let entry = source.entries(&deck.id).unwrap().remove(0);
         source.set_alias(&entry.id, "냥이", true).unwrap();
         source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, None, true, "exact", None, 500, 200, None).unwrap();
-        source.mark_stage_completed(&deck.id, 1, 61_000).unwrap();
-        source.mark_stage_completed(&deck.id, 1, 73_000).unwrap();
+        source.mark_stage_completed(&deck.id, 1, 61_000, 2).unwrap();
+        source.mark_stage_completed(&deck.id, 1, 73_000, 1).unwrap();
         let mut session = StudySession::new(deck.id.clone(), 1, &[entry.clone()], &[StudyMode::Reading], 50, 500, 1).unwrap();
         session.active_duration_ms = 47_000;
         source.save_session(&session).unwrap();
@@ -2251,6 +2269,7 @@ mod tests{
         assert_eq!(destination.load_session(&deck.id, 1).unwrap().unwrap().active_duration_ms, 47_000);
         assert_eq!(destination.library_stats(Some(&deck.id)).unwrap().attempts, 1);
         assert_eq!(destination.stage_schedule_summary(&deck.id, 1).unwrap().clear_times_ms, vec![61_000, 73_000]);
+        assert_eq!(destination.stage_schedule_summary(&deck.id, 1).unwrap().clear_cycles, vec![2, 1]);
         assert!(destination.pitch_question(&entry.id, false).unwrap().is_some());
     }
 
@@ -2265,7 +2284,7 @@ mod tests{
         let entry = source.entries(&deck.id).unwrap().remove(0);
         source.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, Some(true), true, "exact", None, 420, 180, None).unwrap();
         source.record_study_activity(&deck.id, Some(StudyMode::Reading), 7_500).unwrap();
-        source.mark_stage_completed(&deck.id, 1, 7_500).unwrap();
+        source.mark_stage_completed(&deck.id, 1, 7_500, 2).unwrap();
         source.set_setting("audio_volume", Some("0.65")).unwrap();
 
         let backup_path = source_dir.path().join("all-data.tanren");

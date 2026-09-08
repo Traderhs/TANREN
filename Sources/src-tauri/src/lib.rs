@@ -346,7 +346,7 @@ fn submit_answer(
                 state.db.save_session(session)?;
                 Ok(SubmitResult {
                     status: SubmitStatus::Pitch, message: None, failure_type: None,
-                    canonical_answer: Some(entry.meanings.join(" / ")), reading: entry.reading,
+                    canonical_answer: Some(entry.term.clone()), reading: entry.reading,
                     pitch: Some(question), card: None,
                 })
             } else {
@@ -410,7 +410,7 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
     if let Some(question) = pitch {
         session.pending = Some(PendingState::Pitch { variant, question: question.clone() });
         state.db.save_session(session)?;
-        Ok(SubmitResult { status: SubmitStatus::Pitch, message: None, failure_type: None, canonical_answer: Some(entry.meanings.join(" / ")), reading: entry.reading, pitch: Some(question), card: None })
+        Ok(SubmitResult { status: SubmitStatus::Pitch, message: None, failure_type: None, canonical_answer: Some(entry.term.clone()), reading: entry.reading, pitch: Some(question), card: None })
     } else {
         session.resolve_current(&variant, true)?;
         let result = review_result(&entry, None, "정답으로 기억했어요.");
@@ -702,11 +702,11 @@ fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Res
 }
 
 fn complete_current_stage(state: &AppState, engine: &mut Engine) -> Result<SubmitResult, String> {
-    let (deck_id, stage, duration_ms) = {
+    let (deck_id, stage, duration_ms, cycles) = {
         let session = engine.session.as_ref().ok_or("진행 중인 학습이 없어요.")?;
-        (session.deck_id.clone(), session.stage, session.active_duration_ms)
+        (session.deck_id.clone(), session.stage, session.active_duration_ms, session.queue.completed_cycles as u32 + 1)
     };
-    state.db.mark_stage_completed(&deck_id, stage, duration_ms)?;
+    state.db.mark_stage_completed(&deck_id, stage, duration_ms, cycles)?;
     state.db.clear_stage_session(&deck_id, stage)?;
     engine.session = None;
     let _ = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요.")?.restore();
@@ -775,7 +775,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 status: SubmitStatus::Pitch,
                 message: None,
                 failure_type: None,
-                canonical_answer: Some(entry.meanings.join(" / ")),
+                canonical_answer: Some(entry.term.clone()),
                 reading: entry.reading,
                 pitch: Some(question),
                 card: Some(card),
