@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type Ref } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { flushSync } from "react-dom";
 import { api } from "./lib/api";
@@ -42,14 +42,22 @@ function PitchTrace({
   levels,
   tone = "neutral",
   cursor = null,
+  traceRef,
+  onScroll,
+  showMoraLabels = true,
+  logicalWidth,
 }: {
   morae: string[];
   levels: Array<number | null>;
   tone?: "neutral" | "correct" | "incorrect";
   cursor?: number | null;
+  traceRef?: Ref<HTMLDivElement>;
+  onScroll?: (scrollLeft: number) => void;
+  showMoraLabels?: boolean;
+  logicalWidth?: number;
 }) {
   const count = Math.max(morae.length, 1);
-  const width = Math.max(240, count * 76);
+  const width = logicalWidth ?? Math.max(240, count * 76);
   const step = width / count;
   const points = morae.map((_, index) => {
     const level = levels[index];
@@ -60,15 +68,26 @@ function PitchTrace({
     };
   });
 
-  return <div className={`learning-pitch-trace is-${tone}`}>
-    <svg viewBox={`0 0 ${width} 98`} role="img" aria-label={`피치 ${morae.join(" ")}`}>
+  const minimumReadableWidth = logicalWidth ?? Math.max(240, count * 48);
+
+  return <div
+    ref={traceRef}
+    className={`learning-pitch-trace is-${tone} ${showMoraLabels ? "has-mora-labels" : ""}`}
+    onScroll={onScroll ? (event) => onScroll(event.currentTarget.scrollLeft) : undefined}
+  >
+    <svg
+      viewBox={`0 0 ${width} ${showMoraLabels ? 98 : 78}`}
+      style={{ width: `max(100%, ${minimumReadableWidth}px)` }}
+      role="img"
+      aria-label={`피치 ${morae.join(" ")}`}
+    >
       <line className="learning-pitch-guide" x1="0" y1="24" x2={width} y2="24" />
       <line className="learning-pitch-guide" x1="0" y1="64" x2={width} y2="64" />
       {points.length > 1 && <polyline className="learning-pitch-line" points={points.map((point) => `${point.x},${point.y}`).join(" ")} />}
       {points.map((point, index) => <g key={`${morae[index]}-${index}`}>
         {cursor === index && <circle className="learning-pitch-cursor" cx={point.x} cy={point.y} r="11" />}
         <circle className={`learning-pitch-node ${point.level == null ? "is-unset" : ""}`} cx={point.x} cy={point.y} r="5.5" />
-        <text className={`learning-pitch-mora-label ${cursor === index ? "is-current" : ""}`} x={point.x} y="92" textAnchor="middle">{morae[index]}</text>
+        {showMoraLabels && <text className={`learning-pitch-mora-label ${cursor === index ? "is-current" : ""}`} x={point.x} y="92" textAnchor="middle">{morae[index]}</text>}
       </g>)}
     </svg>
   </div>;
@@ -114,6 +133,10 @@ export function BookStudy({
   const exitTurnStarted = useRef(false);
   const stageComplete = useRef(false);
   const pitchControl = useRef<HTMLDivElement>(null);
+  const pitchScroll = useRef<HTMLDivElement>(null);
+  const reviewExpectedPitch = useRef<HTMLDivElement>(null);
+  const reviewSubmittedPitch = useRef<HTMLDivElement>(null);
+  const syncingReviewPitchScroll = useRef(false);
   const imeCandidateList = useRef<HTMLDivElement>(null);
   const cardRef = useRef(card);
   const answerRef = useRef(answer);
@@ -147,11 +170,21 @@ export function BookStudy({
   const review = result.status === "review" || result.status === "fail";
   const ambiguous = result.status === "ambiguous";
   const pitchQuestion = result.pitch ?? null;
+  const pitchTrackWidth = pitchQuestion ? Math.max(320, pitchQuestion.morae.length * 76) : 320;
   const pitchCorrection = Boolean(pitchQuestion && result.failure_type);
   const japanese = card?.answer_language === "ja-JP";
   const preedit = imeSegments.map((segment) => segment.text).join("");
   const candidates = imeSegments.find((segment) => segment.kind === "focus" && segment.candidates?.length);
   const total = card?.total ?? lastTotal.current;
+
+  const syncReviewPitchScroll = (target: HTMLDivElement | null, scrollLeft: number) => {
+    if (!target || syncingReviewPitchScroll.current || target.scrollLeft === scrollLeft) return;
+    syncingReviewPitchScroll.current = true;
+    target.scrollLeft = scrollLeft;
+    requestAnimationFrame(() => {
+      syncingReviewPitchScroll.current = false;
+    });
+  };
   const resolvedPass = review && !result.failure_type && !result.card;
   const displayRemaining = card ? Math.max(0, card.remaining - (resolvedPass ? 1 : 0)) : 0;
   const completedCount = complete ? total : card ? Math.max(0, total - displayRemaining) : 0;
@@ -700,16 +733,33 @@ export function BookStudy({
     ));
   }
 
-  function focusPitch(index: number) {
+  function focusPitch(index: number, smooth = true) {
     if (!pitchQuestion) return;
     const bounded = Math.max(0, Math.min(index, pitchQuestion.morae.length - 1));
     setPitchCursor(bounded);
+    requestAnimationFrame(() => {
+      const scroller = pitchScroll.current;
+      const target = scroller?.querySelector<HTMLElement>(`[data-pitch-index="${bounded}"]`);
+      if (!scroller || !target) return;
+
+      const margin = Math.min(84, scroller.clientWidth * .15);
+      const targetLeft = target.offsetLeft;
+      const targetRight = targetLeft + target.offsetWidth;
+      const visibleLeft = scroller.scrollLeft + margin;
+      const visibleRight = scroller.scrollLeft + scroller.clientWidth - margin;
+
+      if (targetLeft < visibleLeft) {
+        scroller.scrollTo({ left: Math.max(0, targetLeft - margin), behavior: smooth ? "smooth" : "auto" });
+      } else if (targetRight > visibleRight) {
+        scroller.scrollTo({ left: targetRight - scroller.clientWidth + margin, behavior: smooth ? "smooth" : "auto" });
+      }
+    });
   }
 
-  function choosePitch(index: number, level: PitchLevel, advance = false) {
+  function choosePitch(index: number, level: PitchLevel, advance = false, smooth = true) {
     setPitch((current) => setPitchLevel(current, index, level));
     setPitchCursor(index);
-    if (advance && pitchQuestion) focusPitch(Math.min(index + 1, pitchQuestion.morae.length - 1));
+    if (advance && pitchQuestion) focusPitch(Math.min(index + 1, pitchQuestion.morae.length - 1), smooth);
   }
 
   function submitPitch() {
@@ -724,22 +774,22 @@ export function BookStudy({
   function pitchKeydown(event: ReactKeyboardEvent<HTMLDivElement>, index: number) {
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      focusPitch(index - 1);
+      focusPitch(index - 1, !event.repeat);
       return;
     }
     if (event.key === "ArrowRight") {
       event.preventDefault();
-      focusPitch(index + 1);
+      focusPitch(index + 1, !event.repeat);
       return;
     }
     if (event.key === "ArrowUp") {
       event.preventDefault();
-      choosePitch(index, 1, true);
+      choosePitch(index, 1, true, !event.repeat);
       return;
     }
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      choosePitch(index, 0, true);
+      choosePitch(index, 0, true, !event.repeat);
       return;
     }
     if (event.key === "Enter") {
@@ -932,24 +982,44 @@ export function BookStudy({
 
         {pitchQuestion && <div
           className="learning-feedback learning-pitch-step"
-          style={{ width: `min(${Math.max(800, pitchQuestion.morae.length * 82)}px, 100%)` }}
+          style={{ width: `min(${Math.max(800, pitchTrackWidth)}px, 100%)` }}
         >
           <strong className="learning-target-expression" lang={deck.target_language}>{pitchTitle}</strong>
           <div
             ref={pitchControl}
             className="learning-pitch-control"
-            style={{ width: `min(${Math.max(700, pitchQuestion.morae.length * 82)}px, 100%)` }}
+            style={{ width: `min(${pitchTrackWidth}px, 100%)` }}
             role="group"
             aria-label="피치 입력"
             tabIndex={0}
             onKeyDown={(event) => pitchKeydown(event, pitchCursor)}
           >
-            <PitchTrace morae={pitchQuestion.morae} levels={pitch} cursor={pitchCursor} />
-            <div className="learning-pitch" aria-hidden="true">
-              {pitchQuestion.morae.map((mora, index) => <div className={`learning-pitch-mora ${pitchCursor === index ? "is-current" : ""} ${pitch[index] != null ? "is-set" : ""}`} key={`${mora}-${index}`}>
-                <span lang="ja">{mora}</span>
-                <small>{pitch[index] === 1 ? "↑" : pitch[index] === 0 ? "↓" : pitchCursor === index ? "↕" : "·"}</small>
-              </div>)}
+            <div ref={pitchScroll} className="learning-pitch-scroll">
+              <div
+                className="learning-pitch-track"
+                style={{
+                  width: `max(100%, ${pitchTrackWidth}px)`,
+                  ["--pitch-mora-count" as string]: pitchQuestion.morae.length,
+                }}
+              >
+                <PitchTrace
+                  morae={pitchQuestion.morae}
+                  levels={pitch}
+                  cursor={pitchCursor}
+                  showMoraLabels={false}
+                  logicalWidth={pitchTrackWidth}
+                />
+                <div className="learning-pitch" aria-hidden="true">
+                  {pitchQuestion.morae.map((mora, index) => <div
+                    className={`learning-pitch-mora ${pitchCursor === index ? "is-current" : ""} ${pitch[index] != null ? "is-set" : ""}`}
+                    data-pitch-index={index}
+                    key={`${mora}-${index}`}
+                  >
+                    <span lang="ja">{mora}</span>
+                    <small>{pitch[index] === 1 ? "↑" : pitch[index] === 0 ? "↓" : pitchCursor === index ? "↕" : "·"}</small>
+                  </div>)}
+                </div>
+              </div>
             </div>
           </div>
         </div>}
@@ -982,8 +1052,20 @@ export function BookStudy({
               {submittedAnswerKnown && <div className={`learning-user-answer ${submittedAnswerCorrect ? "is-correct" : "is-incorrect"}`}><span>응답</span><strong>{submittedAnswerLabel}</strong></div>}
             </div>
             {submittedPitch && submittedPitchQuestion && expectedPitch && <div className="learning-pitch-review">
-              <div><PitchTrace morae={submittedPitchQuestion.morae} levels={expectedPitch} tone="correct" /></div>
-              <div><PitchTrace morae={submittedPitchQuestion.morae} levels={submittedPitch} tone={pitchWasCorrect ? "correct" : "incorrect"} /></div>
+              <div><PitchTrace
+                morae={submittedPitchQuestion.morae}
+                levels={expectedPitch}
+                tone="correct"
+                traceRef={reviewExpectedPitch}
+                onScroll={(scrollLeft) => syncReviewPitchScroll(reviewSubmittedPitch.current, scrollLeft)}
+              /></div>
+              <div><PitchTrace
+                morae={submittedPitchQuestion.morae}
+                levels={submittedPitch}
+                tone={pitchWasCorrect ? "correct" : "incorrect"}
+                traceRef={reviewSubmittedPitch}
+                onScroll={(scrollLeft) => syncReviewPitchScroll(reviewExpectedPitch.current, scrollLeft)}
+              /></div>
             </div>}
           </div>
         </div>}
