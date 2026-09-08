@@ -930,11 +930,15 @@ export function BookStudy({
           <p>남은 {(card?.remaining ?? 0).toLocaleString("ko-KR")}개를 다시 풀어요</p>
         </div>}
 
-        {pitchQuestion && <div className="learning-feedback learning-pitch-step">
+        {pitchQuestion && <div
+          className="learning-feedback learning-pitch-step"
+          style={{ width: `min(${Math.max(800, pitchQuestion.morae.length * 82)}px, 100%)` }}
+        >
           <strong className="learning-target-expression" lang={deck.target_language}>{pitchTitle}</strong>
           <div
             ref={pitchControl}
             className="learning-pitch-control"
+            style={{ width: `min(${Math.max(700, pitchQuestion.morae.length * 82)}px, 100%)` }}
             role="group"
             aria-label="피치 입력"
             tabIndex={0}
