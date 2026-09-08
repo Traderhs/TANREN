@@ -10,12 +10,24 @@ $EnvDir = Join-Path $Results "python-sidecar-env"
 $Output = Join-Path $Results "sidecar"
 $Script = Join-Path $Sources "src-tauri\sidecar\japanese_sidecar.py"
 $Requirements = Join-Path $Sources "src-tauri\sidecar\requirements-build.txt"
+$RuntimeRequirements = Join-Path $Sources "src-tauri\sidecar\requirements.txt"
+$Marker = Join-Path $Output ".tanren-language-source"
 
-if (!(Test-Path (Join-Path $EnvDir "Scripts\python.exe"))) {
+$EnvPython = Join-Path $EnvDir "Scripts\python.exe"
+$RecreateEnv = !(Test-Path $EnvPython)
+if (!$RecreateEnv) {
+    try {
+        & $EnvPython -c "import sys" *> $null
+        $RecreateEnv = $LASTEXITCODE -ne 0
+    } catch {
+        $RecreateEnv = $true
+    }
+}
+if ($RecreateEnv) {
+    Remove-Item $EnvDir -Recurse -Force -ErrorAction SilentlyContinue
     & $Python -m venv $EnvDir
 }
 
-$EnvPython = Join-Path $EnvDir "Scripts\python.exe"
 & $EnvPython -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed with exit code $LASTEXITCODE" }
 & $EnvPython -m pip install -r $Requirements
@@ -54,5 +66,11 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($TargetTriple)) {
 $TauriSidecar = Join-Path $Output "tanren-language-$TargetTriple.exe"
 Copy-Item $Built $TauriSidecar -Force
 Remove-Item $Built -Force
+
+$FingerprintFiles = @($Script, $Requirements, $RuntimeRequirements, $PSCommandPath)
+$Fingerprint = ($FingerprintFiles | ForEach-Object {
+    (Get-FileHash $_ -Algorithm SHA256).Hash
+}) -join ":"
+Set-Content -Path $Marker -Value $Fingerprint -NoNewline
 
 Write-Host "Tauri sidecar: $TauriSidecar"
