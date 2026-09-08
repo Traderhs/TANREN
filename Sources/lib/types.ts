@@ -75,7 +75,7 @@ export interface PitchQuestion {
 }
 
 export interface SubmitResult {
-  status: "pass" | "fail" | "ambiguous" | "pitch" | "review" | "stage_complete";
+  status: "pass" | "fail" | "ambiguous" | "pitch" | "review" | "cycle_complete" | "stage_complete";
   message?: string;
   failure_type?: string | null;
   canonical_answer?: string | null;

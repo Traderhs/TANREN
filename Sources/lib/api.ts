@@ -43,6 +43,7 @@ export const api = {
   submitPitch: (variantId: string, patterns: number[]) =>
     invoke<SubmitResult>("submit_pitch", { variantId, patterns }),
   continueReview: () => invoke<SubmitResult>("continue_review"),
+  continueCycle: () => invoke<SubmitResult>("continue_cycle"),
   adjudicate: (variantId: string, accept: boolean) =>
     invoke<SubmitResult>("adjudicate_answer", { variantId, accept }),
   libraryStats: (deckId?: string) => invoke<LibraryStats>("library_stats", { deckId: deckId ?? null }),
