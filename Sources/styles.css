@@ -6363,13 +6363,29 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
   padding: 0 0 10px;
   text-align: center;
 }
-.learning-answer-review .learning-review-cue>strong { font-size: 52px; }
+.learning-answer-review .learning-review-cue {
+  width: max-content;
+  min-width: min(680px, 100%);
+  max-width: 100%;
+}
+.learning-answer-review {
+  width: max-content;
+  min-width: min(800px, 100%);
+  max-width: 100%;
+}
+.learning-answer-review .learning-review-cue>strong {
+  max-width: 100%;
+  font-size: 52px;
+  overflow-wrap: anywhere;
+}
 .learning-adjudication-cue .learning-reading {
   justify-content: center;
   margin-top: 1px;
 }
 .learning-review-result-stack {
-  width: min(680px, 100%);
+  width: max-content;
+  min-width: min(680px, 100%);
+  max-width: 100%;
   position: relative;
 }
 .learning-review-result-stack.has-user-answer::after {
@@ -6402,10 +6418,10 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
   text-align: center;
 }
 .learning-answer-review .learning-answer-comparison.has-user-answer .learning-user-answer { border-left: 0; }
-.learning-answer-review .learning-user-answer>strong { font-size: 26px; }
+.learning-answer-review .learning-user-answer>strong { max-width: 100%; font-size: 26px; overflow-wrap: anywhere; }
 .learning-answer-review .learning-user-answer.is-correct>strong { color: #84c79b; }
 .learning-answer-review .learning-user-answer.is-incorrect>strong { color: #d98787; }
-.learning-answer-review .learning-correct-answer>strong { font-size: 26px; }
+.learning-answer-review .learning-correct-answer>strong { max-width: 100%; font-size: 26px; overflow-wrap: anywhere; }
 .learning-adjudication .learning-feedback-actions {
   width: auto;
   display: flex;
@@ -6465,6 +6481,7 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
 .learning-pitch-trace.is-correct { color: #84c79b; }
 .learning-pitch-trace.is-incorrect { color: #d98787; }
 .learning-pitch-control { width: min(700px, 100%); outline: none; }
+.learning-pitch-control>.learning-pitch-trace { width: 100%; }
 .learning-pitch-control .learning-pitch { margin-top: 36px; }
 .learning-pitch-mora { min-width: 74px; padding: 8px 8px 10px; border: 1px solid transparent; border-radius: 8px; transition: border-color .15s, background .15s, opacity .15s; }
 .learning-pitch-mora.is-current { border-color: #5b513e; background: #c1a26b0a; }
