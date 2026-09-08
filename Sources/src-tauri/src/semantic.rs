@@ -109,7 +109,7 @@ impl SemanticGrader {
 
     pub fn status(&self) -> SemanticRuntimeStatus { self.backend.status() }
 
-    pub fn grade_reading(&self, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String]) -> GradeOutcome {
+    pub fn grade_reading(&self, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String], answer_language: &str, expression_language: &str) -> GradeOutcome {
         if let Some(outcome) = grade_reading_deterministic(entry, answer, accepted, rejected) {
             return outcome;
         }
@@ -157,11 +157,39 @@ impl SemanticGrader {
         }
         if best_positive >= self.thresholds.pass && margin >= self.thresholds.minimum_margin {
             GradeOutcome { decision: GradeDecision::Pass, method: "semantic_embedding", score: Some(best_positive) }
+        } else if let Ok((context_positive, context_negative)) = self.contextual_translation_scores(entry, &normalized_answer, &positives, &negatives, answer_language, expression_language) {
+            let context_margin = context_negative.map(|negative| context_positive - negative).unwrap_or(f64::INFINITY);
+            if context_positive >= self.thresholds.pass && context_margin >= self.thresholds.minimum_margin {
+                GradeOutcome { decision: GradeDecision::Pass, method: "semantic_context_embedding", score: Some(context_positive) }
+            } else if best_positive <= self.thresholds.fail {
+                GradeOutcome { decision: GradeDecision::Fail, method: "semantic_embedding", score: Some(best_positive) }
+            } else {
+                GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_embedding", score: Some(best_positive) }
+            }
         } else if best_positive <= self.thresholds.fail {
             GradeOutcome { decision: GradeDecision::Fail, method: "semantic_embedding", score: Some(best_positive) }
         } else {
             GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_embedding", score: Some(best_positive) }
         }
+    }
+
+    fn contextual_translation_scores(&self, entry: &EntryRecord, answer: &str, positives: &[String], negatives: &[String], answer_language: &str, expression_language: &str) -> Result<(f64, Option<f64>), String> {
+        let answer_text = contextual_translation_text(entry, answer, answer_language, expression_language)?;
+        let answer_embedding = self.embeddings(&[("context_query", answer_text)])?.remove(0);
+        let positive_requests: Vec<_> = positives.iter()
+            .map(|value| contextual_translation_text(entry, value, answer_language, expression_language).map(|text| ("context_document", text)))
+            .collect::<Result<_, _>>()?;
+        let positive_embeddings = self.embeddings(&positive_requests)?;
+        let best_positive = positive_embeddings.iter().map(|value| cosine(&answer_embedding, value)).fold(-1.0, f64::max);
+        if negatives.is_empty() {
+            return Ok((best_positive, None));
+        }
+        let negative_requests: Vec<_> = negatives.iter()
+            .map(|value| contextual_translation_text(entry, value, answer_language, expression_language).map(|text| ("context_document", text)))
+            .collect::<Result<_, _>>()?;
+        let negative_embeddings = self.embeddings(&negative_requests)?;
+        let best_negative = negative_embeddings.iter().map(|value| cosine(&answer_embedding, value)).fold(-1.0, f64::max);
+        Ok((best_positive, Some(best_negative)))
     }
 
     fn grade_multiple_meanings(&self, entry: &EntryRecord, answer: &str) -> GradeOutcome {
@@ -246,7 +274,10 @@ impl SemanticGrader {
             if let Some(value) = self.db.cached_embedding(&key.normalized_text, key.purpose, &key.model_id, &key.model_version, key.dimension)? {
                 resolved[index] = Some(value);
             } else {
-                let encoded = if key.purpose == "query" { format!("{QUERY_INSTRUCTION}{}", key.normalized_text) } else { key.normalized_text.clone() };
+                let encoded = match key.purpose {
+                    "query" | "context_query" => format!("{QUERY_INSTRUCTION}{}", key.normalized_text),
+                    _ => key.normalized_text.clone(),
+                };
                 missing.push((index, encoded));
             }
         }
@@ -277,6 +308,15 @@ fn normalized_unique<'a>(values: impl Iterator<Item = &'a String>) -> Vec<String
 }
 
 fn contains_hangul(value: &str) -> bool { value.chars().any(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c)) }
+
+fn contextual_translation_text(entry: &EntryRecord, meaning: &str, answer_language: &str, expression_language: &str) -> Result<String, String> {
+    let term = entry.term.trim();
+    if term.is_empty() { return Err("semantic source term is empty".into()); }
+    let source = entry.reading.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        .map(|reading| format!("{term}({reading})"))
+        .unwrap_or_else(|| term.to_string());
+    Ok(format!("{expression_language} 표현 {source}의 {answer_language} 뜻: {meaning}"))
+}
 
 fn threshold_from_env(name: &str, default: f64) -> f64 {
     std::env::var(name).ok().and_then(|value| value.parse::<f64>().ok()).filter(|value| (0.0..=1.0).contains(value)).unwrap_or(default)
@@ -354,7 +394,12 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.unavailable { return Err("offline".into()); }
             Ok(texts.iter().map(|text| {
-                if text.ends_with("전화하다") || text.ends_with("전화를 걸다") { vec![0.0, 1.0, 0.0, 0.0] }
+                if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 찬장") || text == "ja-JP 표현 棚(たな)의 ko-KR 뜻: 선반" { vec![1.0, 0.0, 0.0, 0.0] }
+                else if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 냉장고") { vec![0.0, 0.0, 0.0, 1.0] }
+                else if text.contains("ja-JP 표현 見据える의 ko-KR 뜻: 내다보다") || text.contains("ja-JP 표현 見据える의 ko-KR 뜻: 전망하다") { vec![1.0, 0.0, 0.0, 0.0] }
+                else if text.contains("ja-JP 표현 見据える의 ko-KR 뜻: 쳐다보다") { vec![0.0, 0.0, 0.0, 1.0] }
+                else if text == "선반" { vec![0.0, 1.0, 0.0, 0.0] }
+                else if text.ends_with("전화하다") || text.ends_with("전화를 걸다") { vec![0.0, 1.0, 0.0, 0.0] }
                 else if text.contains("미래를 내다보다") || text == "내다보다" || text == "전망하다" || text.ends_with("걸다") || text.ends_with("매달다") { vec![1.0, 0.0, 0.0, 0.0] }
                 else if text == "시간을 들이다" || text.ends_with("시간을 쓰다") { vec![0.0, 0.0, 1.0, 0.0] }
                 else if text.contains("쳐다보다") { vec![0.0, 0.0, 0.0, 1.0] }
@@ -376,6 +421,10 @@ mod tests {
         }
     }
 
+    fn shelf_entry() -> EntryRecord {
+        EntryRecord { id: "shelf".into(), term: "棚".into(), meanings: vec!["선반".into()], reading: Some("たな".into()) }
+    }
+
     fn grader(backend: Arc<FakeBackend>) -> SemanticGrader {
         let dir = tempdir().unwrap().keep();
         let db = Database::open(dir.join("semantic.db")).unwrap();
@@ -386,9 +435,9 @@ mod tests {
     fn deterministic_alias_paths_never_call_model() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend.clone());
-        assert_eq!(grader.grade_reading(&entry(), "내다보다", &[], &[]).decision, GradeDecision::Pass);
-        assert_eq!(grader.grade_reading(&entry(), "앞날", &["앞날".into()], &[]).decision, GradeDecision::Pass);
-        assert_eq!(grader.grade_reading(&entry(), "과거", &[], &["과거".into()]).decision, GradeDecision::Fail);
+        assert_eq!(grader.grade_reading(&entry(), "내다보다", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "앞날", &["앞날".into()], &[], "ko-KR", "ja-JP").decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "과거", &[], &["과거".into()], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     }
 
@@ -396,9 +445,9 @@ mod tests {
     fn semantic_synonym_passes_and_canonical_cache_is_reused() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend.clone());
-        assert_eq!(grader.grade_reading(&entry(), "미래를 내다보다", &[], &[]).decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "미래를 내다보다", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Pass);
         let first_calls = backend.calls.load(Ordering::Relaxed);
-        assert_eq!(grader.grade_reading(&entry(), "미래를 내다보다", &[], &[]).decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "미래를 내다보다", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Pass);
         assert_eq!(backend.calls.load(Ordering::Relaxed), first_calls);
     }
 
@@ -406,15 +455,25 @@ mod tests {
     fn unrelated_fails_and_confusable_negative_never_passes() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend);
-        assert_eq!(grader.grade_reading(&entry(), "쳐다보다", &[], &[]).decision, GradeDecision::Fail);
-        assert_ne!(grader.grade_reading(&entry(), "과거만 보다", &[], &["과거를 보다".into()]).decision, GradeDecision::Pass);
+        assert_eq!(grader.grade_reading(&entry(), "쳐다보다", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
+        assert_ne!(grader.grade_reading(&entry(), "과거만 보다", &[], &["과거를 보다".into()], "ko-KR", "ja-JP").decision, GradeDecision::Pass);
+    }
+
+    #[test]
+    fn source_term_and_reading_context_can_directly_accept_valid_translation() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let grader = grader(backend);
+        let related = grader.grade_reading(&shelf_entry(), "찬장", &[], &[], "ko-KR", "ja-JP");
+        assert_eq!(related.decision, GradeDecision::Pass);
+        assert_eq!(related.method, "semantic_context_embedding");
+        assert_eq!(grader.grade_reading(&shelf_entry(), "냉장고", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
     }
 
     #[test]
     fn unavailable_backend_abstains() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: true });
         let grader = grader(backend);
-        let outcome = grader.grade_reading(&entry(), "미래를 예측하다", &[], &[]);
+        let outcome = grader.grade_reading(&entry(), "미래를 예측하다", &[], &[], "ko-KR", "ja-JP");
         assert_eq!(outcome.decision, GradeDecision::Ambiguous);
         assert_eq!(outcome.method, "semantic_unavailable");
     }
@@ -423,7 +482,7 @@ mod tests {
     fn multiple_meanings_are_order_independent_one_to_one() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend);
-        let outcome = grader.grade_reading(&multi_entry(), "시간을 쓰다 / 매달다 / 전화하다", &[], &[]);
+        let outcome = grader.grade_reading(&multi_entry(), "시간을 쓰다 / 매달다 / 전화하다", &[], &[], "ko-KR", "ja-JP");
         assert_eq!(outcome.decision, GradeDecision::Pass);
         assert_eq!(outcome.method, "semantic_multi_embedding");
     }
@@ -432,7 +491,15 @@ mod tests {
     fn multiple_meanings_fail_on_missing_or_wrong_item() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend);
-        assert_eq!(grader.grade_reading(&multi_entry(), "매달다 / 전화하다", &[], &[]).decision, GradeDecision::Fail);
-        assert_eq!(grader.grade_reading(&multi_entry(), "매달다 / 전화하다 / 쳐다보다", &[], &[]).decision, GradeDecision::Fail);
+        assert_eq!(grader.grade_reading(&multi_entry(), "매달다 / 전화하다", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
+        assert_eq!(grader.grade_reading(&multi_entry(), "매달다 / 전화하다 / 쳐다보다", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
+    }
+
+    #[test]
+    fn contextual_translation_text_uses_deck_languages() {
+        let entry = EntryRecord { id: "en".into(), term: "shelf".into(), meanings: vec!["선반".into()], reading: None };
+        assert_eq!(contextual_translation_text(&entry, "선반", "ko-KR", "en-US").unwrap(), "en-US 표현 shelf의 ko-KR 뜻: 선반");
+        let entry = EntryRecord { id: "fr".into(), term: "étagère".into(), meanings: vec!["선반".into()], reading: None };
+        assert_eq!(contextual_translation_text(&entry, "선반", "ko-KR", "fr-FR").unwrap(), "fr-FR 표현 étagère의 ko-KR 뜻: 선반");
     }
 }
