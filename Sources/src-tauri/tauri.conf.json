@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "app.tanren.desktop",
   "build": {
-    "beforeDevCommand": "npm run web:dev",
+    "beforeDevCommand": "npm run sidecar:sync && npm run web:dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../../Results/web-dist"

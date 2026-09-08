@@ -10,6 +10,7 @@
     "build": "npm run ime:sync && tsc && vite build",
     "test": "vitest run",
     "sidecar:build": "powershell -ExecutionPolicy Bypass -File tools/build_sidecar.ps1",
+    "sidecar:sync": "powershell -ExecutionPolicy Bypass -File tools/sync_sidecar.ps1",
     "sidecar:test": "powershell -ExecutionPolicy Bypass -File tools/test_sidecar.ps1",
     "tauri": "tauri",
     "desktop": "tauri dev",

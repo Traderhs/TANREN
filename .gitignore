@@ -1,3 +1,6 @@
+#Results
+Results/
+
 # JavaScript / Vite
 Sources/node_modules/
 Sources/dist/
@@ -10,26 +13,12 @@ Sources/public/vendor/.tanren-hechima-pin
 # Rust / Tauri generated output
 Sources/src-tauri/target/
 Sources/src-tauri/gen/
-Results/cargo-target/
 
 # Python / PyInstaller generated output
 **/__pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
-Results/python-sidecar-env/
-Results/pyinstaller-work/
-Results/pyinstaller-spec/
-Results/sidecar/
-
-# Frontend/package caches and generated build output
-Results/debug/
-Results/npm-cache/
-Results/web-dist/
-Results/semantic/
-
-# Local toolchains
-Results/toolchains/
 
 # Local runtime data
 Runtime/
@@ -44,6 +33,7 @@ Data/*.sqlite3-*
 .idea/
 .vscode/
 .vs/
+.vite/
 .DS_Store
 Thumbs.db
 *.log
