@@ -13,6 +13,7 @@ use crate::{
 };
 
 const QUERY_INSTRUCTION: &str = "Instruct: 한국어 학습 답변과 사전의 한국어 의미가 같은 뜻인지 검색하세요.\nQuery: ";
+const CONTEXT_PASS_OFFSET: f64 = 0.05;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendIdentity {
@@ -159,8 +160,11 @@ impl SemanticGrader {
             GradeOutcome { decision: GradeDecision::Pass, method: "semantic_embedding", score: Some(best_positive) }
         } else if let Ok((context_positive, context_negative)) = self.contextual_translation_scores(entry, &normalized_answer, &positives, &negatives, answer_language, expression_language) {
             let context_margin = context_negative.map(|negative| context_positive - negative).unwrap_or(f64::INFINITY);
-            if context_positive >= self.thresholds.pass && context_margin >= self.thresholds.minimum_margin {
+            let context_pass = (self.thresholds.pass + CONTEXT_PASS_OFFSET).min(1.0);
+            if context_positive >= context_pass && context_margin >= self.thresholds.minimum_margin {
                 GradeOutcome { decision: GradeDecision::Pass, method: "semantic_context_embedding", score: Some(context_positive) }
+            } else if context_positive >= self.thresholds.pass {
+                GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_context_embedding", score: Some(context_positive) }
             } else if best_positive <= self.thresholds.fail {
                 GradeOutcome { decision: GradeDecision::Fail, method: "semantic_embedding", score: Some(best_positive) }
             } else {
@@ -394,7 +398,9 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.unavailable { return Err("offline".into()); }
             Ok(texts.iter().map(|text| {
-                if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 찬장") || text == "ja-JP 표현 棚(たな)의 ko-KR 뜻: 선반" { vec![1.0, 0.0, 0.0, 0.0] }
+                if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 찬장") { vec![0.93, 0.3676, 0.0, 0.0] }
+                else if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 서랍장") { vec![0.91, 0.4146, 0.0, 0.0] }
+                else if text == "ja-JP 표현 棚(たな)의 ko-KR 뜻: 선반" { vec![1.0, 0.0, 0.0, 0.0] }
                 else if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 냉장고") { vec![0.0, 0.0, 0.0, 1.0] }
                 else if text.contains("ja-JP 표현 見据える의 ko-KR 뜻: 내다보다") || text.contains("ja-JP 표현 見据える의 ko-KR 뜻: 전망하다") { vec![1.0, 0.0, 0.0, 0.0] }
                 else if text.contains("ja-JP 표현 見据える의 ko-KR 뜻: 쳐다보다") { vec![0.0, 0.0, 0.0, 1.0] }
@@ -466,6 +472,9 @@ mod tests {
         let related = grader.grade_reading(&shelf_entry(), "찬장", &[], &[], "ko-KR", "ja-JP");
         assert_eq!(related.decision, GradeDecision::Pass);
         assert_eq!(related.method, "semantic_context_embedding");
+        let nearby = grader.grade_reading(&shelf_entry(), "서랍장", &[], &[], "ko-KR", "ja-JP");
+        assert_eq!(nearby.decision, GradeDecision::Ambiguous);
+        assert_eq!(nearby.method, "semantic_context_embedding");
         assert_eq!(grader.grade_reading(&shelf_entry(), "냉장고", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
     }
 
