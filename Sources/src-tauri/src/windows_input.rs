@@ -58,7 +58,6 @@ impl WindowsInputAdapter {
             if profile_changed {
                 match activate_tsf_profile(langid) {
                     Ok(()) => {
-                        activate_window_layout(target_window, klid).map_err(|error| format!("{language} input profile could not be applied to the focused answer field: {error}"))?;
                         self.active_language = Some(language.to_string());
                     }
                     Err(tsf_error) => {
@@ -72,6 +71,12 @@ impl WindowsInputAdapter {
                     }
                 }
             }
+
+            // Focus can move from the WebView root to the actual input after the
+            // profile was selected. Re-assert the layout for the currently
+            // focused child even when the requested language itself did not change.
+            activate_window_layout(target_window, klid)
+                .map_err(|error| format!("{language} input profile could not be applied to the focused answer field: {error}"))?;
 
             if matches!(language, "ja-JP" | "ko-KR") {
                 if let Err(tsf_error) = set_native_tsf_mode(language) {
