@@ -5,7 +5,7 @@ describe("parseEntryText", () => {
   it("supports BOM, CRLF, TSV, headers, and keeps valid rows around malformed rows", () => {
     const parsed = parseEntryText("\uFEFFterm\tmeaning\r\n見据える\t내다보다 / 전망하다\r\n잘못됨\t\r\n躊躇う\t망설이다");
     expect(parsed.entries).toHaveLength(2);
-    expect(parsed.issues).toEqual([{ row: 3, message: "뜻이 비어 있습니다.", raw: "잘못됨\t" }]);
+    expect(parsed.issues).toEqual([{ row: 3, message: "뜻이 비어 있어요", raw: "잘못됨\t" }]);
   });
 
   it("supports quoted CSV commas, quotes, LF, and optional reading", () => {

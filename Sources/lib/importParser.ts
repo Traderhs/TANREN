@@ -21,7 +21,7 @@ function parseDelimited(text: string, delimiter: string): string[][] {
   }
   row.push(field);
   if (row.some((value) => value.length > 0)) rows.push(row);
-  if (quoted) throw new Error("닫히지 않은 CSV 따옴표가 있습니다.");
+    if (quoted) throw new Error("닫히지 않은 CSV 따옴표가 있어요");
   return rows;
 }
 
@@ -44,13 +44,13 @@ export function parseEntryText(input: string): ParsedImport {
     const meaningCell = fields[1]?.trim() ?? "";
     const reading = fields[2]?.trim() || undefined;
     if (!term || !meaningCell) {
-      issues.push({ row: index + 1, message: !term ? "표현이 비어 있습니다." : "뜻이 비어 있습니다.", raw });
+      issues.push({ row: index + 1, message: !term ? "표현이 비어 있어요" : "뜻이 비어 있어요", raw });
       return;
     }
     const meanings = meaningCell.split("/").map((value) => value.trim()).filter(Boolean);
     const key = `${term}\u0000${meanings.join("\u0000")}\u0000${reading ?? ""}`;
     if (seen.has(key)) {
-      issues.push({ row: index + 1, message: "입력 안의 중복 행입니다.", raw });
+      issues.push({ row: index + 1, message: "입력 안의 중복 행이에요", raw });
       return;
     }
     seen.add(key);

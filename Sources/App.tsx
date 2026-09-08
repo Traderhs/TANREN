@@ -793,7 +793,7 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
 
   const exportBackup = async () => {
     const exported = await api.exportBackup();
-    if (exported) setBackupMessage("백업 파일을 내보냈어요.");
+    if (exported) setBackupMessage("백업 파일을 내보냈어요");
   };
 
   const importBackup = async () => {
@@ -804,14 +804,14 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
     setSettings(restoredStorage);
     setPath(restoredStorage.selected_path ?? restoredStorage.active_path);
     await onDataRestored();
-    setBackupMessage("백업 파일을 가져왔어요.");
+    setBackupMessage("백업 파일을 가져왔어요");
   };
 
   return <section className="content settings-dashboard">
     <div className="settings-grid">
       <article className="settings-panel">
         <header><span>01</span><h2>데이터</h2></header>
-        <p className="settings-panel-help">저장 위치와 백업을 관리해요.</p>
+        <p className="settings-panel-help">저장 위치와 백업을 관리해요</p>
         <div className="settings-data-body">
           <label htmlFor="semantic-storage">저장 위치</label>
           <div className="settings-path-row">
@@ -833,11 +833,11 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
             <button className="settings-action-button" onClick={() => void reset()}>기본값</button>
           </div>
           {message && <p className="success">{message}</p>}
-          {settings?.restart_required && <p className="setting-warning">재시작하면 새 위치가 적용돼요.</p>}
+        {settings?.restart_required && <p className="setting-warning">재시작하면 새 위치가 적용돼요</p>}
 
           <div className="settings-backup-section">
             <strong>백업</strong>
-            <p>책, 학습 표현, 학습 기록, 통계와 설정을 하나의 <code>.tanren</code> 파일로 저장해요.</p>
+        <p>책, 학습 표현, 학습 기록, 통계와 설정을 하나의 <code>.tanren</code> 파일로 저장해요</p>
             <div className="settings-backup-actions">
               <button className="settings-action-button" onClick={() => void exportBackup()}>내보내기</button>
               <button className="settings-action-button" onClick={() => void importBackup()}>가져오기</button>
@@ -849,7 +849,7 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
 
       <article className="settings-panel">
         <header><span>02</span><h2>음성</h2></header>
-        <p className="settings-panel-help">학습 중 재생되는 음성을 조절해요.</p>
+        <p className="settings-panel-help">학습 중 재생되는 음성을 조절해요</p>
         <div className="settings-control-list">
           <label className="settings-range-row">
             <div><strong>음량</strong><span>{Math.round(audioSettings.volume * 100)}%</span></div>
@@ -1055,7 +1055,7 @@ function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDelete }: {
         <span className="book-inline-entry-delete-head">삭제</span>
       </div>
       {loading ? <div className="book-inline-entry-empty">불러오는 중</div>
-        : filteredEntries.length === 0 ? <div className="book-inline-entry-empty">{entries.length === 0 ? "아직 표현이 없어요." : "검색 결과가 없어요."}</div>
+        : filteredEntries.length === 0 ? <div className="book-inline-entry-empty">{entries.length === 0 ? "아직 표현이 없어요" : "검색 결과가 없어요"}</div>
           : sortedEntries.map((entry) => <div className="book-inline-entry-row" key={entry.id} role="row">
             <span className="book-inline-entry-number">{(entryNumbers.get(entry.id) ?? 0).toLocaleString("ko-KR")}</span>
             <strong>{entry.term}</strong>
@@ -1179,7 +1179,7 @@ const BookDeleteButton = memo(function BookDeleteButton({ deck, onDeleted }: {
 
   const remove = async () => {
     if (deleting) return;
-    if (!window.confirm(`'${deck.name}' 책을 삭제할까요?\n책장에서 바로 사라져요.`)) return;
+    if (!window.confirm(`'${deck.name}' 책을 삭제할까요?\n책장에서 바로 사라져요`)) return;
     setDeleting(true);
     try {
       await api.deleteDeck(deck.id);
@@ -1791,9 +1791,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       setEntryDialog(null);
       setEditingEntryId(null);
       setEntryMessage(processing?.failed
-        ? `${processingPrefix} ${processing.failed.toLocaleString("ko-KR")}개 표현의 피치·음성 생성에 실패했어요.${processing.last_error ? ` ${processing.last_error}` : ""}`
+          ? `${processingPrefix} ${processing.failed.toLocaleString("ko-KR")}개 표현의 피치·음성 생성에 실패했어요${processing.last_error ? ` ${processing.last_error}` : ""}`
         : processing?.runtime_phase === "unavailable"
-          ? `${processingPrefix} 음성 엔진을 사용할 수 없어 피치·음성 생성을 완료하지 못했어요.`
+            ? `${processingPrefix} 음성 엔진을 사용할 수 없어 피치·음성 생성을 완료하지 못했어요`
           : "");
       await refreshBookEntries(openedDeck.id, Boolean(result?.inserted));
     } finally {
@@ -1808,9 +1808,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       const result = await api.importEntries(openedDeck.id, parsedBulkEntries.entries);
       const processing = result.entry_ids.length ? await waitForEntryProcessing(result.entry_ids) : null;
       setEntryMessage(processing?.failed
-        ? `추가했지만 ${processing.failed.toLocaleString("ko-KR")}개 표현의 피치·음성 생성에 실패했어요.${processing.last_error ? ` ${processing.last_error}` : ""}`
+          ? `추가했지만 ${processing.failed.toLocaleString("ko-KR")}개 표현의 피치·음성 생성에 실패했어요${processing.last_error ? ` ${processing.last_error}` : ""}`
         : processing?.runtime_phase === "unavailable"
-          ? "추가했지만 음성 엔진을 사용할 수 없어 피치·음성 생성을 완료하지 못했어요."
+            ? "추가했지만 음성 엔진을 사용할 수 없어 피치·음성 생성을 완료하지 못했어요"
           : "");
       setBulkText("");
       setBulkFileName("");
@@ -2111,8 +2111,8 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                   <span>#</span><span>표현</span><span>발음</span><span>뜻</span>
                 </div>
                 <div className="book-entry-list">
-                  {bookPanelLoading ? <div className="book-workspace-empty">표현을 불러오고 있어요.</div>
-                    : filteredBookEntries.length === 0 ? <div className="book-workspace-empty">{bookEntries.length === 0 ? "아직 표현이 없어요." : "검색 결과가 없어요."}</div>
+                  {bookPanelLoading ? <div className="book-workspace-empty">표현을 불러오고 있어요</div>
+                    : filteredBookEntries.length === 0 ? <div className="book-workspace-empty">{bookEntries.length === 0 ? "아직 표현이 없어요" : "검색 결과가 없어요"}</div>
                       : filteredBookEntries.map((entry, index) => <div className="book-entry-row" key={entry.id}>
                         <span>{String(index + 1).padStart(3, "0")}</span>
                         <strong>{entry.term}</strong>
@@ -2137,7 +2137,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                   <span>총 {parsedBulkEntries.entries.length.toLocaleString("ko-KR")}개{bulkPreviewHiddenCount > 0 ? ` (${IMPORT_PREVIEW_LIMIT.toLocaleString("ko-KR")}개 미리보기)` : ""}</span>
                 </div>
                 {parsedBulkEntries.issues.length > 0 && <div className="book-entry-import-note">
-                  <span>확인 필요 행은 추가에서 제외돼요.</span>
+                        <span>확인 필요 행은 추가에서 제외돼요</span>
                 </div>}
                 <div className="book-entry-import-table" role="table" aria-label="가져올 표현 미리보기">
                   <div className="book-entry-import-row book-entry-import-head" role="row"><span>#</span><span>표현</span><span>발음</span><span>뜻</span></div>
@@ -2146,7 +2146,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                       ? bulkPreviewEntries.map((entry, index) => <div className="book-entry-import-row" role="row" key={`${index}-${entry.term}-${entry.reading ?? ""}`}>
                         <span>{(index + 1).toLocaleString("ko-KR")}</span><strong title={entry.term}>{entry.term}</strong><span title={entry.reading ?? ""}>{entry.reading || "—"}</span><span title={entry.meanings.join(" / ")}>{entry.meanings.join(" / ")}</span>
                       </div>)
-                      : <div className="book-entry-import-empty">가져올 수 있는 표현이 없어요.</div>}
+                      : <div className="book-entry-import-empty">가져올 수 있는 표현이 없어요</div>}
                   </div>
                 </div>
                 <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || parsedBulkEntries.entries.length === 0} onClick={() => void addBulkEntries()}>추가</button></div>
@@ -2169,7 +2169,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
               <span>총 {parsedBulkEntries.entries.length.toLocaleString("ko-KR")}개{bulkPreviewHiddenCount > 0 ? ` (${IMPORT_PREVIEW_LIMIT.toLocaleString("ko-KR")}개 미리보기)` : ""}</span>
             </div>
             {parsedBulkEntries.issues.length > 0 && <div className="book-entry-import-note">
-              <span>확인 필요 행은 추가에서 제외돼요.</span>
+                  <span>확인 필요 행은 추가에서 제외돼요</span>
             </div>}
             <div className="book-entry-import-table" role="table" aria-label="가져올 표현 미리보기">
               <div className="book-entry-import-row book-entry-import-head" role="row"><span>#</span><span>표현</span><span>발음</span><span>뜻</span></div>
@@ -2178,7 +2178,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                   ? bulkPreviewEntries.map((entry, index) => <div className="book-entry-import-row" role="row" key={`${index}-${entry.term}-${entry.reading ?? ""}`}>
                     <span>{(index + 1).toLocaleString("ko-KR")}</span><strong title={entry.term}>{entry.term}</strong><span title={entry.reading ?? ""}>{entry.reading || "—"}</span><span title={entry.meanings.join(" / ")}>{entry.meanings.join(" / ")}</span>
                   </div>)
-                  : <div className="book-entry-import-empty">가져올 수 있는 표현이 없어요.</div>}
+                : <div className="book-entry-import-empty">가져올 수 있는 표현이 없어요</div>}
               </div>
             </div>
             <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || parsedBulkEntries.entries.length === 0} onClick={() => void addBulkEntries()}>추가</button></div>
@@ -2308,7 +2308,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             })}
           </div>
         ))}
-        {decks.length === 0 && <div className="empty"><strong>아직 책이 없어요.</strong></div>}
+            {decks.length === 0 && <div className="empty"><strong>아직 책이 없어요</strong></div>}
       </motion.div>}
     </AnimatePresence>
   </section>;
@@ -2328,17 +2328,17 @@ function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise
     const parsed = parseEntryText(text);
     const result = await api.importEntries(deck.id, parsed.entries);
     const issueText = parsed.issues.length ? ` 확인이 필요한 표현이 ${parsed.issues.length}개 있어요: ${parsed.issues.map((issue) => `${issue.row}행 ${issue.message}`).join("; ")}` : "";
-    setMessage(`${result.inserted}개를 추가했어요.${result.duplicates ? ` 중복 ${result.duplicates}개는 건너뛰었어요.` : ""}${issueText}`);
+    setMessage(`${result.inserted}개를 추가했어요${result.duplicates ? ` 중복 ${result.duplicates}개는 건너뛰었어요` : ""}${issueText}`);
     await onDone();
   };
   const toggleMode = (mode: StudyMode) => setModes((current) => current.includes(mode) ? current.filter((value) => value !== mode) : [...current, mode]);
   const save = async () => {
     await api.updateDeck(deck.id, name, modes);
-    setMessage("책 설정을 저장했어요.");
+    setMessage("책 설정을 저장했어요");
     await onDone();
   };
   const remove = async () => {
-    if (!window.confirm(`'${name}' 책을 삭제할까요?\n책장에서 바로 사라져요.`)) return;
+    if (!window.confirm(`'${name}' 책을 삭제할까요?\n책장에서 바로 사라져요`)) return;
     await api.deleteDeck(deck.id);
     await onDone();
     window.location.reload();
@@ -2353,7 +2353,7 @@ function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise
     URL.revokeObjectURL(link.href);
   };
   return <section className="content narrow">
-    <div className="section-heading"><div><h1>{name}</h1><p>표현을 붙여넣거나 CSV로 추가할 수 있어요.</p></div></div>
+      <div className="section-heading"><div><h1>{name}</h1><p>표현을 붙여넣거나 CSV로 추가할 수 있어요</p></div></div>
     <div className="deck-settings">
       <input value={name} maxLength={MAX_DECK_NAME_LENGTH} onChange={(event) => setName(event.target.value)} aria-label="책 이름" />
       <div className="mode-options">
@@ -2923,7 +2923,7 @@ function GrowthChart({ stats }: { stats: LibraryStats }) {
       }}
       onMouseLeave={resetTooltipMotion}
     >
-      {validValues.length === 0 ? <div className="stats-growth-empty">학습 기록이 쌓이면 성장 곡선이 보여요.</div> :
+          {validValues.length === 0 ? <div className="stats-growth-empty">학습 기록이 쌓이면 성장 곡선이 보여요</div> :
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart accessibilityLayer={false} data={visibleChartData} margin={{ top: 68, right: 24, bottom: 4, left: 8 }}>
             <defs>
@@ -2991,23 +2991,23 @@ function GrowthChart({ stats }: { stats: LibraryStats }) {
 
 function LibraryStatsView({ stats, deck }: { stats: LibraryStats | null; deck: DeckSummary | null }) {
   return <section className="content stats-dashboard stats-dashboard-global">
-    {!stats ? <div className="stats-loading" aria-live="polite"><span />통계를 불러오고 있어요.</div>
-      : stats.deck_count === 0 ? <div className="stats-empty"><span>統</span><strong>아직 보여드릴 통계가 없어요.</strong><p>학습을 시작하면 기록이 여기에 쌓여요.</p></div>
+      {!stats ? <div className="stats-loading" aria-live="polite"><span />통계를 불러오고 있어요</div>
+        : stats.deck_count === 0 ? <div className="stats-empty"><span>統</span><strong>아직 보여드릴 통계가 없어요</strong><p>학습을 시작하면 기록이 여기에 쌓여요</p></div>
         : <>
           <div className="stats-context" aria-label={deck ? `${deck.name} 통계` : "전체 통계"}>
             <span>{deck ? "BOOK" : "LIBRARY"}</span>
             <strong>{deck ? `${deck.name} 통계` : "전체 통계"}</strong>
           </div>
           <div className="stats-summary-grid">
-            <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="지금까지 문제를 푼 횟수예요." />
-            <StatsMetric label="누적 표현 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help="한 번이라도 학습한 표현 수예요." />
-            <StatsMetric label="문제 정확도" value={formatPercent(stats.base_accuracy)} help="피치를 제외한 문제의 정답률이에요." />
-            <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help="피치를 정확히 맞힌 비율이에요." />
-            <StatsMetric label="중앙 응답시간" value={formatLatency(stats.median_recall_latency_ms)} help="문제를 보고 답을 입력하기 시작하기까지 걸린 시간이에요." />
-            <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="학습 화면에서 실제로 공부한 시간을 기록해요." />
+            <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="지금까지 문제를 푼 횟수예요" />
+            <StatsMetric label="누적 표현 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help="한 번이라도 학습한 표현 수예요" />
+            <StatsMetric label="문제 정확도" value={formatPercent(stats.base_accuracy)} help="피치를 제외한 문제의 정답률이에요" />
+            <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help="피치를 정확히 맞힌 비율이에요" />
+            <StatsMetric label="중앙 응답시간" value={formatLatency(stats.median_recall_latency_ms)} help="문제를 보고 답을 입력하기 시작하기까지 걸린 시간이에요" />
+            <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="학습 화면에서 실제로 공부한 시간을 기록해요" />
             {deck
-              ? <StatsMetric label="수록 표현" value={`${numberFormat.format(stats.entry_count)}개`} help="이 책에 들어 있는 전체 표현 수예요." />
-              : <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요." />}
+              ? <StatsMetric label="수록 표현" value={`${numberFormat.format(stats.entry_count)}개`} help="이 책에 들어 있는 전체 표현 수예요" />
+              : <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요" />}
           </div>
 
           <GrowthChart stats={stats} />

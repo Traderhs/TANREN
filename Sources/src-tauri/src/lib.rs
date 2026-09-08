@@ -140,7 +140,7 @@ fn create_deck(
     source_language: String,
     target_language: String,
 ) -> Result<DeckSummary, String> {
-    if name.trim().is_empty() { return Err("책 이름을 입력해주세요.".into()); }
+    if name.trim().is_empty() { return Err("책 이름을 입력해주세요".into()); }
     state.db.create_deck(name.trim(), &source_language, &target_language)
 }
 
@@ -193,14 +193,14 @@ fn update_entry(state: State<'_, AppState>, deck_id: String, entry_id: String, e
 
 #[tauri::command]
 fn delete_entry(state: State<'_, AppState>, deck_id: String, entry_id: String) -> Result<(), String> {
-    if state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?.session.as_ref().is_some_and(|session| session.deck_id == deck_id) {
-        return Err("학습을 끝낸 뒤 삭제해주세요.".into());
+    if state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?.session.as_ref().is_some_and(|session| session.deck_id == deck_id) {
+        return Err("학습을 끝낸 뒤 삭제해주세요".into());
     }
     state.db.delete_entry(&deck_id, &entry_id)
 }
 
 fn deck_summary(db: &Database, deck_id: &str) -> Result<DeckSummary, String> {
-    db.list_decks()?.into_iter().find(|deck| deck.id == deck_id).ok_or_else(|| "책을 찾지 못했어요.".into())
+    db.list_decks()?.into_iter().find(|deck| deck.id == deck_id).ok_or_else(|| "책을 찾지 못했어요".into())
 }
 
 #[tauri::command]
@@ -211,8 +211,8 @@ fn update_deck(state: State<'_, AppState>, deck_id: String, name: String, enable
 
 #[tauri::command]
 fn delete_deck(state: State<'_, AppState>, deck_id: String) -> Result<(), String> {
-    if state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?.session.as_ref().is_some_and(|session| session.deck_id == deck_id) {
-        return Err("학습을 끝낸 뒤 삭제해주세요.".into());
+    if state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?.session.as_ref().is_some_and(|session| session.deck_id == deck_id) {
+        return Err("학습을 끝낸 뒤 삭제해주세요".into());
     }
     state.db.delete_deck(&deck_id)
 }
@@ -233,11 +233,11 @@ fn import_deck_export(state: State<'_, AppState>, payload: String) -> Result<Dec
 fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) -> Result<SubmitResult, String> {
     let deck = state.db.deck(&deck_id)?;
     let entries = state.db.entries(&deck_id)?;
-    if entries.is_empty() { return Err("먼저 표현을 추가해주세요.".into()); }
+    if entries.is_empty() { return Err("먼저 표현을 추가해주세요".into()); }
     let selected_stage = stage.unwrap_or(deck.current_stage);
     let slots = state.db.ensure_stage_schedule(&deck_id, selected_stage, &entries)?;
 
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let stale_session = if let Some(session) = engine.session.as_ref() {
         state.db.load_session(&session.deck_id, session.stage)?.is_none()
     } else {
@@ -247,7 +247,7 @@ fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) 
         engine.session = None;
     }
     if engine.session.as_ref().is_some_and(|session| session.deck_id != deck_id || session.stage != selected_stage) {
-        return Err("다른 책이나 단계를 학습 중이에요. 먼저 종료해주세요.".into());
+        return Err("다른 책이나 단계를 학습 중이에요 먼저 종료해주세요".into());
     }
     if engine.session.is_none() {
         let mut session = if let Some(persisted) = state.db.load_session(&deck_id, selected_stage)? {
@@ -256,7 +256,7 @@ fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) 
             StudySession::new_for_stage_with_slots(
                 deck_id.clone(), selected_stage, slots, &entries, &deck.enabled_modes,
                 deck.increment_size, deck.checkpoint_size, random(),
-            ).ok_or("이 단계는 지금 시작할 수 없어요.")?
+    ).ok_or("이 단계는 지금 시작할 수 없어요")?
         };
         if let Some(variant) = match session.pending.as_ref() {
             Some(PendingState::Pitch { variant, .. }) | Some(PendingState::PitchCorrection { variant, .. }) => Some(variant.clone()),
@@ -268,7 +268,7 @@ fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) 
         }
         session.sync_entries(&entries, &deck.enabled_modes);
         engine.session = Some(session);
-        let mut input = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요.")?;
+    let mut input = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요")?;
         let _ = input.remember_current();
     }
     let result = resume_session(&state, &mut engine)?;
@@ -279,7 +279,7 @@ fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) 
 #[tauri::command]
 fn record_study_activity(state: State<'_, AppState>, deck_id: String, mode: Option<StudyMode>, duration_ms: u64) -> Result<(), String> {
     state.db.record_study_activity(&deck_id, mode, duration_ms)?;
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     if let Some(session) = engine.session.as_mut().filter(|session| session.deck_id == deck_id) {
         session.active_duration_ms = session.active_duration_ms.saturating_add(duration_ms);
         state.db.save_session(session)?;
@@ -298,8 +298,8 @@ fn submit_answer(
     interkey_gaps_ms: Vec<u64>,
     ime_composition_ms: u64,
 ) -> Result<SubmitResult, String> {
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
-    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
+    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     if session.pending.is_some() { return Err("current card is awaiting review, pitch, or adjudication".into()); }
     let variant = session.current.clone().ok_or("no active card")?;
     if variant.id() != variant_id { return Err("stale study card submission".into()); }
@@ -349,7 +349,7 @@ fn submit_answer(
             state.db.save_session(session)?;
             Ok(SubmitResult {
                 status: SubmitStatus::Ambiguous,
-                message: Some("이 답은 직접 판정이 필요해요.".into()),
+            message: Some("이 답은 직접 판정이 필요해요".into()),
                 failure_type: None,
                 canonical_answer: Some(entry.meanings.join(" / ")),
                 reading: entry.reading,
@@ -374,7 +374,7 @@ fn submit_answer(
                 })
             } else {
                 session.resolve_current(&variant, true)?;
-                let result = review_result(&entry, None, "맞았어요.");
+        let result = review_result(&entry, None, "맞았어요");
                 session.pending = Some(PendingState::Review { variant, result: result.clone() });
                 state.db.save_session(session)?;
                 Ok(result)
@@ -392,8 +392,8 @@ fn timeout_current(
     elapsed_ms: u64,
     typing_duration_ms: u64,
 ) -> Result<SubmitResult, String> {
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
-    let session = engine.session.as_ref().ok_or("진행 중인 학습이 없어요.")?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
+    let session = engine.session.as_ref().ok_or("진행 중인 학습이 없어요")?;
     if session.pending.is_some() { return Err("current card already resolved".into()); }
     let variant = session.current.clone().ok_or("no active card")?;
     validate_timeout_variant(&variant, &variant_id)?;
@@ -409,8 +409,8 @@ fn timeout_current(
 
 #[tauri::command]
 fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: bool) -> Result<SubmitResult, String> {
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
-    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
+    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let pending = ambiguous_for_adjudication(&session.pending, &variant_id)?;
     let PendingState::Ambiguous { variant, answer: pending_answer, recall_latency_ms, typing_duration_ms, interkey_gaps_ms, ime_composition_ms, method, score } = pending else {
         unreachable!();
@@ -436,7 +436,7 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
         Ok(SubmitResult { status: SubmitStatus::Pitch, message: None, failure_type: None, canonical_answer: Some(entry.term.clone()), reading: entry.reading, pitch: Some(question), card: None })
     } else {
         session.resolve_current(&variant, true)?;
-        let result = review_result(&entry, None, "정답으로 기억했어요.");
+        let result = review_result(&entry, None, "정답으로 기억했어요");
         session.pending = Some(PendingState::Review { variant, result: result.clone() });
         state.db.save_session(session)?;
         Ok(result)
@@ -454,8 +454,8 @@ fn ambiguous_for_adjudication(pending: &Option<PendingState>, variant_id: &str) 
 
 #[tauri::command]
 fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8>) -> Result<SubmitResult, String> {
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
-    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
+    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let pending = session.pending.clone().ok_or("no pitch question is pending")?;
     let (variant, question, correction_failure) = match pending {
         PendingState::Pitch { variant, question } => (variant, question, None),
@@ -473,7 +473,7 @@ fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8
         let result = review_result(
             &entry,
             Some(&failure),
-            "오답이에요. 방금 피치는 연습용이며 피치 정확도에 포함되지 않아요.",
+        "오답이에요 방금 피치는 연습용이며 피치 정확도에 포함되지 않아요",
         );
         session.pending = Some(PendingState::Review { variant, result: result.clone() });
         state.db.save_session(session)?;
@@ -488,7 +488,7 @@ fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8
     let result = review_result(
         &entry,
         failed_gate.then_some(FailureType::PitchWrong.as_str()),
-        if correct { "피치도 맞았어요." } else if question.gate_enabled { "피치가 달라요. 이 문제는 다시 나와요." } else { "참고 피치와 달라요. 정답 처리는 그대로예요." },
+        if correct { "피치도 맞았어요" } else if question.gate_enabled { "피치가 달라요 이 문제는 다시 나와요" } else { "참고 피치와 달라요 정답 처리는 그대로예요" },
     );
     session.pending = Some(PendingState::Review { variant, result: result.clone() });
     state.db.save_session(session)?;
@@ -502,8 +502,8 @@ fn grade_pitch_contour(question: &model::PitchQuestion, contour: &[u8]) -> (bool
 
 #[tauri::command]
 fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
-    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
+    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let reviewed_variant = match session.pending.take() {
         Some(PendingState::Review { variant, .. }) => variant,
         Some(other) => { session.pending = Some(other); return Err("review is not ready to continue".into()); }
@@ -532,8 +532,8 @@ fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
 
 #[tauri::command]
 fn continue_cycle(state: State<'_, AppState>) -> Result<SubmitResult, String> {
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
-    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
+    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     match session.pending.take() {
         Some(PendingState::CycleComplete { .. }) => {}
         Some(other) => { session.pending = Some(other); return Err("cycle is not ready to continue".into()); }
@@ -863,20 +863,20 @@ fn export_backup(state: State<'_, AppState>) -> Result<Option<String>, String> {
 #[tauri::command]
 fn import_backup(state: State<'_, AppState>) -> Result<bool, String> {
     let Some(path) = pick_backup_file(false)? else { return Ok(false); };
-    state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?.session = None;
+    state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?.session = None;
     state.db.import_backup(&path)?;
     Ok(true)
 }
 
 #[tauri::command]
 fn exit_study(state: State<'_, AppState>) -> Result<(), String> {
-    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     if let Some(session) = engine.session.as_mut() {
         session.recover_interrupted_card();
         state.db.save_session(session)?;
     }
     engine.session = None;
-    state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요.")?.restore()?;
+    state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요")?.restore()?;
     Ok(())
 }
 
@@ -906,7 +906,7 @@ fn fail_base(
     failure: FailureType,
     score: Option<f64>,
 ) -> Result<SubmitResult, String> {
-    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
+    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let stage = session.range().label.clone();
     db.insert_attempt(
         &entry.id, &session.deck_id, variant.mode, session.stage, &stage, &answer,
@@ -931,7 +931,7 @@ fn fail_base(
         });
     }
     session.resolve_current(&variant, false)?;
-    let result = review_result(entry, Some(failure.as_str()), "정답을 보고 다음 문제로 넘어가세요.");
+    let result = review_result(entry, Some(failure.as_str()), "정답을 보고 다음 문제로 넘어가세요");
     session.pending = Some(PendingState::Review { variant, result: result.clone() });
     db.save_session(session)?;
     Ok(result)
@@ -950,7 +950,7 @@ fn review_result(entry: &EntryRecord, failure: Option<&str>, message: &str) -> S
 }
 
 fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Result<SubmitResult, String> {
-    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
+    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     if session.current.is_some() { return Err("an unresolved active card already exists".into()); }
     let variant = session.next_variant(10).ok_or("stage queue is empty")?;
     session.pending = None;
@@ -961,20 +961,20 @@ fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Res
 
 fn complete_current_stage(state: &AppState, engine: &mut Engine) -> Result<SubmitResult, String> {
     let (deck_id, stage, duration_ms, cycles) = {
-        let session = engine.session.as_ref().ok_or("진행 중인 학습이 없어요.")?;
+    let session = engine.session.as_ref().ok_or("진행 중인 학습이 없어요")?;
         (session.deck_id.clone(), session.stage, session.active_duration_ms, session.queue.completed_cycles as u32 + 1)
     };
     state.db.mark_stage_completed(&deck_id, stage, duration_ms, cycles)?;
     state.db.clear_stage_session(&deck_id, stage)?;
     engine.session = None;
-    let _ = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요.")?.restore();
+    let _ = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요")?.restore();
     Ok(SubmitResult::simple(SubmitStatus::StageComplete))
 }
 
 fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) -> Result<StudyCard, String> {
     let deck = state.db.deck(&session.deck_id)?;
     let entries = state.db.entries(&session.deck_id)?;
-    let entry = entries.iter().find(|e| e.id == variant.entry_id).ok_or("표현을 찾지 못했어요.")?;
+    let entry = entries.iter().find(|e| e.id == variant.entry_id).ok_or("표현을 찾지 못했어요")?;
     let question = match variant.mode {
         StudyMode::Reading => entry.term.clone(),
         StudyMode::Listening => entry.term.clone(),
@@ -984,7 +984,7 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
     let profile = state.db.typing_profile(&deck.id, &answer_language, variant.mode)?;
     let audio_path = state.db.next_audio_path(&entry.id)?;
     if matches!(variant.mode, StudyMode::Listening) && audio_path.is_none() {
-        return Err("아직 음성이 준비되지 않았어요. 잠시 후 다시 시도해주세요.".into());
+        return Err("아직 음성이 준비되지 않았어요 잠시 후 다시 시도해주세요".into());
     }
     Ok(StudyCard {
         entry_id: entry.id.clone(),
@@ -1011,14 +1011,14 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
     if should_complete_empty_stage {
         return complete_current_stage(state, engine);
     }
-    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
+    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     match session.pending.clone() {
         Some(PendingState::Ambiguous { variant, .. }) => {
             let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
             let card = build_card(state, session, &variant)?;
             Ok(SubmitResult {
                 status: SubmitStatus::Ambiguous,
-                message: Some("이 답은 직접 판정이 필요해요.".into()),
+            message: Some("이 답은 직접 판정이 필요해요".into()),
                 failure_type: None,
                 canonical_answer: Some(entry.meanings.join(" / ")),
                 reading: entry.reading,
@@ -1084,7 +1084,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
 }
 
 fn find_entry(db: &Database, deck_id: &str, entry_id: &str) -> Result<EntryRecord, String> {
-    db.entries(deck_id)?.into_iter().find(|e| e.id == entry_id).ok_or_else(|| "표현을 찾지 못했어요.".into())
+    db.entries(deck_id)?.into_iter().find(|e| e.id == entry_id).ok_or_else(|| "표현을 찾지 못했어요".into())
 }
 
 fn record_successful_typing(db: &Database, deck: &model::DeckRecord, variant: &VariantKey, answer: &str, gaps: &[u64], duration_ms: u64, ime_ms: u64) -> Result<(), String> {
@@ -1239,7 +1239,7 @@ fn pick_backup_file(save: bool) -> Result<Option<PathBuf>, String> {
     #[cfg(not(windows))]
     {
         let _ = save;
-        Err("백업 파일 선택은 현재 Windows에서만 지원해요.".into())
+        Err("백업 파일 선택은 현재 Windows에서만 지원해요".into())
     }
 }
 
