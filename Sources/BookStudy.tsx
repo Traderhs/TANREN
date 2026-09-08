@@ -117,6 +117,9 @@ export function BookStudy({
   const [elapsed, setElapsed] = useState(0);
   const [studyActivityNow, setStudyActivityNow] = useState(() => performance.now());
   const [playing, setPlaying] = useState(false);
+  const [listeningAudioFinished, setListeningAudioFinished] = useState(
+    initialResult.card?.mode !== "listening" || !initialResult.card?.audio_path,
+  );
   const [imeSegments, setImeSegments] = useState<JapaneseImeSegment[]>([]);
   const [imeReady, setImeReady] = useState(false);
   const [pitch, setPitch] = useState<PitchSelection>(emptyPitchSelection(initialResult.pitch?.morae.length ?? 0));
@@ -146,6 +149,9 @@ export function BookStudy({
   const timeoutSent = useRef(false);
   const locked = useRef(false);
   const composing = useRef(false);
+  const listeningTimerStarted = useRef(
+    initialResult.card?.mode !== "listening" || !initialResult.card?.audio_path,
+  );
   const studyActivityStartedAt = useRef<number | null>(null);
   const stageStudyDuration = useRef(initialResult.card?.active_duration_ms ?? 0);
   const studyActivityMode = useRef(card?.mode ?? null);
@@ -281,6 +287,9 @@ export function BookStudy({
     setAnswer("");
     answerRef.current = "";
     setPlaying(false);
+    const listeningReady = nextCard.mode !== "listening" || !nextCard.audio_path;
+    listeningTimerStarted.current = listeningReady;
+    setListeningAudioFinished(listeningReady);
     setInputWarning("");
     setImeSegments([]);
     selection.current = { start: 0, end: 0 };
@@ -300,6 +309,30 @@ export function BookStudy({
     };
     setElapsed(0);
   }
+
+  function startListeningTimer() {
+    const currentCard = cardRef.current;
+    if (!currentCard || currentCard.mode !== "listening" || listeningTimerStarted.current) return;
+    listeningTimerStarted.current = true;
+    const currentNow = performance.now();
+    timing.current = {
+      start: currentNow,
+      first: null,
+      last: null,
+      gaps: [],
+      compositionStart: 0,
+      compositionMs: 0,
+      compositionEnd: null,
+    };
+    setElapsed(0);
+    setListeningAudioFinished(true);
+  }
+
+  useEffect(() => {
+    if (!active || busy || card?.mode !== "listening" || !listeningAudioFinished) return;
+    const frame = requestAnimationFrame(() => input.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [active, busy, card?.variant_id, card?.mode, listeningAudioFinished]);
 
   async function run(action: () => Promise<SubmitResult | void>) {
     if (locked.current) return;
@@ -446,7 +479,7 @@ export function BookStudy({
         ime.current.setActive(true);
         setImeReady(true);
         input.current?.focus();
-      }).catch(() => { if (!cancelled) setInputWarning("내장 일본어 입력기를 불러오지 못했어요."); });
+    }).catch(() => { if (!cancelled) setInputWarning("내장 일본어 입력기를 불러오지 못했어요"); });
     } else {
       const activate = () => {
         input.current?.focus();
@@ -608,7 +641,10 @@ export function BookStudy({
     }
     player.volume = audioSettings.volume;
     player.playbackRate = audioSettings.playback_rate;
-    void player.play().catch(() => setInputWarning("음성을 재생하지 못했어요. 재생 버튼으로 다시 시도해 주세요."));
+    void player.play().catch(() => {
+      setInputWarning("음성을 재생하지 못했어요 재생 버튼으로 다시 시도해 주세요");
+      startListeningTimer();
+    });
   }
 
   useEffect(() => {
@@ -696,6 +732,7 @@ export function BookStudy({
 
   useEffect(() => {
     if (!active || !card || busy || timeoutSent.current) return;
+    if (card.mode === "listening" && !listeningAudioFinished) return;
     const interval = window.setInterval(() => {
       const currentNow = performance.now();
       const currentTiming = timing.current;
@@ -716,7 +753,7 @@ export function BookStudy({
       }
     }, 100);
     return () => window.clearInterval(interval);
-  }, [active, card?.variant_id, card?.recall_timeout_ms, card?.completion_idle_ms, busy, error]);
+  }, [active, card?.variant_id, card?.recall_timeout_ms, card?.completion_idle_ms, card?.mode, listeningAudioFinished, busy, error]);
 
   function submitAnswer() {
     if (!card || !active || locked.current || composing.current || (japanese && !imeReady)) return;
@@ -860,7 +897,7 @@ export function BookStudy({
                 ref={input}
                 value={preedit ? answer.slice(0, selection.current.start) + preedit + answer.slice(selection.current.end) : answer}
                 readOnly={japanese}
-                disabled={busy}
+                disabled={busy || (card?.mode === "listening" && !listeningAudioFinished)}
                 autoComplete="off"
                 autoCorrect="off"
                 autoCapitalize="off"
@@ -1071,7 +1108,19 @@ export function BookStudy({
         </div>}
       </>}
 
-      {card?.audio_path && <audio ref={audio} src={convertFileSrc(card.audio_path)} preload="auto" onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} onEmptied={() => setPlaying(false)} />}
+      {card?.audio_path && <audio
+        ref={audio}
+        src={convertFileSrc(card.audio_path)}
+        preload="auto"
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => {
+          setPlaying(false);
+          startListeningTimer();
+        }}
+        onError={() => startListeningTimer()}
+        onEmptied={() => setPlaying(false)}
+      />}
       {(card?.input_warning || inputWarning) && <p className="learning-warning">{card?.input_warning || inputWarning}</p>}
       {error && <p className="learning-error" role="alert">{error}</p>}
     </main>
