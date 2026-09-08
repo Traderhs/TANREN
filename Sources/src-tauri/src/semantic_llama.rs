@@ -6,7 +6,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
@@ -28,6 +28,7 @@ struct RuntimeState {
     child: Option<Child>,
     #[cfg(windows)]
     job: Option<usize>,
+    loading_started: Option<Instant>,
     load_time_ms: Option<u64>,
     last_embedding_ms: Option<u64>,
     error: Option<String>,
@@ -42,7 +43,7 @@ impl LlamaCppEmbeddingBackend {
     pub fn install(home: PathBuf) -> Arc<Self> {
         let backend = Arc::new(Self {
             home,
-            state: Mutex::new(RuntimeState { phase: "starting".into(), port: None, child: None, #[cfg(windows)] job: None, load_time_ms: None, last_embedding_ms: None, error: None }),
+            state: Mutex::new(RuntimeState { phase: "starting".into(), port: None, child: None, #[cfg(windows)] job: None, loading_started: None, load_time_ms: None, last_embedding_ms: None, error: None }),
         });
         let worker = Arc::clone(&backend);
         thread::spawn(move || worker.prepare());
@@ -88,6 +89,9 @@ impl LlamaCppEmbeddingBackend {
 
     fn start_server(&self, server_path: &Path, model_path: &Path) -> Result<(), String> {
         self.set_phase("loading")?;
+        if let Ok(mut state) = self.state.lock() {
+            state.loading_started = Some(Instant::now());
+        }
         let port = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?.local_addr().map_err(|e| e.to_string())?.port();
         let logs = self.home.join("logs");
         fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
@@ -127,6 +131,7 @@ impl LlamaCppEmbeddingBackend {
             if http_get(port, "/health").is_ok() {
                 let mut state = self.state.lock().map_err(|_| "semantic runtime lock poisoned")?;
                 state.phase = "ready".into();
+                state.loading_started = None;
                 state.load_time_ms = Some(started.elapsed().as_millis() as u64);
                 state.error = None;
                 return Ok(());
@@ -147,11 +152,32 @@ impl LlamaCppEmbeddingBackend {
     }
 
     fn download_progress(&self) -> Option<u8> {
-        latest_partial_progress(&[
+        cumulative_asset_progress(&[
             (self.home.join("models").join(MODEL_FILE), MODEL_SIZE),
             (self.home.join("runtime").join("llama-b10621-bin-win-cuda-12.4-x64.zip"), LLAMA_ZIP_SIZE),
             (self.home.join("runtime").join("cudart-llama-bin-win-cuda-12.4-x64.zip"), CUDA_ZIP_SIZE),
         ])
+    }
+
+    fn load_progress(&self, started: Option<Instant>) -> Option<u8> {
+        let started = started?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let timed = ((elapsed_ms.saturating_mul(95)) / 15_000).min(95) as u8;
+        let log = fs::read_to_string(self.home.join("logs").join("llama-server.stderr.log")).unwrap_or_default();
+        let observed = if log.contains("model loaded") {
+            99
+        } else if log.contains("initializing, n_slots") {
+            90
+        } else if log.contains("llama threadpool init") {
+            78
+        } else if log.contains("control-looking token") {
+            48
+        } else if log.contains("loading model") {
+            12
+        } else {
+            1
+        };
+        Some(timed.max(observed).min(99))
     }
 }
 
@@ -179,8 +205,14 @@ impl EmbeddingBackend for LlamaCppEmbeddingBackend {
     fn status(&self) -> SemanticRuntimeStatus {
         let state = self.state.lock().ok();
         let phase = state.as_ref().map(|value| value.phase.clone()).unwrap_or_else(|| "unavailable".into());
+        let loading_started = state.as_ref().and_then(|value| value.loading_started);
         SemanticRuntimeStatus {
             download_progress: if phase == "downloading" { self.download_progress() } else { None },
+            load_progress: match phase.as_str() {
+                "loading" => self.load_progress(loading_started),
+                "ready" => Some(100),
+                _ => None,
+            },
             phase,
             model_id: MODEL_ID.into(),
             model_version: MODEL_VERSION.into(),
@@ -194,19 +226,17 @@ impl EmbeddingBackend for LlamaCppEmbeddingBackend {
     }
 }
 
-fn latest_partial_progress(assets: &[(PathBuf, u64)]) -> Option<u8> {
-    let mut latest: Option<(SystemTime, u64, u64)> = None;
-    for (path, total) in assets {
+fn cumulative_asset_progress(assets: &[(PathBuf, u64)]) -> Option<u8> {
+    let total_bytes = assets.iter().map(|(_, total)| *total).sum::<u64>();
+    if total_bytes == 0 { return None; }
+    let downloaded = assets.iter().map(|(path, total)| {
+        let complete = fs::metadata(path).ok().map(|metadata| metadata.len().min(*total)).unwrap_or(0);
+        if complete > 0 { return complete; }
         let mut partial_name = path.as_os_str().to_os_string();
         partial_name.push(".partial");
-        let partial = PathBuf::from(partial_name);
-        let Ok(metadata) = fs::metadata(partial) else { continue; };
-        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if latest.as_ref().map_or(true, |(current, _, _)| modified >= *current) {
-            latest = Some((modified, metadata.len(), *total));
-        }
-    }
-    latest.map(|(_, downloaded, total)| ((downloaded.min(total) * 100) / total.max(1)) as u8)
+        fs::metadata(PathBuf::from(partial_name)).ok().map(|metadata| metadata.len().min(*total)).unwrap_or(0)
+    }).sum::<u64>();
+    Some(((downloaded.saturating_mul(100)) / total_bytes).min(100) as u8)
 }
 
 impl Drop for LlamaCppEmbeddingBackend {

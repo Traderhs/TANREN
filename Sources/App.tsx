@@ -1,4 +1,5 @@
 import { FormEvent, forwardRef, memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import HTMLFlipBook from "react-pageflip";
@@ -11,7 +12,7 @@ import { parseEntryText } from "./lib/importParser";
 import { BookStudy } from "./BookStudy";
 import { loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { SubmitResult } from "./lib/types";
-import type { AudioSettings, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
+import type { AudioSettings, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
 
 type View = "decks" | "editor" | "settings";
 
@@ -43,11 +44,11 @@ const VIEW_LABELS: Record<Exclude<View, "decks">, string> = {
   settings: "설정",
 };
 
-function runtimePhaseLabel(phase: string, downloadProgress?: number | null) {
+function runtimePhaseLabel(phase: string, downloadProgress?: number | null, loadProgress?: number | null) {
   switch (phase) {
     case "starting": return "준비 중이에요";
-    case "downloading": return downloadProgress == null ? "필요한 파일을 받고 있어요" : `${downloadProgress}%  ·  필요한 파일을 받고 있어요`;
-    case "loading": return "불러오고 있어요";
+    case "downloading": return `${Math.max(0, Math.min(100, Math.round(downloadProgress ?? 0)))}%  ·  필요한 파일을 받고 있어요`;
+    case "loading": return `${Math.max(0, Math.min(100, Math.round(loadProgress ?? 0)))}%  ·  불러오고 있어요`;
     case "ready": return "사용할 수 있어요";
     default: return "지금은 사용할 수 없어요";
   }
@@ -55,6 +56,37 @@ function runtimePhaseLabel(phase: string, downloadProgress?: number | null) {
 
 function runtimePhaseIsLoading(phase?: string) {
   return !phase || phase === "starting" || phase === "downloading" || phase === "loading";
+}
+
+type RuntimeDisplayState = {
+  phase: string;
+  downloadProgress: number;
+  loadProgress: number;
+};
+
+function phaseDownloadProgress(phase: string | undefined, progress?: number | null) {
+  if (!phase || phase === "starting") return 0;
+  if (phase === "downloading") return Math.max(0, Math.min(100, progress ?? 0));
+  return 100;
+}
+
+function phaseLoadProgress(phase: string | undefined, progress?: number | null) {
+  if (!phase || phase === "starting" || phase === "downloading") return 0;
+  if (phase === "loading") return Math.max(0, Math.min(100, progress ?? 0));
+  return 100;
+}
+
+function runtimeDisplayState(phase: string | undefined, downloadProgress?: number | null, loadProgress?: number | null): RuntimeDisplayState {
+  if (!phase || phase === "starting") {
+    return { phase: "starting", downloadProgress: 0, loadProgress: 0 };
+  }
+  const download = phaseDownloadProgress(phase, downloadProgress);
+  const load = phaseLoadProgress(phase, loadProgress);
+  return {
+    phase: download < 100 ? "downloading" : load < 100 ? "loading" : phase === "unavailable" ? "unavailable" : "ready",
+    downloadProgress: download,
+    loadProgress: load,
+  };
 }
 
 function formatStudyRangeLabel(label?: string | null, separator = " - ") {
@@ -137,6 +169,9 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [semanticStatus, setSemanticStatus] = useState<SemanticRuntimeStatus | null>(null);
   const [voicevoxStatus, setVoicevoxStatus] = useState<VoicevoxRuntimeStatus | null>(null);
+  const [startupProgress, setStartupProgress] = useState<StartupRuntimeProgress | null>(null);
+  const [imeRuntimePhase, setImeRuntimePhase] = useState("starting");
+  const [imeLoadProgress, setImeLoadProgress] = useState(0);
   const [initialRuntimeReady, setInitialRuntimeReady] = useState(false);
   const [audioSettings, setAudioSettings] = useState<AudioSettings>({ volume: 1, playback_rate: 1 });
   const homeScrollRef = useRef<HTMLDivElement>(null);
@@ -144,6 +179,42 @@ function App() {
   const homeShelfWheelAtRef = useRef(0);
   const homeShelfScrollTargetRef = useRef<number | null>(null);
   const homeShelfScrollFrameRef = useRef<number | null>(null);
+
+  const semanticDownloadProgress = phaseDownloadProgress(semanticStatus?.phase, semanticStatus?.download_progress);
+  const semanticLoadProgress = phaseLoadProgress(semanticStatus?.phase, semanticStatus?.load_progress);
+  const languageDownloadProgress = startupProgress?.language_download_progress ?? 0;
+  const languageLoadProgress = startupProgress?.language_load_progress ?? 0;
+  const languageSyncPhase = startupProgress?.language_sync_phase ?? "checking";
+  const meaningDownloadProgress = Math.round(semanticDownloadProgress * 0.85 + languageDownloadProgress * 0.15);
+  const meaningLoadProgress = Math.round(semanticLoadProgress * 0.85 + languageLoadProgress * 0.15);
+  const meaningUnavailable = semanticStatus?.phase === "unavailable" || startupProgress?.language_phase === "unavailable";
+  const meaningDownloading = semanticStatus?.phase === "downloading" || languageSyncPhase === "downloading";
+  const meaningChecking = !meaningDownloading && (semanticStatus?.phase == null || semanticStatus.phase === "starting" || languageSyncPhase === "checking");
+  const meaningRuntime: RuntimeDisplayState = {
+    phase: meaningChecking
+      ? "starting"
+      : meaningDownloading
+        ? "downloading"
+        : meaningLoadProgress < 100
+        ? "loading"
+        : meaningUnavailable ? "unavailable" : "ready",
+    downloadProgress: meaningDownloadProgress,
+    loadProgress: meaningLoadProgress,
+  };
+  const voiceRuntime = runtimeDisplayState(voicevoxStatus?.phase, voicevoxStatus?.download_progress, voicevoxStatus?.load_progress);
+  const inputDownloadProgress = startupProgress?.input_download_progress ?? 0;
+  const inputSyncPhase = startupProgress?.input_sync_phase ?? "checking";
+  const inputRuntime: RuntimeDisplayState = {
+    phase: inputSyncPhase === "checking"
+      ? "starting"
+      : inputSyncPhase === "downloading"
+        ? "downloading"
+        : imeLoadProgress < 100
+        ? "loading"
+        : imeRuntimePhase === "unavailable" ? "unavailable" : "ready",
+    downloadProgress: inputDownloadProgress,
+    loadProgress: imeLoadProgress,
+  };
 
   const refresh = async () => {
     try {
@@ -155,7 +226,42 @@ function App() {
   };
 
   useEffect(() => void refresh(), []);
-  useEffect(() => { void loadJapaneseImeRuntime().catch(() => undefined); }, []);
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    const applyProgress = (progress: StartupRuntimeProgress) => {
+      if (!active) return;
+      setStartupProgress(progress);
+      setSemanticStatus(progress.semantic);
+      setVoicevoxStatus(progress.voicevox);
+    };
+    void (async () => {
+      try {
+        unlisten = await listen<StartupRuntimeProgress>("runtime-progress", (event) => applyProgress(event.payload));
+      } catch { /* invoke snapshot below still initializes the loader */ }
+      try { applyProgress(await api.startupRuntimeProgress()); } catch { /* first push will fill it */ }
+      await api.startupDependencyPreflight().catch(() => undefined);
+      if (!active) return;
+      setImeRuntimePhase("loading");
+      setImeLoadProgress(0);
+      try {
+        await loadJapaneseImeRuntime((progress) => { if (active) setImeLoadProgress(progress); });
+        if (active) {
+          setImeLoadProgress(100);
+          setImeRuntimePhase("ready");
+        }
+      } catch {
+        if (active) {
+          setImeLoadProgress(100);
+          setImeRuntimePhase("unavailable");
+        }
+      }
+    })();
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
   useEffect(() => { void api.audioSettings().then(setAudioSettings); }, []);
   useEffect(() => {
     if (view !== "decks") return;
@@ -502,20 +608,16 @@ function App() {
     };
   }, []);
   useEffect(() => {
-    const update = () => {
-      void api.semanticStatus().then(setSemanticStatus).catch(() => undefined);
-      void api.voicevoxStatus().then(setVoicevoxStatus).catch(() => undefined);
-    };
-    update();
-    const interval = window.setInterval(update, 2000);
-    return () => window.clearInterval(interval);
-  }, []);
-  useEffect(() => {
-    if (initialRuntimeReady || !semanticStatus || !voicevoxStatus) return;
-    if (!runtimePhaseIsLoading(semanticStatus.phase) && !runtimePhaseIsLoading(voicevoxStatus.phase)) {
-      setInitialRuntimeReady(true);
+    if (initialRuntimeReady || !startupProgress || !semanticStatus || !voicevoxStatus) return;
+    if (
+      !runtimePhaseIsLoading(meaningRuntime.phase)
+      && !runtimePhaseIsLoading(voiceRuntime.phase)
+      && !runtimePhaseIsLoading(inputRuntime.phase)
+    ) {
+      const timeout = window.setTimeout(() => setInitialRuntimeReady(true), 180);
+      return () => window.clearTimeout(timeout);
     }
-  }, [initialRuntimeReady, semanticStatus, voicevoxStatus]);
+  }, [initialRuntimeReady, startupProgress, semanticStatus, voicevoxStatus, meaningRuntime.phase, voiceRuntime.phase, inputRuntime.phase]);
   useEffect(() => {
     if (initialRuntimeReady) return;
     const blockKeyboard = (event: globalThis.KeyboardEvent) => {
@@ -634,8 +736,9 @@ function App() {
           <span className="initial-loading-spinner" aria-hidden="true" />
           <h2 id="initial-loading-title">TANREN을 준비하고 있어요</h2>
           <div className="initial-loading-status" aria-live="polite">
-            <p><span>의미 모델</span><strong>{runtimePhaseLabel(semanticStatus?.phase ?? "starting", semanticStatus?.download_progress)}</strong></p>
-            <p><span>음성 모델</span><strong>{runtimePhaseLabel(voicevoxStatus?.phase ?? "starting", voicevoxStatus?.download_progress)}</strong></p>
+            <p><span>의미 모델</span><strong>{runtimePhaseLabel(meaningRuntime.phase, meaningRuntime.downloadProgress, meaningRuntime.loadProgress)}</strong></p>
+            <p><span>음성 모델</span><strong>{runtimePhaseLabel(voiceRuntime.phase, voiceRuntime.downloadProgress, voiceRuntime.loadProgress)}</strong></p>
+            <p><span>입력 모델</span><strong>{runtimePhaseLabel(inputRuntime.phase, inputRuntime.downloadProgress, inputRuntime.loadProgress)}</strong></p>
           </div>
         </div>
       </div>}
@@ -757,7 +860,7 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
             <input type="range" min="0.5" max="2" step="0.1" value={audioSettings.playback_rate} onChange={(event) => updateAudio({ ...audioSettings, playback_rate: Number(event.target.value) })} />
           </label>
         </div>
-        {voicevoxStatus?.phase !== "ready" && voicevoxStatus && <p className="settings-runtime">음성 모델 · {runtimePhaseLabel(voicevoxStatus.phase, voicevoxStatus.download_progress)}{voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}</p>}
+        {voicevoxStatus?.phase !== "ready" && voicevoxStatus && <p className="settings-runtime">음성 모델 · {runtimePhaseLabel(voicevoxStatus.phase, voicevoxStatus.download_progress, voicevoxStatus.load_progress)}{voicevoxStatus.error ? ` · ${voicevoxStatus.error}` : ""}</p>}
       </article>
     </div>
   </section>;
