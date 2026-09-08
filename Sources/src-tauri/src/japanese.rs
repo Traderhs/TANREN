@@ -58,6 +58,7 @@ pub struct JapaneseAnalyzer {
     audio_dir: PathBuf,
     voicevox: Arc<VoicevoxRuntime>,
     sidecar: Arc<Mutex<LanguageSidecar>>,
+    runtime_phase: Arc<Mutex<String>>,
 }
 
 struct LanguageSidecar {
@@ -112,6 +113,13 @@ impl LanguageSidecar {
     }
 
     fn spawn(app: &AppHandle, script_path: &Path) -> Result<LanguageSidecarProcess, String> {
+        #[cfg(debug_assertions)]
+        if let Some(executable) = debug_sidecar_executable() {
+            if let Ok((events, child)) = app.shell().command(executable).spawn() {
+                return Ok(LanguageSidecarProcess { child, events });
+            }
+        }
+
         let bundled = app.shell().sidecar("tanren-language");
         if let Ok(command) = bundled {
             if let Ok((events, child)) = command.spawn() {
@@ -151,6 +159,33 @@ impl LanguageSidecar {
     }
 }
 
+#[cfg(debug_assertions)]
+fn debug_sidecar_executable() -> Option<PathBuf> {
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()?
+        .parent()?
+        .join("Results")
+        .join("sidecar");
+    let mut candidates = fs::read_dir(output)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            (path.is_file()
+                && name.starts_with("tanren-language-")
+                && name.ends_with(".exe"))
+                .then_some(path)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    candidates.pop()
+}
+
 impl JapaneseAnalyzer {
     pub fn install(app: AppHandle, app_data: &Path, audio_dir: PathBuf, voicevox: Arc<VoicevoxRuntime>) -> Result<Self, String> {
         let runtime_dir = app_data.join("runtime");
@@ -166,10 +201,14 @@ impl JapaneseAnalyzer {
             audio_dir,
             voicevox,
             sidecar: Arc::new(Mutex::new(LanguageSidecar::new())),
+            runtime_phase: Arc::new(Mutex::new("starting".into())),
         })
     }
 
     pub fn audio_runtime_phase(&self) -> String { self.voicevox.phase() }
+    pub fn runtime_phase(&self) -> String {
+        self.runtime_phase.lock().map(|phase| phase.clone()).unwrap_or_else(|_| "unavailable".into())
+    }
 
     pub fn invalidate_audio(&self, entry_id: &str) -> Result<(), String> {
         let entry_audio_dir = self.audio_dir.join(entry_id);
@@ -199,12 +238,18 @@ impl JapaneseAnalyzer {
     }
 
     pub fn warm(&self) -> Result<(), String> {
-        let response = self.request_sidecar(&serde_json::json!({ "op": "warm" }))?;
-        if response.get("warm").and_then(serde_json::Value::as_bool) == Some(true) {
-            Ok(())
-        } else {
-            Err("language sidecar warm-up returned an invalid response".into())
+        if let Ok(mut phase) = self.runtime_phase.lock() { *phase = "loading".into(); }
+        let result = self.request_sidecar(&serde_json::json!({ "op": "warm" })).and_then(|response| {
+            if response.get("warm").and_then(serde_json::Value::as_bool) == Some(true) {
+                Ok(())
+            } else {
+                Err("language sidecar warm-up returned an invalid response".into())
+            }
+        });
+        if let Ok(mut phase) = self.runtime_phase.lock() {
+            *phase = if result.is_ok() { "ready".into() } else { "unavailable".into() };
         }
+        result
     }
 
     pub fn warm_audio(&self) -> Result<(), String> {

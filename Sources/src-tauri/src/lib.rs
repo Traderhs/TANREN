@@ -10,7 +10,7 @@ mod voicevox;
 mod windows_input;
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, Mutex,
 };
 use std::{path::{Path, PathBuf}, process::Command};
@@ -27,7 +27,7 @@ use study::{PendingState, StudySession};
 use semantic::{SemanticGrader, SemanticRuntimeStatus, SemanticThresholds};
 use semantic_llama::LlamaCppEmbeddingBackend;
 use serde::Serialize;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use voicevox::{VoicevoxRuntime, VoicevoxRuntimeStatus};
 use windows_input::WindowsInputAdapter;
 
@@ -46,6 +46,13 @@ struct AppState {
     engine: Mutex<Engine>,
     input: Mutex<WindowsInputAdapter>,
     enrichment_running: Arc<AtomicBool>,
+    startup_preflight_started: Arc<AtomicBool>,
+    startup_preflight_done: Arc<AtomicBool>,
+    startup_language_download_progress: Arc<AtomicU8>,
+    startup_language_load_progress: Arc<AtomicU8>,
+    startup_input_download_progress: Arc<AtomicU8>,
+    startup_language_sync_phase: Arc<AtomicU8>,
+    startup_input_sync_phase: Arc<AtomicU8>,
 }
 
 const SEMANTIC_STORAGE_SETTING: &str = "semantic_storage_dir";
@@ -64,6 +71,19 @@ struct StorageSettings {
 struct AudioSettings {
     volume: f64,
     playback_rate: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct StartupRuntimeProgress {
+    semantic: SemanticRuntimeStatus,
+    voicevox: VoicevoxRuntimeStatus,
+    language_phase: String,
+    language_download_progress: u8,
+    language_load_progress: u8,
+    input_download_progress: u8,
+    language_sync_phase: String,
+    input_sync_phase: String,
+    preflight_done: bool,
 }
 
 #[derive(Serialize)]
@@ -538,6 +558,246 @@ fn voicevox_status(state: State<'_, AppState>) -> VoicevoxRuntimeStatus {
 }
 
 #[tauri::command]
+fn japanese_runtime_phase(state: State<'_, AppState>) -> String {
+    state.analyzer.runtime_phase()
+}
+
+fn startup_runtime_progress_snapshot(state: &AppState) -> StartupRuntimeProgress {
+    StartupRuntimeProgress {
+        semantic: state.semantic.status(),
+        voicevox: state.voicevox.status(),
+        language_phase: state.analyzer.runtime_phase(),
+        language_download_progress: state.startup_language_download_progress.load(Ordering::Acquire),
+        language_load_progress: state.startup_language_load_progress.load(Ordering::Acquire),
+        input_download_progress: state.startup_input_download_progress.load(Ordering::Acquire),
+        language_sync_phase: sync_phase_label(state.startup_language_sync_phase.load(Ordering::Acquire)).into(),
+        input_sync_phase: sync_phase_label(state.startup_input_sync_phase.load(Ordering::Acquire)).into(),
+        preflight_done: state.startup_preflight_done.load(Ordering::Acquire),
+    }
+}
+
+fn sync_phase_label(value: u8) -> &'static str {
+    match value {
+        1 => "downloading",
+        2 => "done",
+        _ => "checking",
+    }
+}
+
+#[tauri::command]
+fn startup_runtime_progress(state: State<'_, AppState>) -> StartupRuntimeProgress {
+    startup_runtime_progress_snapshot(&state)
+}
+
+#[cfg(debug_assertions)]
+fn observed_hechima_progress(sources: &Path, floor: u8) -> u8 {
+    let vendor = sources.join("public").join("vendor");
+    let expected_paths = [
+        vendor.join("hechima").join("hechima.js"),
+        vendor.join("hechima").join("hechima-worker.js"),
+        vendor.join("hechima").join("hechima.d.ts"),
+        vendor.join("hechima-wasm").join("hechima-wasm.js"),
+        vendor.join("hechima-wasm").join("hechima-wasm.wasm"),
+        vendor.join("hechima-wasm").join("mozc.data"),
+        vendor.join("hechima-wasm").join("BUILD_INFO.txt"),
+        vendor.join("hechima-notices").join("LICENSE"),
+        vendor.join("hechima-notices").join("THIRD_PARTY_NOTICES.md"),
+        vendor.join("hechima-notices").join("VENDOR.md"),
+    ];
+    let expected = expected_paths.iter().filter_map(|path| std::fs::metadata(path).ok().map(|value| value.len())).sum::<u64>();
+    if expected == 0 { return floor; }
+    let temp = std::env::temp_dir();
+    let Some(root) = std::fs::read_dir(temp).ok().and_then(|entries| {
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_str()?;
+                if !path.is_dir() || !name.starts_with("tanren-hechima-") { return None; }
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some((modified, path))
+            })
+            .max_by_key(|(modified, _)| *modified)
+            .map(|(_, path)| path)
+    }) else {
+        return floor;
+    };
+    fn tree_size(root: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(root) else { return 0; };
+        entries.flatten().map(|entry| {
+            let path = entry.path();
+            if path.is_dir() { tree_size(&path) } else { entry.metadata().ok().map(|value| value.len()).unwrap_or(0) }
+        }).sum()
+    }
+    let downloaded = tree_size(&root).min(expected);
+    let observed = 8 + ((downloaded.saturating_mul(82)) / expected) as u8;
+    floor.max(observed.min(90))
+}
+
+#[cfg(debug_assertions)]
+fn observed_sidecar_progress(sources: &Path, floor: u8) -> u8 {
+    let Some(root) = sources.parent() else { return floor; };
+    let cache = root.join("Results").join("python-sidecar-cache").join("unidic");
+    let Ok(entries) = std::fs::read_dir(&cache) else { return floor; };
+    let mut expected = 0u64;
+    let mut partial = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else { continue; };
+        let size = entry.metadata().ok().map(|value| value.len()).unwrap_or(0);
+        if name.ends_with(".zip") { expected = expected.max(size); }
+        if name.ends_with(".zip.partial") { partial = partial.max(size); }
+    }
+    if expected == 0 || partial == 0 { return floor; }
+    let observed = 48 + ((partial.min(expected).saturating_mul(12)) / expected) as u8;
+    floor.max(observed.min(60))
+}
+
+#[cfg(debug_assertions)]
+fn run_dev_dependency_sync(script_name: &str, progress: &AtomicU8, phase: &AtomicU8) -> Result<(), String> {
+    let sources = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| "TANREN source directory could not be resolved".to_string())?
+        .to_path_buf();
+    let script = sources.join("tools").join(script_name);
+    let progress_file = std::env::temp_dir().join(format!(
+        "tanren-{}-{}-progress",
+        std::process::id(),
+        script_name.replace('.', "-")
+    ));
+    let phase_file = std::env::temp_dir().join(format!(
+        "tanren-{}-{}-phase",
+        std::process::id(),
+        script_name.replace('.', "-")
+    ));
+    let _ = std::fs::remove_file(&progress_file);
+    let _ = std::fs::remove_file(&phase_file);
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .env("TANREN_PROGRESS_FILE", &progress_file)
+        .env("TANREN_PHASE_FILE", &phase_file)
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{script_name} could not start: {error}"))?;
+    let status = loop {
+        let mut observed = progress.load(Ordering::Acquire);
+        if let Ok(value) = std::fs::read_to_string(&progress_file) {
+            if let Ok(value) = value.trim().parse::<u8>() {
+                observed = observed.max(value.min(100));
+            }
+        }
+        if let Ok(value) = std::fs::read_to_string(&phase_file) {
+            let code = match value.trim() {
+                "downloading" => 1,
+                "done" => 2,
+                _ => 0,
+            };
+            phase.store(code, Ordering::Release);
+        }
+        observed = match script_name {
+            "sync_hechima.ps1" => observed_hechima_progress(&sources, observed),
+            "sync_sidecar.ps1" => observed_sidecar_progress(&sources, observed),
+            _ => observed,
+        };
+        progress.store(observed, Ordering::Release);
+        if let Some(status) = child.try_wait().map_err(|error| format!("{script_name} wait failed: {error}"))? {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let _ = std::fs::remove_file(&progress_file);
+    let _ = std::fs::remove_file(&phase_file);
+    if status.success() {
+        progress.store(100, Ordering::Release);
+        phase.store(2, Ordering::Release);
+        Ok(())
+    } else {
+        Err(format!("{script_name} failed with {status}"))
+    }
+}
+
+#[tauri::command]
+async fn startup_dependency_preflight(state: State<'_, AppState>) -> Result<(), String> {
+    let analyzer = state.analyzer.clone();
+    let db = state.db.clone();
+    let enrichment_running = Arc::clone(&state.enrichment_running);
+    let started = Arc::clone(&state.startup_preflight_started);
+    let done = Arc::clone(&state.startup_preflight_done);
+    let language_download_progress = Arc::clone(&state.startup_language_download_progress);
+    let language_load_progress = Arc::clone(&state.startup_language_load_progress);
+    let input_download_progress = Arc::clone(&state.startup_input_download_progress);
+    let language_sync_phase = Arc::clone(&state.startup_language_sync_phase);
+    let input_sync_phase = Arc::clone(&state.startup_input_sync_phase);
+
+    if started.swap(true, Ordering::AcqRel) {
+        tauri::async_runtime::spawn_blocking(move || {
+            while !done.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+        .await
+        .map_err(|error| format!("startup preflight wait failed: {error}"))?;
+        return Ok(());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(debug_assertions)]
+        {
+            if let Err(error) = run_dev_dependency_sync("sync_sidecar.ps1", &language_download_progress, &language_sync_phase) {
+                eprintln!("TANREN language dependency sync skipped: {error}");
+                language_download_progress.store(100, Ordering::Release);
+                language_sync_phase.store(2, Ordering::Release);
+            }
+            if let Err(error) = run_dev_dependency_sync("sync_hechima.ps1", &input_download_progress, &input_sync_phase) {
+                eprintln!("TANREN input dependency sync skipped: {error}");
+                input_download_progress.store(100, Ordering::Release);
+                input_sync_phase.store(2, Ordering::Release);
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            language_download_progress.store(100, Ordering::Release);
+            input_download_progress.store(100, Ordering::Release);
+            language_sync_phase.store(2, Ordering::Release);
+            input_sync_phase.store(2, Ordering::Release);
+        }
+
+        language_load_progress.store(1, Ordering::Release);
+        let language_load_monitor = Arc::new(AtomicBool::new(false));
+        let language_load_monitor_done = Arc::clone(&language_load_monitor);
+        let language_load_monitor_progress = Arc::clone(&language_load_progress);
+        let language_load_thread = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while !language_load_monitor_done.load(Ordering::Acquire) {
+                let elapsed = started.elapsed().as_millis() as u64;
+                let estimated = 1 + ((elapsed.saturating_mul(94)) / 3_000).min(94) as u8;
+                language_load_monitor_progress.fetch_max(estimated, Ordering::AcqRel);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        if let Err(error) = analyzer.warm() {
+            eprintln!("TANREN language sidecar warm-up failed: {error}");
+        }
+        language_load_monitor.store(true, Ordering::Release);
+        let _ = language_load_thread.join();
+        language_load_progress.store(100, Ordering::Release);
+        start_enrichment_worker(db, analyzer, enrichment_running);
+        done.store(true, Ordering::Release);
+    })
+    .await
+    .map_err(|error| format!("startup preflight failed: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
 fn storage_settings(state: State<'_, AppState>) -> Result<StorageSettings, String> {
     storage_settings_snapshot(&state)
 }
@@ -1007,31 +1267,74 @@ pub fn run() {
             let default_semantic_home = default_runtime_home()?;
             let semantic_home = configured_semantic_home(&db, &default_semantic_home)?;
             std::fs::create_dir_all(&semantic_home).map_err(|e| e.to_string())?;
-            let voicevox = VoicevoxRuntime::install(semantic_home.join("voicevox"));
+            let voicevox_home = semantic_home.join("voicevox");
+            let voicevox = VoicevoxRuntime::install(voicevox_home);
             let audio_dir = semantic_home.join("audio");
             app.asset_protocol_scope().allow_directory(&audio_dir, true).map_err(|e| e.to_string())?;
             let analyzer = JapaneseAnalyzer::install(app.handle().clone(), &app_data, audio_dir, Arc::clone(&voicevox))?;
             let semantic_backend = LlamaCppEmbeddingBackend::install(semantic_home.clone());
             let semantic = Arc::new(SemanticGrader::new(semantic_backend, db.clone(), SemanticThresholds::configured()));
             let enrichment_running = Arc::new(AtomicBool::new(false));
+            let startup_preflight_started = Arc::new(AtomicBool::new(false));
+            let startup_preflight_done = Arc::new(AtomicBool::new(false));
+            let startup_language_download_progress = Arc::new(AtomicU8::new(0));
+            let startup_language_load_progress = Arc::new(AtomicU8::new(0));
+            let startup_input_download_progress = Arc::new(AtomicU8::new(0));
+            let startup_language_sync_phase = Arc::new(AtomicU8::new(0));
+            let startup_input_sync_phase = Arc::new(AtomicU8::new(0));
+            let monitor_semantic = Arc::clone(&semantic);
+            let monitor_voicevox = Arc::clone(&voicevox);
+            let monitor_analyzer = analyzer.clone();
+            let monitor_preflight_done = Arc::clone(&startup_preflight_done);
+            let monitor_language_download = Arc::clone(&startup_language_download_progress);
+            let monitor_language_load = Arc::clone(&startup_language_load_progress);
+            let monitor_input_download = Arc::clone(&startup_input_download_progress);
+            let monitor_language_sync_phase = Arc::clone(&startup_language_sync_phase);
+            let monitor_input_sync_phase = Arc::clone(&startup_input_sync_phase);
+            let monitor_app = app.handle().clone();
             app.manage(AppState {
                 db: db.clone(),
                 analyzer: analyzer.clone(),
                 semantic: Arc::clone(&semantic),
-                voicevox,
+                voicevox: Arc::clone(&voicevox),
                 semantic_home,
                 default_semantic_home,
                 engine: Mutex::new(Engine::default()),
                 input: Mutex::new(WindowsInputAdapter::default()),
                 enrichment_running: Arc::clone(&enrichment_running),
+                startup_preflight_started,
+                startup_preflight_done,
+                startup_language_download_progress,
+                startup_language_load_progress,
+                startup_input_download_progress,
+                startup_language_sync_phase,
+                startup_input_sync_phase,
             });
-            let warm_analyzer = analyzer.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                if let Err(error) = warm_analyzer.warm() {
-                    eprintln!("TANREN language sidecar warm-up failed: {error}");
+            std::thread::spawn(move || {
+                loop {
+                    let semantic_status = monitor_semantic.status();
+                    let voicevox_status = monitor_voicevox.status();
+                    let preflight_done = monitor_preflight_done.load(Ordering::Acquire);
+                    let snapshot = StartupRuntimeProgress {
+                        semantic: semantic_status.clone(),
+                        voicevox: voicevox_status.clone(),
+                        language_phase: monitor_analyzer.runtime_phase(),
+                        language_download_progress: monitor_language_download.load(Ordering::Acquire),
+                        language_load_progress: monitor_language_load.load(Ordering::Acquire),
+                        input_download_progress: monitor_input_download.load(Ordering::Acquire),
+                        language_sync_phase: sync_phase_label(monitor_language_sync_phase.load(Ordering::Acquire)).into(),
+                        input_sync_phase: sync_phase_label(monitor_input_sync_phase.load(Ordering::Acquire)).into(),
+                        preflight_done,
+                    };
+                    let _ = monitor_app.emit("runtime-progress", snapshot);
+                    let semantic_terminal = !matches!(semantic_status.phase.as_str(), "starting" | "downloading" | "loading");
+                    let voicevox_terminal = !matches!(voicevox_status.phase.as_str(), "starting" | "downloading" | "loading");
+                    if preflight_done && semantic_terminal && voicevox_terminal {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             });
-            start_enrichment_worker(db, analyzer, enrichment_running);
             if let Ok(candidates) = app.state::<AppState>().db.semantic_candidates() {
                 start_semantic_precompute(semantic, candidates);
             }
@@ -1062,6 +1365,9 @@ pub fn run() {
             library_stats,
             semantic_status,
             voicevox_status,
+            japanese_runtime_phase,
+            startup_runtime_progress,
+            startup_dependency_preflight,
             storage_settings,
             pick_storage_directory,
             set_storage_directory,

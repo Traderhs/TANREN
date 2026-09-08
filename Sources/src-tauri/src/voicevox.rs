@@ -6,7 +6,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -51,6 +51,7 @@ struct RuntimeState {
     child: Option<Child>,
     #[cfg(windows)]
     job: Option<OwnedHandle>,
+    loading_started: Option<Instant>,
     error: Option<String>,
 }
 
@@ -58,6 +59,7 @@ struct RuntimeState {
 pub struct VoicevoxRuntimeStatus {
     pub phase: String,
     pub download_progress: Option<u8>,
+    pub load_progress: Option<u8>,
     pub engine_version: String,
     pub backend: String,
     pub error: Option<String>,
@@ -78,6 +80,7 @@ impl VoicevoxRuntime {
                 child: None,
                 #[cfg(windows)]
                 job: None,
+                loading_started: None,
                 error: None,
             }),
         });
@@ -97,10 +100,30 @@ impl VoicevoxRuntime {
 
     fn prepare_inner(&self) -> Result<(), String> {
         fs::create_dir_all(&self.home).map_err(|e| e.to_string())?;
+        let installer = self.home.join("install_voicevox.ps1");
+        if fs::read_to_string(&installer).ok().as_deref() != Some(INSTALLER) {
+            fs::write(&installer, INSTALLER).map_err(|e| e.to_string())?;
+        }
+        let logs = self.home.join("logs");
+        fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
+        let stdout = File::create(logs.join("updater.stdout.log")).map_err(|e| e.to_string())?;
+        let stderr = File::create(logs.join("updater.stderr.log")).map_err(|e| e.to_string())?;
+        let status = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&installer)
+            .arg("-HomePath")
+            .arg(&self.home)
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .status()
+            .map_err(|e| format!("VOICEVOX updater could not start: {e}"))?;
+        if !status.success() {
+            return Err(format!("VOICEVOX updater failed with {status}; inspect voicevox/logs"));
+        }
         let runtime_dir = self.home.join("runtime");
         let mut run = find_file(&runtime_dir, "run.exe");
         if voice_model_layout_needs_reconcile(run.as_deref()) {
-            self.set_phase("downloading")?;
             let installer = self.home.join("install_voicevox.ps1");
             if fs::read_to_string(&installer).ok().as_deref() != Some(INSTALLER) {
                 fs::write(&installer, INSTALLER).map_err(|e| e.to_string())?;
@@ -130,6 +153,9 @@ impl VoicevoxRuntime {
 
     fn start_engine(&self, run: &Path) -> Result<(), String> {
         self.set_phase("loading")?;
+        if let Ok(mut state) = self.state.lock() {
+            state.loading_started = Some(Instant::now());
+        }
         let port = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?.local_addr().map_err(|e| e.to_string())?.port();
         let logs = self.home.join("logs");
         fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
@@ -171,6 +197,7 @@ impl VoicevoxRuntime {
             if http_get(port, "/version").is_ok() {
                 let mut state = self.state.lock().map_err(|_| "VOICEVOX runtime lock poisoned")?;
                 state.phase = "ready".into();
+                state.loading_started = None;
                 state.error = None;
                 return Ok(());
             }
@@ -200,8 +227,19 @@ impl VoicevoxRuntime {
     pub fn status(&self) -> VoicevoxRuntimeStatus {
         let state = self.state.lock().ok();
         let phase = state.as_ref().map(|value| value.phase.clone()).unwrap_or_else(|| "unavailable".into());
+        let phase = if phase == "starting" && self.download_is_active() {
+            "downloading".to_string()
+        } else {
+            phase
+        };
+        let loading_started = state.as_ref().and_then(|value| value.loading_started);
         VoicevoxRuntimeStatus {
             download_progress: if phase == "downloading" { self.download_progress() } else { None },
+            load_progress: match phase.as_str() {
+                "loading" => self.load_progress(loading_started),
+                "ready" => Some(100),
+                _ => None,
+            },
             phase,
             engine_version: ENGINE_VERSION.into(),
             backend: "DirectML".into(),
@@ -215,18 +253,69 @@ impl VoicevoxRuntime {
 
     fn download_progress(&self) -> Option<u8> {
         let downloads = self.home.join("downloads");
-        let mut assets = vec![
+        let assets = vec![
             (downloads.join("voicevox_engine-windows-directml-0.25.2.7z.txt"), ENGINE_LIST_SIZE),
             (downloads.join("voicevox_engine-windows-directml-0.25.2.7z.001"), ENGINE_ARCHIVE_SIZE),
             (downloads.join("7zr.exe"), SEVEN_ZIP_SIZE),
         ];
-        if let Some(run) = find_file(&self.home.join("runtime"), "run.exe") {
-            if let Some(parent) = run.parent() {
-                let model_dir = parent.join("model");
-                assets.extend(VOICE_MODEL_SIZES.iter().map(|(name, size)| (model_dir.join(name), *size)));
+        let mut downloaded = assets.iter().map(|(path, total)| asset_bytes(path, *total)).sum::<u64>();
+        let mut total_bytes = assets.iter().map(|(_, total)| *total).sum::<u64>();
+        let current_model_dir = find_file(&self.home.join("runtime"), "run.exe")
+            .and_then(|run| run.parent().map(|parent| parent.join("model")));
+        for (name, size) in VOICE_MODEL_SIZES {
+            let mut candidates = vec![self.home.join("model.new").join(name)];
+            if let Some(model_dir) = current_model_dir.as_ref() {
+                candidates.push(model_dir.join(name));
+            } else if let Some(current) = find_file(&self.home.join("runtime"), name) {
+                candidates.push(current);
             }
+            if let Some(stage) = find_file(&self.home.join("runtime.new"), name) {
+                candidates.push(stage);
+            }
+            if let Some(stage_partial) = find_file(&self.home.join("runtime.new"), &format!("{name}.partial")) {
+                candidates.push(stage_partial);
+            }
+            downloaded += candidates.iter().map(|path| asset_bytes(path, size)).max().unwrap_or(0);
+            total_bytes += size;
         }
-        latest_partial_progress(&assets)
+        if total_bytes == 0 { None } else { Some(((downloaded.saturating_mul(100)) / total_bytes).min(100) as u8) }
+    }
+
+    fn download_is_active(&self) -> bool {
+        let downloads = self.home.join("downloads");
+        [
+            downloads.join("voicevox_engine-windows-directml-0.25.2.7z.txt.partial"),
+            downloads.join("voicevox_engine-windows-directml-0.25.2.7z.001.partial"),
+            downloads.join("7zr.exe.partial"),
+        ]
+        .iter()
+        .any(|path| path.exists())
+            || has_partial_file(&self.home.join("model.new"))
+            || has_partial_file(&self.home.join("runtime.new"))
+    }
+
+    fn load_progress(&self, started: Option<Instant>) -> Option<u8> {
+        let started = started?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let timed = ((elapsed_ms.saturating_mul(92)) / 12_000).min(92) as u8;
+        let stdout = fs::read_to_string(self.home.join("logs").join("engine.stdout.log")).unwrap_or_default();
+        let actual = stdout.lines().rev().find_map(|line| {
+            let marker = line.find("emitting double-array:")?;
+            let tail = &line[marker + "emitting double-array:".len()..];
+            let percent = tail.find('%')?;
+            tail[..percent].trim().parse::<u8>().ok()
+        }).unwrap_or(0);
+        let stderr = fs::read_to_string(self.home.join("logs").join("engine.stderr.log")).unwrap_or_default();
+        let observed = if stderr.contains("Application startup complete") {
+            99
+        } else if stderr.contains("DirectML (device_id=0)を利用します") {
+            35
+        } else if stderr.contains("GPUをテストします") {
+            15
+        } else {
+            1
+        };
+        Some(timed.max(actual).max(observed).min(99))
     }
 }
 
@@ -280,19 +369,29 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-fn latest_partial_progress(assets: &[(PathBuf, u64)]) -> Option<u8> {
-    let mut latest: Option<(SystemTime, u64, u64)> = None;
-    for (path, total) in assets {
-        let mut partial_name = path.as_os_str().to_os_string();
-        partial_name.push(".partial");
-        let partial = PathBuf::from(partial_name);
-        let Ok(metadata) = fs::metadata(partial) else { continue; };
-        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if latest.as_ref().map_or(true, |(current, _, _)| modified >= *current) {
-            latest = Some((modified, metadata.len(), *total));
+fn has_partial_file(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else { return false; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if has_partial_file(&path) { return true; }
+        } else if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.ends_with(".partial"))
+        {
+            return true;
         }
     }
-    latest.map(|(_, downloaded, total)| ((downloaded.min(total) * 100) / total.max(1)) as u8)
+    false
+}
+
+fn asset_bytes(path: &Path, total: u64) -> u64 {
+    let complete = fs::metadata(path).ok().map(|metadata| metadata.len().min(total)).unwrap_or(0);
+    if complete > 0 { return complete; }
+    let mut partial_name = path.as_os_str().to_os_string();
+    partial_name.push(".partial");
+    fs::metadata(PathBuf::from(partial_name)).ok().map(|metadata| metadata.len().min(total)).unwrap_or(0)
 }
 
 fn voice_model_layout_needs_reconcile(run: Option<&Path>) -> bool {

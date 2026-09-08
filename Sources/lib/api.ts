@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AudioSettings, DeckSummary, EnrichmentProgress, EntryDetails, EntryDraft, EntryListRecord, ImportResult, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
+import type { AudioSettings, DeckSummary, EnrichmentProgress, EntryDetails, EntryDraft, EntryListRecord, ImportResult, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
 
 export const api = {
   listDecks: () => invoke<DeckSummary[]>("list_decks"),
@@ -49,6 +49,9 @@ export const api = {
   libraryStats: (deckId?: string) => invoke<LibraryStats>("library_stats", { deckId: deckId ?? null }),
   semanticStatus: () => invoke<SemanticRuntimeStatus>("semantic_status"),
   voicevoxStatus: () => invoke<VoicevoxRuntimeStatus>("voicevox_status"),
+  japaneseRuntimePhase: () => invoke<string>("japanese_runtime_phase"),
+  startupRuntimeProgress: () => invoke<StartupRuntimeProgress>("startup_runtime_progress"),
+  startupDependencyPreflight: () => invoke<void>("startup_dependency_preflight"),
   storageSettings: () => invoke<StorageSettings>("storage_settings"),
   pickStorageDirectory: () => invoke<string | null>("pick_storage_directory"),
   setStorageDirectory: (path: string | null) => invoke<StorageSettings>("set_storage_directory", { path }),

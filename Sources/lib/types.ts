@@ -142,6 +142,7 @@ export interface EntryDetails {
 export interface SemanticRuntimeStatus {
   phase: "starting" | "downloading" | "loading" | "ready" | "unavailable" | string;
   download_progress?: number | null;
+  load_progress?: number | null;
   model_id: string;
   model_version: string;
   dimension: number;
@@ -155,9 +156,22 @@ export interface SemanticRuntimeStatus {
 export interface VoicevoxRuntimeStatus {
   phase: "starting" | "downloading" | "loading" | "ready" | "unavailable" | string;
   download_progress?: number | null;
+  load_progress?: number | null;
   engine_version: string;
   backend: string;
   error?: string | null;
+}
+
+export interface StartupRuntimeProgress {
+  semantic: SemanticRuntimeStatus;
+  voicevox: VoicevoxRuntimeStatus;
+  language_phase: string;
+  language_download_progress: number;
+  language_load_progress: number;
+  input_download_progress: number;
+  language_sync_phase: "checking" | "downloading" | "done" | string;
+  input_sync_phase: "checking" | "downloading" | "done" | string;
+  preflight_done: boolean;
 }
 
 export interface StorageSettings {

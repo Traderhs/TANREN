@@ -61,6 +61,13 @@ const EXPECTED_HECHIMA_VERSION = "0.22.1";
 
 let scriptPromise: Promise<void> | null = null;
 let runtimePromise: Promise<JapaneseImeRuntime> | null = null;
+let runtimeProgress = 0;
+const runtimeProgressListeners = new Set<(progress: number) => void>();
+
+function setRuntimeProgress(progress: number) {
+  runtimeProgress = Math.max(runtimeProgress, Math.min(100, Math.round(progress)));
+  runtimeProgressListeners.forEach((listener) => listener(runtimeProgress));
+}
 
 function assetUrl(path: string) {
   return new URL(path, document.baseURI).toString();
@@ -95,7 +102,9 @@ function loadHechimaScript() {
 }
 
 async function createRuntime(): Promise<JapaneseImeRuntime> {
+  setRuntimeProgress(5);
   await loadHechimaScript();
+  setRuntimeProgress(20);
   const hechima = (globalThis as typeof globalThis & { Hechima?: HechimaApi }).Hechima;
   if (!hechima) throw new Error("Hechima did not expose its runtime API.");
   if (hechima.version !== EXPECTED_HECHIMA_VERSION) {
@@ -103,8 +112,10 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
   }
 
   const worker = new Worker(assetUrl(HECHIMA_WORKER));
+  setRuntimeProgress(30);
   const connection = hechima.connectWorker(worker, { maxCands: 20 });
   let timeoutId: number | null = null;
+  let progressId: number | null = null;
   const workerFailure = new Promise<never>((_, reject) => {
     worker.addEventListener("error", (event) => {
       reject(new Error(event.message || "Japanese IME worker could not be loaded."));
@@ -115,6 +126,12 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
   });
 
   try {
+    const loadingStarted = performance.now();
+    setRuntimeProgress(40);
+    progressId = window.setInterval(() => {
+      const elapsed = performance.now() - loadingStarted;
+      setRuntimeProgress(Math.min(95, 40 + (elapsed / 15_000) * 55));
+    }, 50);
     await Promise.race([
       connection.init({
         wasmJs: assetUrl(HECHIMA_WASM_JS),
@@ -130,7 +147,10 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
     throw error;
   } finally {
     if (timeoutId !== null) window.clearTimeout(timeoutId);
+    if (progressId !== null) window.clearInterval(progressId);
   }
+
+  setRuntimeProgress(100);
 
   return {
     version: hechima.version,
@@ -143,14 +163,21 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
   };
 }
 
-export function loadJapaneseImeRuntime() {
+export function loadJapaneseImeRuntime(onProgress?: (progress: number) => void) {
+  if (onProgress) {
+    runtimeProgressListeners.add(onProgress);
+    onProgress(runtimeProgress);
+  }
   if (!runtimePromise) {
     runtimePromise = createRuntime().catch((error) => {
       runtimePromise = null;
+      runtimeProgress = 0;
       throw error;
     });
   }
-  return runtimePromise;
+  return runtimePromise.finally(() => {
+    if (onProgress) runtimeProgressListeners.delete(onProgress);
+  });
 }
 
 const SHIFTED_DIGITS: Record<string, string> = {
