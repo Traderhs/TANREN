@@ -1866,9 +1866,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                 <div className="book-range-scroll" aria-label={`${openedDeck.name} study ranges`}>
                   <div className="book-stage-list">
                     {Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1).map((stage) => {
-                      const current = stage === openedDeck.current_stage;
                       const fallbackRange = openedDeck.study_ranges[stage - 1];
                       const schedule = stageSchedules[stage];
+                      const current = Boolean(schedule?.active);
                       const range = schedule?.study_range ?? fallbackRange;
                       const entryCount = range ? Math.max(0, range.end - range.start) : 0;
                       const questionCount = entryCount * openedDeck.enabled_modes.length;
