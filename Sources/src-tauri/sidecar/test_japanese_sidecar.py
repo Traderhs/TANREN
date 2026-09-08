@@ -64,6 +64,82 @@ class MoraFixtures(unittest.TestCase):
 
 
 class ScopeAndCacheFixtures(unittest.TestCase):
+    def test_voicevox_supplies_predicted_pitch_for_custom_reading(self):
+        tokens = [{"reading": "ジュウサン", "pronunciation": "ジュウサン"}]
+        with patch.object(jp, "token_data", return_value=(tokens, [1], "unidic-test")), \
+             patch.object(jp, "voicevox_native_accent_type", return_value=(2, "test-version")):
+            result = jp.analyze_request({
+                "text": "十三",
+                "reading_hint": "じゅーさん",
+                "voicevox_url": "http://voicevox",
+            })
+        self.assertEqual(result["morae"], ["じゅ", "ー", "さ", "ん"])
+        self.assertEqual(result["accent_types"], [2])
+        self.assertEqual(result["pitch_patterns"], [[0, 1, 0, 0]])
+        self.assertEqual(result["provider"], "voicevox-test-version")
+        self.assertEqual(result["confidence"], "PREDICTED")
+
+    def test_voicevox_native_accent_requires_one_matching_phrase(self):
+        with patch.object(jp, "voicevox_metadata", return_value=([{"speaker_id": 7}], "test-version")), \
+             patch.object(jp, "voicevox_request", return_value={
+                 "accent_phrases": [{
+                     "moras": [{"text": "ジュ"}, {"text": "ー"}, {"text": "サ"}, {"text": "ン"}],
+                     "accent": 2,
+                 }],
+             }):
+            self.assertEqual(
+                jp.voicevox_native_accent_type(
+                    "http://voicevox", "じゅーさん", ["じゅ", "ー", "さ", "ん"]
+                ),
+                (2, "test-version"),
+            )
+
+    def test_voicevox_native_accent_flattens_split_phrase_for_explicit_reading(self):
+        with patch.object(jp, "voicevox_metadata", return_value=([{"speaker_id": 7}], "test-version")), \
+             patch.object(jp, "voicevox_request", return_value={
+                 "accent_phrases": [
+                     {
+                         "moras": [{"text": "セ"}, {"text": "ッ"}, {"text": "ク"}],
+                         "accent": 1,
+                         "pause_mora": None,
+                     },
+                     {
+                         "moras": [{"text": "ス"}],
+                         "accent": 1,
+                         "pause_mora": None,
+                     },
+                 ],
+             }):
+            self.assertEqual(
+                jp.voicevox_native_accent_type(
+                    "http://voicevox", "せっくす", ["せ", "っ", "く", "す"]
+                ),
+                (1, "test-version"),
+            )
+
+    def test_explicit_reading_override_drives_pitch_instead_of_surface_lexicon(self):
+        tokens = [{
+            "surface": "水",
+            "lemma": "水",
+            "reading": "ミズ",
+            "pronunciation": "ミズ",
+            "pos": "名詞",
+            "conjugation": "*",
+            "accent_type": "0",
+        }]
+        with patch.object(jp, "token_data", return_value=(tokens, [0], "test-unidic")), \
+             patch.object(jp, "voicevox_native_accent_type", return_value=(1, "test-version")):
+            result = jp.analyze_request({
+                "text": "水",
+                "reading_hint": "セックス",
+                "voicevox_url": "http://voicevox",
+            })
+        self.assertEqual(result["reading"], "せっくす")
+        self.assertEqual(result["morae"], ["せ", "っ", "く", "す"])
+        self.assertEqual(result["accent_types"], [1])
+        self.assertEqual(result["pitch_patterns"], [[1, 0, 0, 0]])
+        self.assertEqual(result["provider"], "voicevox-test-version")
+
     def test_kana_lexeme_isu_resolves_unidic_lemma_and_confirmed_pitch(self):
         tokens, accent_types, _ = jp.token_data("いす")
         self.assertEqual(len(tokens), 1)

@@ -20,7 +20,7 @@ use grading::grade_form;
 use japanese::{JapaneseAnalyzer, VOICE_AUDIO_REVISION};
 use model::{
     DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
-    StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
+    PitchQuestion, StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
 };
 use rand::random;
 use study::{PendingState, StudySession};
@@ -83,6 +83,13 @@ struct EnrichmentProgress {
     runtime_phase: String,
 }
 
+#[derive(Serialize)]
+struct EntryDetails {
+    entry: EntryRecord,
+    pitch: Option<PitchQuestion>,
+    audio_path: Option<String>,
+}
+
 #[tauri::command]
 fn list_decks(state: State<'_, AppState>) -> Result<Vec<DeckSummary>, String> {
     state.db.list_decks()
@@ -91,6 +98,14 @@ fn list_decks(state: State<'_, AppState>) -> Result<Vec<DeckSummary>, String> {
 #[tauri::command]
 fn list_entries(state: State<'_, AppState>, deck_id: String) -> Result<Vec<EntryListRecord>, String> {
     state.db.entry_list(&deck_id)
+}
+
+#[tauri::command]
+fn entry_details(state: State<'_, AppState>, deck_id: String, entry_id: String) -> Result<EntryDetails, String> {
+    let entry = find_entry(&state.db, &deck_id, &entry_id)?;
+    let pitch = state.db.pitch_question(&entry_id, true)?;
+    let audio_path = state.db.first_audio_path(&entry_id)?;
+    Ok(EntryDetails { entry, pitch, audio_path })
 }
 
 #[tauri::command]
@@ -142,15 +157,18 @@ fn enrichment_progress(state: State<'_, AppState>, entry_ids: Vec<String>) -> Re
 }
 
 #[tauri::command]
-fn update_entry(state: State<'_, AppState>, deck_id: String, entry_id: String, entry: EntryDraft) -> Result<(), String> {
-    state.db.update_entry(&deck_id, &entry_id, &entry)?;
-    start_enrichment_worker(
-        state.db.clone(),
-        state.analyzer.clone(),
-        Arc::clone(&state.enrichment_running),
-    );
+fn update_entry(state: State<'_, AppState>, deck_id: String, entry_id: String, entry: EntryDraft) -> Result<bool, String> {
+    let pronunciation_changed = state.db.update_entry(&deck_id, &entry_id, &entry)?;
+    if pronunciation_changed {
+        state.analyzer.invalidate_audio(&entry_id)?;
+        start_enrichment_worker(
+            state.db.clone(),
+            state.analyzer.clone(),
+            Arc::clone(&state.enrichment_running),
+        );
+    }
     start_semantic_precompute(Arc::clone(&state.semantic), entry.meanings.clone());
-    Ok(())
+    Ok(pronunciation_changed)
 }
 
 #[tauri::command]
@@ -964,6 +982,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_decks,
             list_entries,
+            entry_details,
             stage_schedule,
             create_deck,
             import_entries,

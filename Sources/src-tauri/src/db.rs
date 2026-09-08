@@ -14,6 +14,23 @@ use crate::{
 
 const SCHEMA_VERSION: i64 = 13;
 
+fn contains_han(value: &str) -> bool {
+    value.chars().any(|character| matches!(character as u32,
+        0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xF900..=0xFAFF
+        | 0x20000..=0x2FA1F
+        | 0x30000..=0x323AF
+    ))
+}
+
+fn validate_reading_for_language(target_language: &str, reading: Option<&str>) -> Result<(), String> {
+    if target_language == "ja-JP" && reading.is_some_and(contains_han) {
+        return Err("일본어 발음에는 한자를 입력할 수 없어요.".into());
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct StatsAggregate {
     attempts: usize,
@@ -690,6 +707,7 @@ impl Database {
         let mut duplicates = 0;
         let mut entry_ids = Vec::new();
         for draft in drafts.iter().filter(|d| !d.term.trim().is_empty() && !d.meanings.is_empty()) {
+            validate_reading_for_language(target_language, draft.reading.as_deref())?;
             let meanings = serde_json::to_string(&draft.meanings).map_err(|e| e.to_string())?;
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM entries WHERE deck_id=?1 AND term=?2 AND meanings=?3 AND COALESCE(reading,'')=COALESCE(?4,'') AND deleted_at IS NULL)",
@@ -819,30 +837,65 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_entry(&self, deck_id: &str, entry_id: &str, draft: &EntryDraft) -> Result<(), String> {
+    pub fn update_entry(&self, deck_id: &str, entry_id: &str, draft: &EntryDraft) -> Result<bool, String> {
         let term = draft.term.trim();
         let meanings: Vec<String> = draft.meanings.iter().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).collect();
         if term.is_empty() || meanings.is_empty() { return Err("표현과 뜻을 입력해주세요.".into()); }
+        let target_language = self.deck(deck_id)?.target_language;
 
         let mut conn = self.conn()?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let revision: i64 = tx.query_row(
-            "SELECT revision+1 FROM entries WHERE id=?1 AND deck_id=?2 AND deleted_at IS NULL",
-            params![entry_id, deck_id],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        let meanings_json = serde_json::to_string(&meanings).map_err(|e| e.to_string())?;
         let reading = draft.reading.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        validate_reading_for_language(&target_language, reading)?;
+        let (revision, previous_term, previous_reading): (i64, String, Option<String>) = tx.query_row(
+            "SELECT revision+1,term,reading FROM entries WHERE id=?1 AND deck_id=?2 AND deleted_at IS NULL",
+            params![entry_id, deck_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(|e| e.to_string())?;
+        let pronunciation_changed = previous_term != term || previous_reading.as_deref().unwrap_or("") != reading.unwrap_or("");
+        let meanings_json = serde_json::to_string(&meanings).map_err(|e| e.to_string())?;
         let timestamp = now();
         tx.execute(
             "UPDATE entries SET term=?1,meanings=?2,reading=?3,updated_at=?4,revision=?5,device_id=?6 WHERE id=?7 AND deck_id=?8 AND deleted_at IS NULL",
             params![term, meanings_json, reading, timestamp, revision, self.device_id, entry_id, deck_id],
         ).map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO enrichment_jobs(id,entry_id,status,attempts,last_error,updated_at) VALUES(?1,?2,'queued',0,NULL,?3) \
-             ON CONFLICT(entry_id) DO UPDATE SET status='queued',attempts=0,last_error=NULL,updated_at=excluded.updated_at",
-            params![Uuid::new_v4().to_string(), entry_id, timestamp],
-        ).map_err(|e| e.to_string())?;
+        if pronunciation_changed {
+            let audio_rows = {
+                let mut stmt = tx.prepare("SELECT id,revision FROM audio_assets WHERE entry_id=?1").map_err(|e| e.to_string())?;
+                stmt.query_map([entry_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            tx.execute("DELETE FROM audio_assets WHERE entry_id=?1", [entry_id]).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM audio_playback_state WHERE entry_id=?1", [entry_id]).map_err(|e| e.to_string())?;
+            for (id, audio_revision) in audio_rows {
+                journal(&tx, &id, "audio_asset", &self.device_id, audio_revision + 1, "delete", &serde_json::json!({"entry_id":entry_id}))?;
+            }
+
+            let pitch_rows = {
+                let mut stmt = tx.prepare(
+                    "SELECT p.id,p.revision FROM pitch_patterns p JOIN japanese_analyses a ON a.id=p.analysis_id WHERE a.entry_id=?1",
+                ).map_err(|e| e.to_string())?;
+                stmt.query_map([entry_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            tx.execute(
+                "DELETE FROM pitch_patterns WHERE analysis_id IN (SELECT id FROM japanese_analyses WHERE entry_id=?1)",
+                [entry_id],
+            ).map_err(|e| e.to_string())?;
+            for (id, pitch_revision) in pitch_rows {
+                journal(&tx, &id, "pitch_pattern", &self.device_id, pitch_revision + 1, "delete", &serde_json::json!({"entry_id":entry_id}))?;
+            }
+
+            tx.execute(
+                "INSERT INTO enrichment_jobs(id,entry_id,status,attempts,last_error,updated_at) VALUES(?1,?2,'queued',0,NULL,?3) \
+                 ON CONFLICT(entry_id) DO UPDATE SET status='queued',attempts=0,last_error=NULL,updated_at=excluded.updated_at",
+                params![Uuid::new_v4().to_string(), entry_id, timestamp],
+            ).map_err(|e| e.to_string())?;
+        }
         journal(
             &tx,
             entry_id,
@@ -852,7 +905,8 @@ impl Database {
             "update",
             &serde_json::json!({"deck_id":deck_id,"term":term,"meanings":meanings,"reading":reading}),
         )?;
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(pronunciation_changed)
     }
 
     pub fn delete_entry(&self, deck_id: &str, entry_id: &str) -> Result<(), String> {
@@ -1116,6 +1170,15 @@ impl Database {
         Ok(Some(path))
     }
 
+    pub fn first_audio_path(&self, entry_id: &str) -> Result<Option<String>, String> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT path FROM audio_assets WHERE entry_id=?1 AND deleted_at IS NULL ORDER BY CASE age_band WHEN 'child' THEN 1 WHEN 'adolescent' THEN 2 WHEN 'young_adult' THEN 3 WHEN 'middle_aged' THEN 4 WHEN 'senior' THEN 5 ELSE 6 END, CASE gender_presentation WHEN 'feminine' THEN 1 WHEN 'neutral' THEN 2 WHEN 'masculine' THEN 3 ELSE 4 END, voice_profile, cache_key LIMIT 1",
+            [entry_id],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())
+    }
+
     pub fn library_stats(&self, deck_id: Option<&str>) -> Result<LibraryStats, String> {
         let conn = self.conn()?;
         let (deck_count, entry_count): (usize, usize) = conn.query_row(
@@ -1328,7 +1391,10 @@ impl Database {
                  WHERE e.deleted_at IS NULL \
                    AND e.language='ja-JP' \
                    AND json_extract(a.analysis_json,'$.scope')='lexical' \
-                   AND NOT EXISTS(SELECT 1 FROM audio_assets aa WHERE aa.entry_id=e.id AND aa.deleted_at IS NULL) \
+                   AND ( \
+                     NOT EXISTS(SELECT 1 FROM audio_assets aa WHERE aa.entry_id=e.id AND aa.deleted_at IS NULL) \
+                     OR NOT EXISTS(SELECT 1 FROM pitch_patterns p WHERE p.analysis_id=a.id AND p.deleted_at IS NULL) \
+                   ) \
                )",
             [now()],
         ).map_err(|e| e.to_string())
@@ -1602,6 +1668,38 @@ mod tests{
     }
 
     #[test]
+    fn japanese_reading_rejects_kanji_only_for_japanese_decks() {
+        assert!(validate_reading_for_language("ja-JP", Some("みず")).is_ok());
+        assert_eq!(
+            validate_reading_for_language("ja-JP", Some("水")).unwrap_err(),
+            "일본어 발음에는 한자를 입력할 수 없어요."
+        );
+        assert!(validate_reading_for_language("en-US", Some("水")).is_ok());
+
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("日本語", "ko-KR", "ja-JP").unwrap();
+        let invalid = EntryDraft {
+            term: "水".into(), meanings: vec!["물".into()], reading: Some("水".into()),
+        };
+        assert_eq!(
+            db.import_entries(&deck.id, "ja-JP", &[invalid]).unwrap_err(),
+            "일본어 발음에는 한자를 입력할 수 없어요."
+        );
+
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "水".into(), meanings: vec!["물".into()], reading: Some("みず".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+        assert_eq!(
+            db.update_entry(&deck.id, &entry.id, &EntryDraft {
+                term: "水".into(), meanings: vec!["물".into()], reading: Some("水".into()),
+            }).unwrap_err(),
+            "일본어 발음에는 한자를 입력할 수 없어요."
+        );
+    }
+
+    #[test]
     fn statistics_bucket_activity_and_attempts_by_system_local_date() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
@@ -1744,6 +1842,92 @@ mod tests{
     }
 
     #[test]
+    fn entry_updates_are_shared_by_every_stage_schedule_that_references_the_entry() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("shared entry updates", "ko-KR", "ja-JP").unwrap();
+        let drafts = (1..=50).map(|index| EntryDraft {
+            term: format!("単語{index:03}"), meanings: vec![format!("뜻 {index}")], reading: Some("たんご".into()),
+        }).collect::<Vec<_>>();
+        db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let entry_id = entries[0].id.clone();
+        let stage_one = db.ensure_stage_schedule(&deck.id, 1, &entries).unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "追加".into(), meanings: vec!["추가".into()], reading: Some("ついか".into()),
+        }]).unwrap();
+        let stage_two = db.ensure_stage_schedule(&deck.id, 2, &db.entries(&deck.id).unwrap()).unwrap();
+
+        assert!(stage_one.iter().any(|slot| slot.as_deref() == Some(entry_id.as_str())));
+        assert!(stage_two.iter().any(|slot| slot.as_deref() == Some(entry_id.as_str())));
+        db.update_entry(&deck.id, &entry_id, &EntryDraft {
+            term: "単語001".into(), meanings: vec!["수정된 뜻".into()], reading: Some("たんご".into()),
+        }).unwrap();
+
+        let updated = db.entries(&deck.id).unwrap().into_iter().find(|entry| entry.id == entry_id).unwrap();
+        assert_eq!(updated.meanings, vec!["수정된 뜻"]);
+        assert!(db.load_stage_schedule(&deck.id, 1).unwrap().unwrap().iter().any(|slot| slot.as_deref() == Some(updated.id.as_str())));
+        assert!(db.load_stage_schedule(&deck.id, 2).unwrap().unwrap().iter().any(|slot| slot.as_deref() == Some(updated.id.as_str())));
+    }
+
+    #[test]
+    fn meaning_only_edit_keeps_audio_and_pitch_without_requeueing_enrichment() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("meaning edit", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+        let analysis = serde_json::json!({"scope":"lexical","morae":["ね","こ"]});
+        let audio = [AudioAssetDraft {
+            cache_key: "fixture".into(), path: "fixture.wav".into(), provider: "fixture".into(),
+            voice_profile: "fixture".into(), age_band: "young_adult".into(), gender_presentation: "feminine".into(),
+            speaker_id: None, speaker_name: None, accent_type: Some(1),
+        }];
+        db.set_entry_analysis(&entry.id, Some("ねこ"), &analysis, "fixture", "fixture", "VERIFIED", None, Some(&[vec![1,0]]), "lexical", &audio).unwrap();
+
+        let pronunciation_changed = db.update_entry(&deck.id, &entry.id, &EntryDraft {
+            term: "猫".into(), meanings: vec!["고양이 / 냥이".into()], reading: Some("ねこ".into()),
+        }).unwrap();
+
+        assert!(!pronunciation_changed);
+        assert!(db.first_audio_path(&entry.id).unwrap().is_some());
+        assert!(db.pitch_question(&entry.id, false).unwrap().is_some());
+        let status: String = db.conn().unwrap().query_row("SELECT status FROM enrichment_jobs WHERE entry_id=?1", [&entry.id], |row| row.get(0)).unwrap();
+        assert_eq!(status, "done");
+    }
+
+    #[test]
+    fn term_or_reading_edit_invalidates_audio_pitch_and_requeues_enrichment() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("pronunciation edit", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+        let analysis = serde_json::json!({"scope":"lexical","morae":["ね","こ"]});
+        let audio = [AudioAssetDraft {
+            cache_key: "fixture".into(), path: "fixture.wav".into(), provider: "fixture".into(),
+            voice_profile: "fixture".into(), age_band: "young_adult".into(), gender_presentation: "feminine".into(),
+            speaker_id: None, speaker_name: None, accent_type: Some(1),
+        }];
+        db.set_entry_analysis(&entry.id, Some("ねこ"), &analysis, "fixture", "fixture", "VERIFIED", None, Some(&[vec![1,0]]), "lexical", &audio).unwrap();
+
+        let pronunciation_changed = db.update_entry(&deck.id, &entry.id, &EntryDraft {
+            term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ネコ".into()),
+        }).unwrap();
+
+        assert!(pronunciation_changed);
+        assert!(db.first_audio_path(&entry.id).unwrap().is_none());
+        assert!(db.pitch_question(&entry.id, false).unwrap().is_none());
+        let status: String = db.conn().unwrap().query_row("SELECT status FROM enrichment_jobs WHERE entry_id=?1", [&entry.id], |row| row.get(0)).unwrap();
+        assert_eq!(status, "queued");
+
+    }
+
+    #[test]
     fn growing_partial_stage_keeps_deleted_slots_and_appends_new_entries() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
@@ -1863,13 +2047,14 @@ mod tests{
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
         let deck = db.create_deck("incomplete lexical", "ko-KR", "ja-JP").unwrap();
-        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
-            term: "いす".into(), meanings: vec!["의자".into()], reading: Some("いす".into()),
-        }]).unwrap();
-        let entry = db.entries(&deck.id).unwrap().remove(0);
+        db.import_entries(&deck.id, "ja-JP", &[
+            EntryDraft { term: "いす".into(), meanings: vec!["의자".into()], reading: Some("いす".into()) },
+            EntryDraft { term: "十三".into(), meanings: vec!["열셋".into()], reading: Some("じゅーさん".into()) },
+        ]).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
         let analysis = serde_json::json!({"scope":"lexical","morae":["い","す"]});
         db.set_entry_analysis(
-            &entry.id,
+            &entries[0].id,
             Some("いす"),
             &analysis,
             "builtin-kana",
@@ -1880,9 +2065,26 @@ mod tests{
             "lexical",
             &[],
         ).unwrap();
+        let audio_only = [AudioAssetDraft {
+            cache_key: "fixture".into(), path: "fixture.wav".into(), provider: "fixture".into(),
+            voice_profile: "fixture".into(), age_band: "young_adult".into(), gender_presentation: "feminine".into(),
+            speaker_id: None, speaker_name: None, accent_type: None,
+        }];
+        db.set_entry_analysis(
+            &entries[1].id,
+            Some("じゅーさん"),
+            &serde_json::json!({"scope":"lexical","morae":["じゅ","ー","さ","ん"]}),
+            "voicevox-test",
+            "fixture without pitch",
+            "PREDICTED",
+            None,
+            None,
+            "lexical",
+            &audio_only,
+        ).unwrap();
         assert!(db.queued_enrichment(1).unwrap().is_empty());
-        assert_eq!(db.requeue_incomplete_lexical_enrichment().unwrap(), 1);
-        assert_eq!(db.queued_enrichment(1).unwrap().len(), 1);
+        assert_eq!(db.requeue_incomplete_lexical_enrichment().unwrap(), 2);
+        assert_eq!(db.queued_enrichment(2).unwrap().len(), 2);
     }
 
     #[test]

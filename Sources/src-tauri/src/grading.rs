@@ -27,6 +27,66 @@ pub fn normalize_japanese(input: &str) -> String {
         .collect()
 }
 
+fn kana_vowel(character: char) -> Option<char> {
+    match character {
+        'ぁ' | 'あ' | 'か' | 'が' | 'さ' | 'ざ' | 'た' | 'だ' | 'な' | 'は' | 'ば' | 'ぱ' | 'ま' | 'ゃ' | 'や' | 'ら' | 'ゎ' | 'わ' => Some('あ'),
+        'ぃ' | 'い' | 'き' | 'ぎ' | 'し' | 'じ' | 'ち' | 'ぢ' | 'に' | 'ひ' | 'び' | 'ぴ' | 'み' | 'り' | 'ゐ' => Some('い'),
+        'ぅ' | 'う' | 'く' | 'ぐ' | 'す' | 'ず' | 'つ' | 'づ' | 'ぬ' | 'ふ' | 'ぶ' | 'ぷ' | 'む' | 'ゅ' | 'ゆ' | 'る' | 'ゔ' => Some('う'),
+        'ぇ' | 'え' | 'け' | 'げ' | 'せ' | 'ぜ' | 'て' | 'で' | 'ね' | 'へ' | 'べ' | 'ぺ' | 'め' | 'れ' | 'ゑ' => Some('え'),
+        'ぉ' | 'お' | 'こ' | 'ご' | 'そ' | 'ぞ' | 'と' | 'ど' | 'の' | 'ほ' | 'ぼ' | 'ぽ' | 'も' | 'ょ' | 'よ' | 'ろ' | 'を' => Some('お'),
+        _ => None,
+    }
+}
+
+fn expand_prolonged_sound_marks(input: &str) -> Vec<String> {
+    let mut variants = vec![String::new()];
+    let mut last_vowel = None;
+
+    for character in input.chars() {
+        if character != 'ー' {
+            if let Some(vowel) = kana_vowel(character) {
+                last_vowel = Some(vowel);
+            }
+            for variant in &mut variants {
+                variant.push(character);
+            }
+            continue;
+        }
+
+        let replacements: &[char] = match last_vowel {
+            Some('あ') => &['あ'],
+            Some('い') => &['い'],
+            Some('う') => &['う'],
+            Some('え') => &['え', 'い'],
+            Some('お') => &['お', 'う'],
+            _ => &['ー'],
+        };
+
+        let mut expanded = Vec::with_capacity(variants.len() * replacements.len());
+        for variant in &variants {
+            for replacement in replacements {
+                let mut value = variant.clone();
+                value.push(*replacement);
+                expanded.push(value);
+            }
+        }
+        variants = expanded;
+    }
+
+    variants
+}
+
+fn reading_matches(expected: &str, answer: &str) -> bool {
+    let expected = normalize_japanese(expected);
+    let answer = normalize_japanese(answer);
+    if expected == answer {
+        return true;
+    }
+
+    expand_prolonged_sound_marks(&expected).iter().any(|variant| variant == &answer)
+        || expand_prolonged_sound_marks(&answer).iter().any(|variant| variant == &expected)
+}
+
 pub fn grade_form(entry: &EntryRecord, answer: &str, strict_orthography: bool) -> GradeOutcome {
     let answer = normalize_japanese(answer);
     if answer == normalize_japanese(&entry.term) {
@@ -34,7 +94,7 @@ pub fn grade_form(entry: &EntryRecord, answer: &str, strict_orthography: bool) -
     }
     if !strict_orthography {
         if let Some(reading) = &entry.reading {
-            if answer == normalize_japanese(reading) {
+            if reading_matches(reading, &answer) {
                 return GradeOutcome { decision: GradeDecision::Pass, method: "accepted_reading", score: None };
             }
         }
@@ -137,5 +197,15 @@ mod tests {
         assert_eq!(grade_form(&entry(), "みすえる", false).decision, GradeDecision::Pass);
         assert_eq!(grade_form(&entry(), "ミスエル", false).decision, GradeDecision::Pass);
         assert_eq!(grade_form(&entry(), "みすえる", true).decision, GradeDecision::Fail);
+    }
+
+    #[test]
+    fn reading_accepts_equivalent_long_vowel_spelling() {
+        let mut value = entry();
+        value.term = "11".into();
+        value.reading = Some("じゅーいち".into());
+        assert_eq!(grade_form(&value, "じゅういち", false).decision, GradeDecision::Pass);
+        assert_eq!(grade_form(&value, "ジュウイチ", false).decision, GradeDecision::Pass);
+        assert_eq!(grade_form(&value, "じゅういち", true).decision, GradeDecision::Fail);
     }
 }

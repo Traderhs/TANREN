@@ -171,6 +171,15 @@ impl JapaneseAnalyzer {
 
     pub fn audio_runtime_phase(&self) -> String { self.voicevox.phase() }
 
+    pub fn invalidate_audio(&self, entry_id: &str) -> Result<(), String> {
+        let entry_audio_dir = self.audio_dir.join(entry_id);
+        if !entry_audio_dir.exists() {
+            return Ok(());
+        }
+        fs::remove_dir_all(&entry_audio_dir)
+            .map_err(|error| format!("기존 음성을 삭제하지 못했어요: {error}"))
+    }
+
     fn request_sidecar(&self, request: &serde_json::Value) -> Result<serde_json::Value, String> {
         let stdout = self
             .sidecar
@@ -230,6 +239,9 @@ impl JapaneseAnalyzer {
             .map_err(|error| format!("invalid language enrichment payload: {error}"))?;
         let audio: Vec<AudioAssetDraft> = enrichment.audio_assets.iter().filter(|asset| Path::new(&asset.path).exists()).cloned().collect();
         if enrichment.scope == "lexical" {
+            if enrichment.pitch_patterns.as_ref().is_none_or(|patterns| patterns.is_empty()) {
+                return Err(format!("lexical enrichment completed without generated pitch: {}", entry.term));
+            }
             if audio.is_empty() {
                 return Err(format!("lexical enrichment completed without generated audio: {}", entry.term));
             }

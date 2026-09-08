@@ -132,6 +132,12 @@ export interface EntryListRecord extends EntryRecord {
   attempts: number;
 }
 
+export interface EntryDetails {
+  entry: EntryRecord;
+  pitch?: PitchQuestion | null;
+  audio_path?: string | null;
+}
+
 export interface SemanticRuntimeStatus {
   phase: "starting" | "downloading" | "loading" | "ready" | "unavailable" | string;
   download_progress?: number | null;

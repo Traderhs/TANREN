@@ -1137,6 +1137,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const [singleTerm, setSingleTerm] = useState("");
   const [singleMeaning, setSingleMeaning] = useState("");
   const [singleReading, setSingleReading] = useState("");
+  const [originalEntry, setOriginalEntry] = useState<EntryRecord | null>(null);
   const [bulkText, setBulkText] = useState("");
   const [bulkFileName, setBulkFileName] = useState("");
   const [entryMessage, setEntryMessage] = useState("");
@@ -1187,6 +1188,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const parsedBulkEntries = parseEntryText(bulkText);
   const bulkPreviewEntries = parsedBulkEntries.entries.slice(0, IMPORT_PREVIEW_LIMIT);
   const bulkPreviewHiddenCount = Math.max(0, parsedBulkEntries.entries.length - bulkPreviewEntries.length);
+  const japaneseReadingInvalid = Boolean(openedDeck?.target_language === "ja-JP" && /\p{Script=Han}/u.test(singleReading));
   const bookSessionKey = openedDeck ? `${openedDeck.id}:${bookOpenCycle}` : "";
   const bookVisualReady = Boolean(openedDeck && (reduceMotion || (book3DReady && bookFlipReady)));
   const bookProgressRatio = (deck: DeckSummary) => deck.total_stage_count === 0
@@ -1539,6 +1541,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setSingleTerm("");
     setSingleMeaning("");
     setSingleReading("");
+    setOriginalEntry(null);
     setEntryMessage("");
     setEntryDialog("single");
   };
@@ -1548,8 +1551,17 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setSingleTerm(entry.term);
     setSingleMeaning(entry.meanings.join(" / "));
     setSingleReading(entry.reading ?? "");
+    setOriginalEntry(entry);
     setEntryMessage("");
     setEntryDialog("single");
+    if (!openedDeck) return;
+    void api.entryDetails(openedDeck.id, entry.id).then((details) => {
+      if (details.entry.id !== entry.id) return;
+      setOriginalEntry(details.entry);
+      setSingleTerm(details.entry.term);
+      setSingleMeaning(details.entry.meanings.join(" / "));
+      setSingleReading(details.entry.reading ?? "");
+    }).catch((cause) => setEntryMessage(String(cause)));
   };
 
   const chooseImportEntryFile = () => importFileInputRef.current?.click();
@@ -1574,6 +1586,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     }
     setEntryDialog(null);
     setEditingEntryId(null);
+    setOriginalEntry(null);
   };
 
   const deleteEntry = async (entry: EntryListRecord) => {
@@ -1632,20 +1645,33 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
         meanings: parseMeaningInput(singleMeaning),
         reading: singleReading.trim() || undefined,
       };
+      const textChanged = !originalEntry
+        || entry.term !== originalEntry.term
+        || (entry.reading ?? "") !== (originalEntry.reading ?? "")
+        || entry.meanings.join("\u0000") !== originalEntry.meanings.join("\u0000");
       const result = editingEntryId
         ? null
         : await api.importEntries(openedDeck.id, [entry]);
-      if (editingEntryId) await api.updateEntry(openedDeck.id, editingEntryId, entry);
-      const processing = result?.entry_ids?.length ? await waitForEntryProcessing(result.entry_ids) : null;
+      const pronunciationChanged = editingEntryId && textChanged
+        ? await api.updateEntry(openedDeck.id, editingEntryId, entry)
+        : false;
+      const processing = result?.entry_ids?.length
+        ? await waitForEntryProcessing(result.entry_ids)
+        : editingEntryId && pronunciationChanged
+          ? await waitForEntryProcessing([editingEntryId])
+          : null;
+      const processingPrefix = editingEntryId ? "저장했지만" : "추가했지만";
+
       setSingleTerm("");
       setSingleMeaning("");
       setSingleReading("");
+      setOriginalEntry(null);
       setEntryDialog(null);
       setEditingEntryId(null);
       setEntryMessage(processing?.failed
-        ? `추가했지만 ${processing.failed.toLocaleString("ko-KR")}개 표현의 피치·음성 생성에 실패했어요.${processing.last_error ? ` ${processing.last_error}` : ""}`
+        ? `${processingPrefix} ${processing.failed.toLocaleString("ko-KR")}개 표현의 피치·음성 생성에 실패했어요.${processing.last_error ? ` ${processing.last_error}` : ""}`
         : processing?.runtime_phase === "unavailable"
-          ? "추가했지만 음성 엔진을 사용할 수 없어 피치·음성 생성을 완료하지 못했어요."
+          ? `${processingPrefix} 음성 엔진을 사용할 수 없어 피치·음성 생성을 완료하지 못했어요.`
           : "");
       await refreshBookEntries(openedDeck.id, Boolean(result?.inserted));
     } finally {
@@ -1981,7 +2007,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                 <label><span>표현</span><input className="home-create-input" autoFocus value={singleTerm} onChange={(event) => setSingleTerm(event.target.value)} placeholder="표현을 입력해주세요" /></label>
                 <label><span>발음 <small>선택</small></span><input className="home-create-input" value={singleReading} onChange={(event) => setSingleReading(event.target.value)} placeholder="발음을 입력해주세요" /></label>
                 <label><span>뜻</span><input className="home-create-input" value={singleMeaning} onChange={(event) => setSingleMeaning(event.target.value)} placeholder="뜻을 입력해주세요" /></label>
-                <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim()}>{editingEntryId ? "저장" : "추가"}</button></div>
+                <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim() || japaneseReadingInvalid}>{editingEntryId ? "저장" : "추가"}</button></div>
               </form> : <div className="book-entry-dialog book-entry-import-dialog">
                 <div className="book-entry-dialog-head"><div><span>IMPORT EXPRESSIONS</span><h3 className="book-entry-dialog-title">파일로 표현 추가</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
                 <div className="book-entry-import-meta">
@@ -2013,7 +2039,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             <label><span>표현</span><input className="home-create-input" autoFocus value={singleTerm} onChange={(event) => setSingleTerm(event.target.value)} placeholder="표현을 입력해주세요" /></label>
             <label><span>발음 <small>선택</small></span><input className="home-create-input" value={singleReading} onChange={(event) => setSingleReading(event.target.value)} placeholder="발음을 입력해주세요" /></label>
             <label><span>뜻</span><input className="home-create-input" value={singleMeaning} onChange={(event) => setSingleMeaning(event.target.value)} placeholder="뜻을 입력해주세요" /></label>
-            <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim()}>{editingEntryId ? "저장" : "추가"}</button></div>
+            <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim() || japaneseReadingInvalid}>{editingEntryId ? "저장" : "추가"}</button></div>
           </form> : <div className="book-entry-dialog book-entry-import-dialog">
             <div className="book-entry-dialog-head"><div><span>IMPORT EXPRESSIONS</span><h3 className="book-entry-dialog-title">파일로 표현 추가</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
             <div className="book-entry-import-meta">
