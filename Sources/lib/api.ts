@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AudioSettings, DeckSummary, EnrichmentProgress, EntryDraft, EntryListRecord, ImportResult, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
+import type { AudioSettings, DeckSummary, EnrichmentProgress, EntryDetails, EntryDraft, EntryListRecord, ImportResult, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StorageSettings, StudyMode, SubmitResult, VoicevoxRuntimeStatus } from "./types";
 
 export const api = {
   listDecks: () => invoke<DeckSummary[]>("list_decks"),
   listEntries: (deckId: string) => invoke<EntryListRecord[]>("list_entries", { deckId }),
+  entryDetails: (deckId: string, entryId: string) => invoke<EntryDetails>("entry_details", { deckId, entryId }),
   stageSchedule: (deckId: string, stage: number) => invoke<StageScheduleSummary>("stage_schedule", { deckId, stage }),
   createDeck: (name: string) =>
     invoke<DeckSummary>("create_deck", {
@@ -16,7 +17,7 @@ export const api = {
   enrichmentProgress: (entryIds: string[]) =>
     invoke<EnrichmentProgress>("enrichment_progress", { entryIds }),
   updateEntry: (deckId: string, entryId: string, entry: EntryDraft) =>
-    invoke<void>("update_entry", { deckId, entryId, entry }),
+    invoke<boolean>("update_entry", { deckId, entryId, entry }),
   deleteEntry: (deckId: string, entryId: string) =>
     invoke<void>("delete_entry", { deckId, entryId }),
   startStudy: (deckId: string, stage?: number) => invoke<SubmitResult>("start_study", { deckId, stage }),

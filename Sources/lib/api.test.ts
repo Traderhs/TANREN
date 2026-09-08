@@ -27,4 +27,11 @@ describe("study command payloads", () => {
     await api.activateInputProfile("ko-KR");
     expect(invoke).toHaveBeenCalledWith("activate_input_profile", { language: "ko-KR" });
   });
+
+  it("loads and updates one entry through the shared edit path", async () => {
+    invoke.mockResolvedValueOnce({ entry: { id: "entry", term: "猫", meanings: ["고양이"] }, pitch: null });
+    await api.entryDetails("deck", "entry");
+    expect(invoke).toHaveBeenLastCalledWith("entry_details", { deckId: "deck", entryId: "entry" });
+  });
+
 });

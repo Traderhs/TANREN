@@ -511,6 +511,61 @@ def voicevox_metadata(base_url: str) -> tuple[list[dict[str, Any]], str]:
     return cached
 
 
+def voicevox_native_accent_type(
+    base_url: str,
+    reading: str,
+    expected_morae: list[str],
+) -> tuple[int | None, str | None]:
+    if not expected_morae:
+        return None, None
+    profiles, version = voicevox_metadata(base_url)
+    query = voicevox_request(
+        base_url,
+        "/audio_query",
+        {"text": hira(reading), "speaker": profiles[0]["speaker_id"]},
+    )
+    phrases = query.get("accent_phrases", []) if isinstance(query, dict) else []
+    if not phrases:
+        return None, version
+
+    flattened_morae: list[str] = []
+    phrase_morae: list[list[dict[str, Any]]] = []
+    for phrase in phrases:
+        if not isinstance(phrase, dict):
+            return None, version
+        if phrase.get("pause_mora") is not None:
+            return None, version
+        moras = phrase.get("moras", [])
+        if not isinstance(moras, list):
+            return None, version
+        typed_moras = [mora for mora in moras if isinstance(mora, dict)]
+        if len(typed_moras) != len(moras):
+            return None, version
+        phrase_morae.append(typed_moras)
+        flattened_morae.extend(hira(str(mora.get("text", ""))) for mora in typed_moras)
+
+    normalized_expected = [hira(mora) for mora in expected_morae]
+    if flattened_morae != normalized_expected:
+        return None, version
+
+    for phrase, moras in zip(phrases, phrase_morae):
+        if not moras:
+            continue
+        try:
+            accent = int(phrase.get("accent"))
+        except (TypeError, ValueError):
+            return None, version
+        if accent < 1 or accent > len(moras):
+            return None, version
+        # VOICEVOX occasionally splits one explicitly supplied lexical reading
+        # into multiple accent phrases (e.g. せっくす -> せっく / す). TANREN's
+        # entry is still one learning unit, so use the first lexical downstep
+        # against the flattened mora sequence instead of discarding the pitch.
+        return accent, version
+
+    return None, version
+
+
 def warm_voicevox_profiles(base_url: str) -> int:
     profiles, _ = voicevox_metadata(base_url)
 
@@ -691,11 +746,31 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
     )
     accent_types = lexical_accent if scope == "lexical" and reading_matches_lexicon else None
     patterns = accent_contours(len(mora_list), accent_types)
+    audio_dir = req.get("audio_dir")
+    voicevox_url = req.get("voicevox_url")
+    voicevox_fallback_version = None
+    used_voicevox_pitch_fallback = False
+    if not patterns and voicevox_url and scope == "lexical" and reading:
+        native_accent, voicevox_fallback_version = voicevox_native_accent_type(
+            str(voicevox_url),
+            reading,
+            mora_list,
+        )
+        if native_accent is not None:
+            accent_types = [native_accent]
+            patterns = accent_contours(len(mora_list), accent_types)
+            used_voicevox_pitch_fallback = patterns is not None
     if patterns:
-        provider = "unidic-fugashi"
-        source = "UniDic lexical accent field"
-        confidence = "CONSENSUS"
-        model_version = fugashi_version
+        if used_voicevox_pitch_fallback:
+            provider = f"voicevox-{voicevox_fallback_version or 'unknown'}"
+            source = "VOICEVOX lexical accent phrase"
+            confidence = "PREDICTED"
+            model_version = voicevox_fallback_version
+        else:
+            provider = "unidic-fugashi"
+            source = "UniDic lexical accent field"
+            confidence = "CONSENSUS"
+            model_version = fugashi_version
     elif reading:
         provider = "pyopenjtalk" if openjtalk_version else "builtin-kana"
         source = "OpenJTalk analysis" if openjtalk_version else "surface kana"
@@ -708,8 +783,6 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
         model_version = None
 
     audio_assets: list[dict[str, Any]] = []
-    audio_dir = req.get("audio_dir")
-    voicevox_url = req.get("voicevox_url")
     if audio_dir and voicevox_url and scope == "lexical" and reading:
         audio_assets = generate_voicevox_assets(
             str(voicevox_url),
