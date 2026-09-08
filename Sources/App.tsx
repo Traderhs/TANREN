@@ -2074,7 +2074,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
               setBookStudyExiting(true);
               setBookStudyTransitioning(true);
             }
-            await onRefresh();
+            await refreshBookEntries(openedDeck.id);
           }} />}
         </div>
 
