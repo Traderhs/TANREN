@@ -235,7 +235,7 @@ def kata(text: str) -> str:
 def morae(reading: str) -> list[str]:
     result: list[str] = []
     for ch in reading:
-        if ch.isspace():
+        if ch.isspace() or unicodedata.category(ch).startswith("P"):
             continue
         if ch in SMALL and result:
             result[-1] += ch
@@ -386,6 +386,11 @@ def token_data(text: str) -> tuple[list[dict[str, Any]], list[int] | None, str |
 def reading_from_openjtalk(text: str) -> tuple[str | None, str | None]:
     try:
         pyopenjtalk = import_pyopenjtalk()
+        text = re.sub(
+            r"(?<!\d)\d{1,3}(?:,\d{3})+(?!\d)",
+            lambda match: match.group(0).replace(",", ""),
+            text,
+        )
         return hira(pyopenjtalk.g2p(text, kana=True)), getattr(pyopenjtalk, "__version__", None)
     except Exception:
         return None, None
