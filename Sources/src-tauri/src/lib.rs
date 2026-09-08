@@ -916,11 +916,22 @@ fn start_semantic_precompute(semantic: Arc<SemanticGrader>, candidates: Vec<Stri
     });
 }
 
-fn configured_semantic_home(db: &Database, app_data: &Path) -> Result<PathBuf, String> {
+fn default_runtime_home() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("TANREN executable path could not be resolved: {error}"))?;
+    let install_dir = executable
+        .parent()
+        .ok_or_else(|| "TANREN install directory could not be resolved".to_string())?;
+    Ok(install_dir.join("Runtime"))
+}
+
+fn configured_semantic_home(db: &Database, default_home: &Path) -> Result<PathBuf, String> {
     if let Some(path) = db.setting(SEMANTIC_STORAGE_SETTING)?.filter(|value| !value.trim().is_empty()) {
         return Ok(PathBuf::from(path));
     }
-    Ok(std::env::var_os("TANREN_SEMANTIC_HOME").map(PathBuf::from).unwrap_or_else(|| app_data.join("semantic")))
+    Ok(std::env::var_os("TANREN_SEMANTIC_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_home.to_path_buf()))
 }
 
 fn storage_settings_snapshot(state: &AppState) -> Result<StorageSettings, String> {
@@ -993,8 +1004,9 @@ pub fn run() {
             db.requeue_failed_enrichment()?;
             db.requeue_incomplete_lexical_enrichment()?;
             db.requeue_voice_audio_revision(VOICE_AUDIO_REVISION)?;
-            let default_semantic_home = app_data.join("semantic");
-            let semantic_home = configured_semantic_home(&db, &app_data)?;
+            let default_semantic_home = default_runtime_home()?;
+            let semantic_home = configured_semantic_home(&db, &default_semantic_home)?;
+            std::fs::create_dir_all(&semantic_home).map_err(|e| e.to_string())?;
             let voicevox = VoicevoxRuntime::install(semantic_home.join("voicevox"));
             let audio_dir = semantic_home.join("audio");
             app.asset_protocol_scope().allow_directory(&audio_dir, true).map_err(|e| e.to_string())?;
