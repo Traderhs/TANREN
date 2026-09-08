@@ -6470,7 +6470,8 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
   overflow-x: auto;
   color: #d8c293;
 }
-.learning-pitch-trace svg { width: 100%; min-width: 260px; height: 118px; display: block; overflow: visible; }
+.learning-pitch-trace svg { width: 100%; min-width: 260px; height: 96px; display: block; overflow: visible; }
+.learning-pitch-trace.has-mora-labels svg { height: 118px; }
 .learning-pitch-guide { stroke: #30352e; stroke-width: 1; stroke-dasharray: 3 6; }
 .learning-pitch-line { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
 .learning-pitch-node { fill: #111313; stroke: currentColor; stroke-width: 2.5; }
@@ -6481,9 +6482,25 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
 .learning-pitch-trace.is-correct { color: #84c79b; }
 .learning-pitch-trace.is-incorrect { color: #d98787; }
 .learning-pitch-control { width: min(700px, 100%); outline: none; }
-.learning-pitch-control>.learning-pitch-trace { width: 100%; }
-.learning-pitch-control .learning-pitch { margin-top: 36px; }
-.learning-pitch-mora { min-width: 74px; padding: 8px 8px 10px; border: 1px solid transparent; border-radius: 8px; transition: border-color .15s, background .15s, opacity .15s; }
+.learning-pitch-scroll {
+  width: 100%;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.learning-pitch-track { min-width: 100%; }
+.learning-pitch-track>.learning-pitch-trace {
+  width: 100%;
+  overflow: visible;
+}
+.learning-pitch-control .learning-pitch {
+  display: grid;
+  grid-template-columns: repeat(var(--pitch-mora-count), minmax(0, 1fr));
+  gap: 0;
+  margin: 8px 0 0;
+  padding: 0;
+  overflow: visible;
+}
+.learning-pitch-mora { min-width: 0; padding: 8px 4px 10px; border: 1px solid transparent; border-radius: 8px; transition: border-color .15s, background .15s, opacity .15s; }
 .learning-pitch-mora.is-current { border-color: #5b513e; background: #c1a26b0a; }
 .learning-pitch-mora:not(.is-current):not(.is-set) { opacity: .62; }
 .learning-pitch-mora>span { color: #ddd9d0; font-family: var(--font-jp); font-size: 17px; }
