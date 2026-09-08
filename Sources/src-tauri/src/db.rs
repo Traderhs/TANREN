@@ -1163,7 +1163,7 @@ impl Database {
         let Some(morae_values)=analysis.get("morae").and_then(Value::as_array) else{return Ok(None)};
         let Some(morae)=morae_values.iter().map(|value| value.as_str().map(String::from)).collect::<Option<Vec<_>>>() else{return Ok(None)};
         let Some(kind)=analysis.get("scope").and_then(Value::as_str).map(String::from) else{return Ok(None)};
-        if kind != "lexical" || morae.is_empty() || patterns.is_empty() || patterns.iter().any(|pattern| pattern.len()!=morae.len() || pattern.iter().any(|level| *level>1)) {
+        if !matches!(kind.as_str(), "lexical" | "phrase" | "sentence") || morae.is_empty() || patterns.is_empty() || patterns.iter().any(|pattern| pattern.len()!=morae.len() || pattern.iter().any(|level| *level>1)) {
             return Ok(None);
         }
         let phrase_count=if kind=="lexical"{1}else{patterns.first().map(|p|p.len()).unwrap_or(1)};
@@ -2354,7 +2354,10 @@ mod tests{
             &entries[2].id, Some("とうきょうだいがく"), &phrase, "fixture", "phrase prediction", "PREDICTED", None,
             Some(&[vec![0,1,1,1,1,1,1,0]]), "phrase", &[],
         ).unwrap();
-        assert!(db.pitch_question(&entries[2].id, true).unwrap().is_none());
+        let phrase_question = db.pitch_question(&entries[2].id, true).unwrap().unwrap();
+        assert_eq!(phrase_question.kind, "phrase");
+        assert_eq!(phrase_question.morae, vec!["と","う","きょ","う","だ","い","が","く"]);
+        assert_eq!(phrase_question.allowed_patterns, vec![vec![0,1,1,1,1,1,1,0]]);
 
         let unavailable = serde_json::json!({"scope":"lexical","morae":["ふ","め","い"]});
         db.set_entry_analysis(

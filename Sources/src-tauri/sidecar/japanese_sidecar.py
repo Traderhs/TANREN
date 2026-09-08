@@ -566,6 +566,57 @@ def voicevox_native_accent_type(
     return None, version
 
 
+def voicevox_pitch_contour(
+    base_url: str,
+    reading: str,
+    expected_morae: list[str],
+) -> tuple[list[int] | None, str | None]:
+    if not expected_morae:
+        return None, None
+    profiles, version = voicevox_metadata(base_url)
+    query = voicevox_request(
+        base_url,
+        "/audio_query",
+        {"text": hira(reading), "speaker": profiles[0]["speaker_id"]},
+    )
+    phrases = query.get("accent_phrases", []) if isinstance(query, dict) else []
+    if not phrases:
+        return None, version
+
+    flattened_morae: list[str] = []
+    contour: list[int] = []
+    for phrase in phrases:
+        if not isinstance(phrase, dict):
+            return None, version
+        moras = phrase.get("moras", [])
+        if not isinstance(moras, list):
+            return None, version
+        typed_moras = [mora for mora in moras if isinstance(mora, dict)]
+        if len(typed_moras) != len(moras):
+            return None, version
+        if not typed_moras:
+            continue
+        try:
+            accent = int(phrase.get("accent"))
+        except (TypeError, ValueError):
+            return None, version
+        phrase_contour = accent_contour(len(typed_moras), accent)
+        if phrase_contour is None:
+            return None, version
+        flattened_morae.extend(hira(str(mora.get("text", ""))) for mora in typed_moras)
+        contour.extend(phrase_contour)
+
+    def pronunciation_key(mora: str) -> str:
+        normalized = hira(mora)
+        return {"を": "お", "は": "わ", "へ": "え"}.get(normalized, normalized)
+
+    normalized_actual = [pronunciation_key(mora) for mora in flattened_morae]
+    normalized_expected = [pronunciation_key(mora) for mora in expected_morae]
+    if normalized_actual != normalized_expected:
+        return None, version
+    return contour, version
+
+
 def warm_voicevox_profiles(base_url: str) -> int:
     profiles, _ = voicevox_metadata(base_url)
 
@@ -750,6 +801,7 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
     voicevox_url = req.get("voicevox_url")
     voicevox_fallback_version = None
     used_voicevox_pitch_fallback = False
+    voicevox_pitch_source = None
     if not patterns and voicevox_url and scope == "lexical" and reading:
         native_accent, voicevox_fallback_version = voicevox_native_accent_type(
             str(voicevox_url),
@@ -760,10 +812,21 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
             accent_types = [native_accent]
             patterns = accent_contours(len(mora_list), accent_types)
             used_voicevox_pitch_fallback = patterns is not None
+            voicevox_pitch_source = "VOICEVOX lexical accent phrase"
+    if not patterns and voicevox_url and scope != "lexical" and reading:
+        native_contour, voicevox_fallback_version = voicevox_pitch_contour(
+            str(voicevox_url),
+            reading,
+            mora_list,
+        )
+        if native_contour is not None:
+            patterns = [native_contour]
+            used_voicevox_pitch_fallback = True
+            voicevox_pitch_source = "VOICEVOX accent phrases"
     if patterns:
         if used_voicevox_pitch_fallback:
             provider = f"voicevox-{voicevox_fallback_version or 'unknown'}"
-            source = "VOICEVOX lexical accent phrase"
+            source = voicevox_pitch_source or "VOICEVOX accent phrases"
             confidence = "PREDICTED"
             model_version = voicevox_fallback_version
         else:
@@ -783,7 +846,7 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
         model_version = None
 
     audio_assets: list[dict[str, Any]] = []
-    if audio_dir and voicevox_url and scope == "lexical" and reading:
+    if audio_dir and voicevox_url and reading:
         audio_assets = generate_voicevox_assets(
             str(voicevox_url),
             reading,

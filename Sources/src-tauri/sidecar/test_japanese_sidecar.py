@@ -208,6 +208,63 @@ class ScopeAndCacheFixtures(unittest.TestCase):
         self.assertEqual(jp.scope_for("東京 大学", 2), "phrase")
         self.assertEqual(jp.scope_for("東京大学へ行く。", 4), "sentence")
 
+    def test_phrase_and_sentence_generate_pitch_and_tts(self):
+        fixtures = [
+            ("お水", "おみず", 2, "phrase", [0, 1, 1]),
+            ("水を飲む。", "みずをのむ", 4, "sentence", [0, 1, 0, 1, 0]),
+        ]
+        for text, reading, token_count, expected_scope, contour in fixtures:
+            with self.subTest(text=text):
+                tokens = [{"reading": None, "pronunciation": None} for _ in range(token_count)]
+                audio = [{"path": "voice.wav", "provider": "voicevox-test"}]
+                with patch.object(jp, "token_data", return_value=(tokens, None, "unidic-test")), \
+                     patch.object(jp, "voicevox_pitch_contour", return_value=(contour, "test-version")), \
+                     patch.object(jp, "generate_voicevox_assets", return_value=audio) as generate:
+                    result = jp.analyze_request({
+                        "text": text,
+                        "reading_hint": reading,
+                        "audio_dir": "audio",
+                        "voicevox_url": "http://voicevox",
+                    })
+                self.assertEqual(result["scope"], expected_scope)
+                self.assertEqual(result["pitch_patterns"], [contour])
+                self.assertIsNone(result["accent_types"])
+                self.assertEqual(result["provider"], "voicevox-test-version")
+                self.assertEqual(result["source"], "VOICEVOX accent phrases")
+                self.assertTrue(result["audio_written"])
+                self.assertEqual(result["audio_assets"], audio)
+                generate.assert_called_once_with(
+                    "http://voicevox",
+                    reading,
+                    jp.morae(reading),
+                    None,
+                    "audio",
+                )
+
+    def test_voicevox_pitch_contour_accepts_phonetic_particle_morae(self):
+        with patch.object(jp, "voicevox_metadata", return_value=([{"speaker_id": 7}], "test-version")), \
+             patch.object(jp, "voicevox_request", return_value={
+                 "accent_phrases": [
+                     {
+                         "moras": [{"text": "ミ"}, {"text": "ズ"}],
+                         "accent": 2,
+                         "pause_mora": {"text": "、"},
+                     },
+                     {
+                        "moras": [{"text": "オ"}, {"text": "ノ"}, {"text": "ム"}],
+                         "accent": 2,
+                         "pause_mora": None,
+                     },
+                 ],
+             }):
+            contour, version = jp.voicevox_pitch_contour(
+                "http://voicevox",
+                "みずをのむ",
+                ["み", "ず", "を", "の", "む"],
+            )
+        self.assertEqual(contour, [0, 1, 0, 1, 0])
+        self.assertEqual(version, "test-version")
+
     def test_existing_persistent_voicevox_audio_is_reused_without_network(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "cached.wav")
