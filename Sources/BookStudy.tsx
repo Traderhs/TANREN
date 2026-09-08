@@ -759,10 +759,11 @@ export function BookStudy({
   const submittedAnswerCorrect = !result.failure_type || result.failure_type === "PITCH_WRONG";
   const submittedAnswerLabel = answer.trim();
   const reviewAnswer = card ? reviewAnswerForMode(card.mode, result.canonical_answer) : result.canonical_answer ?? "";
+  const reviewCue = card
+    ? reviewAnswerForMode(card.mode === "reading" ? "writing" : "reading", result.canonical_answer)
+    : "";
   const pitchTitle = pitchQuestion
-    ? (pitchCorrection
-      ? result.canonical_answer ?? pitchQuestion.reading
-      : card?.mode === "reading" ? card.question : answer.trim() || pitchQuestion.reading)
+    ? result.canonical_answer ?? (card?.mode === "reading" || card?.mode === "listening" ? card.question : pitchQuestion.reading)
     : "";
 
   return <section
@@ -963,9 +964,10 @@ export function BookStudy({
         </div>}
 
         {review && !pitchQuestion && <div className={`learning-feedback learning-answer-review ${result.failure_type ? "needs-review" : "is-correct"}`} aria-live="polite">
-          {card?.audio_path && <div className="learning-review-cue">
-            <button className="learning-review-audio" aria-label="발음 듣기" title="발음 듣기" onClick={() => playAudio()}>▶</button>
-          </div>}
+          <div className="learning-review-cue">
+            <strong lang={card?.mode === "reading" ? deck.target_language : deck.source_language}>{reviewCue}</strong>
+            {card?.audio_path && <button className="learning-review-audio" aria-label="발음 듣기" title="발음 듣기" onClick={() => playAudio()}>▶</button>}
+          </div>
           <div className={`learning-review-result-stack ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
             <div className={`learning-answer-comparison ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
               <div className="learning-correct-answer"><span>정답</span><strong lang={card?.mode === "reading" ? deck.source_language : deck.target_language}>{reviewAnswer}</strong></div>

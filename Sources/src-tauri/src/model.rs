@@ -75,6 +75,7 @@ pub struct StageScheduleSummary {
     pub completed: bool,
     pub active: bool,
     pub clear_times_ms: Vec<u64>,
+    pub clear_cycles: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]

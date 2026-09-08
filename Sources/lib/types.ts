@@ -30,6 +30,7 @@ export interface StageScheduleSummary {
   completed: boolean;
   active: boolean;
   clear_times_ms: number[];
+  clear_cycles: number[];
 }
 
 export interface ImportResult {

@@ -1860,7 +1860,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             <FlipPage className="book-inside-page book-inside-right">
               <div className="book-page-inner book-page-inner-right">
                 <div className="range-heading">
-                  <div><span>CONTENTS</span><strong>학습 단계</strong></div>
+                  <div><span>STAGES</span><strong>학습 단계</strong></div>
                 </div>
                 {entryMessage && <p className="book-entry-message" role="alert">{entryMessage}</p>}
                 <div className="book-range-scroll" aria-label={`${openedDeck.name} study ranges`}>
@@ -1898,7 +1898,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                             </span>
                             {schedule?.clear_times_ms.length ? <span className="book-stage-clear-times" aria-label={`${stage}단계 클리어 기록`}>
                               {schedule.clear_times_ms.map((durationMs, clearIndex) => <span className="book-stage-clear-time" key={`${stage}-${clearIndex}-${durationMs}`}>
-                                {clearIndex + 1}회독 {formatStudyTime(durationMs)}
+                                {clearIndex + 1}회독 {schedule.clear_cycles[clearIndex]}바퀴 {formatStudyTime(durationMs)}
                               </span>)}
                             </span> : null}
                           </span>
