@@ -1692,6 +1692,10 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setOriginalEntry(null);
   };
 
+  const activateEntryInputProfile = (language: string) => {
+    void api.activateInputProfile(language).catch(() => {});
+  };
+
   const deleteEntry = async (entry: EntryListRecord) => {
     if (!openedDeck || entrySaving) return;
     setEntrySaving(true);
@@ -2107,9 +2111,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             {entryDialog && <div className="book-entry-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !entrySaving) closeEntryDialog(); }}>
               {entryDialog === "single" ? <form className="book-entry-dialog" onSubmit={(event) => void addSingleEntry(event)}>
                 <div className="book-entry-dialog-head"><div><span>{editingEntryId ? "EDIT EXPRESSION" : "ADD EXPRESSION"}</span><h3 className="book-entry-dialog-title">{editingEntryId ? "표현 편집" : "표현 추가"}</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
-                <label><span>표현</span><input className="home-create-input" autoFocus value={singleTerm} onChange={(event) => setSingleTerm(event.target.value)} placeholder="표현을 입력해주세요" /></label>
+                <label><span>표현</span><input className="home-create-input" autoFocus value={singleTerm} onFocus={() => { if (!editingEntryId && openedDeck) activateEntryInputProfile(openedDeck.target_language); }} onChange={(event) => setSingleTerm(event.target.value)} placeholder="표현을 입력해주세요" /></label>
                 <label><span>발음 <small>선택</small></span><input className="home-create-input" value={singleReading} onChange={(event) => setSingleReading(event.target.value)} placeholder="발음을 입력해주세요" /></label>
-                <label><span>뜻</span><input className="home-create-input" value={singleMeaning} onChange={(event) => setSingleMeaning(event.target.value)} placeholder="뜻을 입력해주세요" /></label>
+                <label><span>뜻</span><input className="home-create-input" value={singleMeaning} onFocus={() => { if (!editingEntryId && openedDeck) activateEntryInputProfile(openedDeck.source_language); }} onChange={(event) => setSingleMeaning(event.target.value)} placeholder="뜻을 입력해주세요" /></label>
                 <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim() || japaneseReadingInvalid}>{editingEntryId ? "저장" : "추가"}</button></div>
               </form> : <div className="book-entry-dialog book-entry-import-dialog">
                 <div className="book-entry-dialog-head"><div><span>IMPORT EXPRESSIONS</span><h3 className="book-entry-dialog-title">파일로 표현 추가</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
@@ -2139,9 +2143,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
         {bookPanel === "study" && entryDialog && <div className="book-entry-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !entrySaving) closeEntryDialog(); }}>
           {entryDialog === "single" ? <form className="book-entry-dialog" onSubmit={(event) => void addSingleEntry(event)}>
             <div className="book-entry-dialog-head"><div><span>{editingEntryId ? "EDIT EXPRESSION" : "ADD EXPRESSION"}</span><h3 className="book-entry-dialog-title">{editingEntryId ? "표현 편집" : "표현 추가"}</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
-            <label><span>표현</span><input className="home-create-input" autoFocus value={singleTerm} onChange={(event) => setSingleTerm(event.target.value)} placeholder="표현을 입력해주세요" /></label>
+            <label><span>표현</span><input className="home-create-input" autoFocus value={singleTerm} onFocus={() => { if (!editingEntryId && openedDeck) activateEntryInputProfile(openedDeck.target_language); }} onChange={(event) => setSingleTerm(event.target.value)} placeholder="표현을 입력해주세요" /></label>
             <label><span>발음 <small>선택</small></span><input className="home-create-input" value={singleReading} onChange={(event) => setSingleReading(event.target.value)} placeholder="발음을 입력해주세요" /></label>
-            <label><span>뜻</span><input className="home-create-input" value={singleMeaning} onChange={(event) => setSingleMeaning(event.target.value)} placeholder="뜻을 입력해주세요" /></label>
+            <label><span>뜻</span><input className="home-create-input" value={singleMeaning} onFocus={() => { if (!editingEntryId && openedDeck) activateEntryInputProfile(openedDeck.source_language); }} onChange={(event) => setSingleMeaning(event.target.value)} placeholder="뜻을 입력해주세요" /></label>
             <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim() || japaneseReadingInvalid}>{editingEntryId ? "저장" : "추가"}</button></div>
           </form> : <div className="book-entry-dialog book-entry-import-dialog">
             <div className="book-entry-dialog-head"><div><span>IMPORT EXPRESSIONS</span><h3 className="book-entry-dialog-title">파일로 표현 추가</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
