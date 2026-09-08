@@ -879,11 +879,6 @@ fn exit_study(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn activate_input_profile(window: tauri::WebviewWindow, state: State<'_, AppState>, language: String) -> Result<Option<String>, String> {
-    if language == "ja-JP" {
-        // Japanese input is handled entirely by TANREN's bundled Mozc WASM IME.
-        // Never require or switch the host OS Japanese input profile.
-        return Ok(None);
-    }
     #[cfg(windows)]
     {
         let hwnd = window.hwnd().map_err(|e| format!("could not resolve TANREN window: {e}"))?;
