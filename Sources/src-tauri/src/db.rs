@@ -26,7 +26,7 @@ fn contains_han(value: &str) -> bool {
 
 fn validate_reading_for_language(target_language: &str, reading: Option<&str>) -> Result<(), String> {
     if target_language == "ja-JP" && reading.is_some_and(contains_han) {
-        return Err("일본어 발음에는 한자를 입력할 수 없어요.".into());
+        return Err("일본어 발음에는 한자를 입력할 수 없어요".into());
     }
     Ok(())
 }
@@ -142,7 +142,7 @@ impl Database {
                 ).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
             } else if version != SCHEMA_VERSION {
-                return Err("현재 버전과 호환되지 않는 TANREN 데이터예요.".into());
+            return Err("현재 버전과 호환되지 않는 TANREN 데이터예요".into());
             }
         } else {
             let user_table_count: i64 = conn.query_row(
@@ -151,7 +151,7 @@ impl Database {
                 |row| row.get(0),
             ).map_err(|e| e.to_string())?;
             if user_table_count > 0 {
-                return Err("현재 버전과 호환되지 않는 TANREN 데이터예요.".into());
+            return Err("현재 버전과 호환되지 않는 TANREN 데이터예요".into());
             }
         }
 
@@ -536,7 +536,7 @@ impl Database {
     pub fn select_stage(&self, deck_id: &str, stage: u32) -> Result<(), String> {
         let total_stages = self.total_stages(deck_id)?;
         if stage == 0 || stage > total_stages {
-            return Err("존재하지 않는 단계예요.".into());
+            return Err("존재하지 않는 단계예요".into());
         }
         let mut conn = self.conn()?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -568,7 +568,7 @@ impl Database {
         let deck = self.deck(deck_id)?;
         let slots = self.effective_stage_slots(deck_id)?;
         if stage_study_range(slots.len(), deck.increment_size, deck.checkpoint_size, stage).is_none() {
-            return Err("존재하지 않는 단계예요.".into());
+            return Err("존재하지 않는 단계예요".into());
         }
         self.save_stage_schedule_if_absent(deck_id, stage, &slots)?;
         Ok(slots)
@@ -581,12 +581,12 @@ impl Database {
         } else {
             let slots = self.effective_stage_slots(deck_id)?;
             if stage_study_range(slots.len(), deck.increment_size, deck.checkpoint_size, stage).is_none() {
-                return Err("존재하지 않는 단계예요.".into());
+            return Err("존재하지 않는 단계예요".into());
             }
             slots
         };
         let study_range = stage_study_range(slots.len(), deck.increment_size, deck.checkpoint_size, stage)
-            .ok_or("존재하지 않는 단계예요.")?;
+            .ok_or("존재하지 않는 단계예요")?;
         let conn = self.conn()?;
         let active: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM stage_states WHERE deck_id=?1 AND stage=?2)",
@@ -857,7 +857,7 @@ impl Database {
     pub fn update_entry(&self, deck_id: &str, entry_id: &str, draft: &EntryDraft) -> Result<bool, String> {
         let term = draft.term.trim();
         let meanings: Vec<String> = draft.meanings.iter().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).collect();
-        if term.is_empty() || meanings.is_empty() { return Err("표현과 뜻을 입력해주세요.".into()); }
+        if term.is_empty() || meanings.is_empty() { return Err("표현과 뜻을 입력해주세요".into()); }
         let target_language = self.deck(deck_id)?.target_language;
 
         let mut conn = self.conn()?;
@@ -1583,7 +1583,7 @@ impl Database {
 
     pub fn export_backup(&self, path: &Path) -> Result<(), String> {
         if path == self.path {
-            return Err("현재 TANREN 데이터 파일에는 백업을 덮어쓸 수 없어요.".into());
+            return Err("현재 TANREN 데이터 파일에는 백업을 덮어쓸 수 없어요".into());
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1600,10 +1600,10 @@ impl Database {
 
     pub fn import_backup(&self, path: &Path) -> Result<(), String> {
         if path == self.path {
-            return Err("현재 TANREN 데이터 파일은 백업으로 가져올 수 없어요.".into());
+            return Err("현재 TANREN 데이터 파일은 백업으로 가져올 수 없어요".into());
         }
         if !path.is_file() {
-            return Err("백업 파일을 찾을 수 없어요.".into());
+            return Err("백업 파일을 찾을 수 없어요".into());
         }
         let source = Connection::open(path).map_err(|e| format!("백업 파일을 열 수 없어요: {e}"))?;
         let valid: bool = source.query_row(
@@ -1612,7 +1612,7 @@ impl Database {
             |row| row.get(0),
         ).map_err(|e| format!("TANREN 백업 파일이 아니에요: {e}"))?;
         if !valid {
-            return Err("TANREN 백업 파일이 아니에요.".into());
+            return Err("TANREN 백업 파일이 아니에요".into());
         }
         let version: i64 = source.query_row(
             "SELECT version FROM schema_info WHERE id=1",
@@ -1620,11 +1620,11 @@ impl Database {
             |row| row.get(0),
         ).map_err(|e| format!("백업 버전을 확인하지 못했어요: {e}"))?;
         if version != SCHEMA_VERSION {
-            return Err("현재 버전과 맞지 않는 TANREN 백업이에요.".into());
+            return Err("현재 버전과 맞지 않는 TANREN 백업이에요".into());
         }
         let integrity: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(|e| e.to_string())?;
         if integrity != "ok" {
-            return Err("백업 파일이 손상되어 있어요.".into());
+            return Err("백업 파일이 손상되어 있어요".into());
         }
         {
             let mut destination = self.conn()?;
@@ -1718,7 +1718,7 @@ mod tests{
         assert!(validate_reading_for_language("ja-JP", Some("みず")).is_ok());
         assert_eq!(
             validate_reading_for_language("ja-JP", Some("水")).unwrap_err(),
-            "일본어 발음에는 한자를 입력할 수 없어요."
+            "일본어 발음에는 한자를 입력할 수 없어요"
         );
         assert!(validate_reading_for_language("en-US", Some("水")).is_ok());
 
@@ -1730,7 +1730,7 @@ mod tests{
         };
         assert_eq!(
             db.import_entries(&deck.id, "ja-JP", &[invalid]).unwrap_err(),
-            "일본어 발음에는 한자를 입력할 수 없어요."
+            "일본어 발음에는 한자를 입력할 수 없어요"
         );
 
         db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
@@ -1741,7 +1741,7 @@ mod tests{
             db.update_entry(&deck.id, &entry.id, &EntryDraft {
                 term: "水".into(), meanings: vec!["물".into()], reading: Some("水".into()),
             }).unwrap_err(),
-            "일본어 발음에는 한자를 입력할 수 없어요."
+            "일본어 발음에는 한자를 입력할 수 없어요"
         );
     }
 
