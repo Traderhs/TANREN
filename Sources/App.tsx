@@ -1696,6 +1696,21 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     void api.activateInputProfile(language).catch(() => {});
   };
 
+  useEffect(() => {
+    if (entryDialog !== "single" || editingEntryId || !openedDeck) return;
+    let cancelled = false;
+    const activate = () => {
+      if (!cancelled) activateEntryInputProfile(openedDeck.target_language);
+    };
+    const frame = window.requestAnimationFrame(activate);
+    const retry = window.setTimeout(activate, 100);
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(retry);
+    };
+  }, [entryDialog, editingEntryId, openedDeck?.id, openedDeck?.target_language]);
+
   const deleteEntry = async (entry: EntryListRecord) => {
     if (!openedDeck || entrySaving) return;
     setEntrySaving(true);
