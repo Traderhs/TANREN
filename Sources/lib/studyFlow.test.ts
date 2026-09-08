@@ -36,7 +36,7 @@ describe("writing study user actions", () => {
   it("runs timers only for an actual active card", () => {
     expect(activeCardTimerRuns(card(), null)).toBe(true);
     expect(activeCardTimerRuns(card(), result("pass", { card: card() }))).toBe(true);
-    for (const status of ["ambiguous", "pitch", "review", "stage_complete"] as const) {
+    for (const status of ["ambiguous", "pitch", "review", "cycle_complete", "stage_complete"] as const) {
       expect(activeCardTimerRuns(status === "stage_complete" ? null : card(), result(status))).toBe(false);
     }
   });

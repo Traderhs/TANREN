@@ -9,6 +9,7 @@ use crate::model::{EntryRecord, PitchQuestion, StudyMode, StudyRange, SubmitResu
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PendingState {
     Review { variant: VariantKey, result: SubmitResult },
+    CycleComplete { variant: VariantKey },
     Ambiguous {
         variant: VariantKey,
         answer: String,
@@ -79,6 +80,8 @@ pub struct QueueState {
     pub remaining: Vec<VariantKey>,
     pub queue: VecDeque<VariantKey>,
     pub recent_entries: VecDeque<String>,
+    #[serde(default)]
+    pub completed_cycles: usize,
 }
 
 impl QueueState {
@@ -86,10 +89,17 @@ impl QueueState {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         variants.shuffle(&mut rng);
         let queue = variants.iter().cloned().collect();
-        Self { seed, remaining: variants, queue, recent_entries: VecDeque::new() }
+        Self { seed, remaining: variants, queue, recent_entries: VecDeque::new(), completed_cycles: 0 }
     }
 
     pub fn remaining_count(&self) -> usize { self.remaining.len() }
+
+    pub fn current_cycle_complete(&self) -> bool { self.queue.is_empty() }
+
+    pub fn complete_cycle(&mut self) -> usize {
+        self.completed_cycles += 1;
+        self.completed_cycles
+    }
 
     pub fn pop_next(&mut self, minimum_same_entry_gap: usize) -> Option<VariantKey> {
         if self.queue.is_empty() && !self.remaining.is_empty() {
@@ -232,6 +242,7 @@ impl StudySession {
         }
         let pending_entry_id = match self.pending.as_ref() {
             Some(PendingState::Review { variant, .. })
+            | Some(PendingState::CycleComplete { variant })
             | Some(PendingState::Ambiguous { variant, .. })
             | Some(PendingState::Pitch { variant, .. })
             | Some(PendingState::PitchCorrection { variant, .. }) => Some(variant.entry_id.as_str()),
@@ -290,6 +301,7 @@ impl StudySession {
         }
         let pending_matches = match self.pending.as_ref() {
             Some(PendingState::Review { variant, .. })
+            | Some(PendingState::CycleComplete { variant })
             | Some(PendingState::Ambiguous { variant, .. })
             | Some(PendingState::Pitch { variant, .. })
             | Some(PendingState::PitchCorrection { variant, .. }) => variant.entry_id == entry_id,
@@ -317,6 +329,9 @@ impl StudySession {
     }
 
     pub fn recover_interrupted_card(&mut self) {
+        if matches!(self.pending, Some(PendingState::CycleComplete { .. })) {
+            return;
+        }
         if let Some(current) = self.current.take() { self.queue.mark_fail(&current); }
         self.pending = None;
     }
@@ -422,6 +437,35 @@ mod tests {
         assert!(failed.contains(&retry_a));
         assert!(failed.contains(&retry_b));
         assert_ne!(retry_a, retry_b);
+    }
+
+    #[test]
+    fn reports_each_completed_cycle_before_retries_begin() {
+        let variants = (0..4).map(|i| VariantKey { entry_id: format!("e{i}"), mode: StudyMode::Reading }).collect::<Vec<_>>();
+        let mut queue = QueueState::new(variants, 7);
+        let mut failed = Vec::new();
+
+        for index in 0..4 {
+            let variant = queue.pop_next(0).unwrap();
+            if index < 2 {
+                queue.mark_fail(&variant);
+                failed.push(variant);
+            } else {
+                queue.mark_pass(&variant);
+            }
+        }
+        assert!(queue.current_cycle_complete());
+        assert_eq!(queue.remaining_count(), 2);
+        assert_eq!(queue.complete_cycle(), 1);
+
+        for _ in 0..2 {
+            let variant = queue.pop_next(0).unwrap();
+            assert!(failed.contains(&variant));
+            queue.mark_fail(&variant);
+        }
+        assert!(queue.current_cycle_complete());
+        assert_eq!(queue.remaining_count(), 2);
+        assert_eq!(queue.complete_cycle(), 2);
     }
 
     #[test]

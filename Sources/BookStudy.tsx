@@ -112,6 +112,7 @@ export function BookStudy({
   const learningSurface = useRef<HTMLElement>(null);
   const transitionContent = useRef<HTMLDivElement>(null);
   const exitTurnStarted = useRef(false);
+  const stageComplete = useRef(false);
   const pitchControl = useRef<HTMLDivElement>(null);
   const imeCandidateList = useRef<HTMLDivElement>(null);
   const cardRef = useRef(card);
@@ -141,6 +142,8 @@ export function BookStudy({
 
   const active = activeCardTimerRuns(card, result);
   const complete = result.status === "stage_complete";
+  stageComplete.current = complete;
+  const cycleComplete = result.status === "cycle_complete";
   const review = result.status === "review" || result.status === "fail";
   const ambiguous = result.status === "ambiguous";
   const pitchQuestion = result.pitch ?? null;
@@ -169,7 +172,7 @@ export function BookStudy({
     ? 0
     : Math.max(0, studyActivityNow - studyActivityStartedAt.current));
 
-  const studyViewIsActive = () => document.visibilityState === "visible" && document.hasFocus();
+  const studyViewIsActive = () => document.visibilityState === "visible" && document.hasFocus() && !stageComplete.current;
 
   function collectStudyActivity(stop = false) {
     const currentNow = performance.now();
@@ -202,6 +205,20 @@ export function BookStudy({
     await flushStudyActivity(true);
     try {
       const next = await api.continueReview();
+      if (next.status !== "stage_complete" && studyViewIsActive()) {
+        studyActivityStartedAt.current = performance.now();
+      }
+      return next;
+    } catch (cause) {
+      if (studyViewIsActive()) studyActivityStartedAt.current = performance.now();
+      throw cause;
+    }
+  }
+
+  async function continueCycle() {
+    await flushStudyActivity(true);
+    try {
+      const next = await api.continueCycle();
       if (next.status !== "stage_complete" && studyViewIsActive()) {
         studyActivityStartedAt.current = performance.now();
       }
@@ -276,7 +293,9 @@ export function BookStudy({
         setResult(next);
       };
 
-      const shouldSlide = (next.card && next.status === "pass") || next.status === "stage_complete";
+      const shouldSlide = (next.card && next.status === "pass")
+        || next.status === "cycle_complete"
+        || next.status === "stage_complete";
       const canSlide = shouldSlide
         && !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
@@ -468,6 +487,28 @@ export function BookStudy({
   }, [review, pitchQuestion, busy, card?.variant_id]);
 
   useEffect(() => {
+    if (!cycleComplete || busy) return;
+    const nextCycleOnEnter = (event: KeyboardEvent) => {
+      if (event.key !== "Enter" || event.repeat || event.isComposing) return;
+      event.preventDefault();
+      void run(continueCycle);
+    };
+    window.addEventListener("keydown", nextCycleOnEnter, true);
+    return () => window.removeEventListener("keydown", nextCycleOnEnter, true);
+  }, [cycleComplete, busy, card?.variant_id]);
+
+  useEffect(() => {
+    if (!complete || busy) return;
+    const exitOnEnter = (event: KeyboardEvent) => {
+      if (event.key !== "Enter" || event.repeat || event.isComposing) return;
+      event.preventDefault();
+      exitStudy();
+    };
+    window.addEventListener("keydown", exitOnEnter, true);
+    return () => window.removeEventListener("keydown", exitOnEnter, true);
+  }, [complete, busy]);
+
+  useEffect(() => {
     if (!pitchQuestion) return;
     setPitch(emptyPitchSelection(pitchQuestion.morae.length));
     setPitchCursor(0);
@@ -557,6 +598,10 @@ export function BookStudy({
     const frame = requestAnimationFrame(() => playAudio());
     return () => cancelAnimationFrame(frame);
   }, [card?.variant_id, card?.audio_path, pitchCorrection]);
+
+  useEffect(() => {
+    if (complete) void flushStudyActivity(true);
+  }, [complete]);
 
   useEffect(() => {
     if (studyViewIsActive()) studyActivityStartedAt.current = performance.now();
@@ -711,15 +756,14 @@ export function BookStudy({
       ?? submittedPitchQuestion.allowed_patterns[0]
       ?? null
     : null;
-  const reviewAnswer = card ? reviewAnswerForMode(card.mode, result.canonical_answer) : result.canonical_answer ?? "";
   const submittedAnswerCorrect = !result.failure_type || result.failure_type === "PITCH_WRONG";
   const submittedAnswerLabel = answer.trim();
+  const reviewAnswer = card ? reviewAnswerForMode(card.mode, result.canonical_answer) : result.canonical_answer ?? "";
   const pitchTitle = pitchQuestion
     ? (pitchCorrection
       ? result.canonical_answer ?? pitchQuestion.reading
       : card?.mode === "reading" ? card.question : answer.trim() || pitchQuestion.reading)
     : "";
-  const showPitchReading = Boolean(pitchQuestion && pitchTitle !== pitchQuestion.reading);
 
   return <section
     ref={learningSurface}
@@ -743,9 +787,8 @@ export function BookStudy({
       {complete ? <div className="learning-complete">
         <span className="learning-complete-mark">✓</span>
         <span className="learning-eyebrow">WELL DONE</span>
-        <h1>한 걸음 더, 익숙해졌어요.</h1>
-        <p>이번 단계를 모두 마쳤어요.</p>
-        <button disabled={busy} onClick={exitStudy}>목차로 돌아가기 <span>→</span></button>
+        <h1>한 걸음 더, 익숙해졌어요</h1>
+        <p>이번 단계를 모두 마쳤어요</p>
       </div> : <>
         {active && <>
           <div className="learning-question">
@@ -880,9 +923,14 @@ export function BookStudy({
           </form>
         </>}
 
+        {cycleComplete && <div className="learning-complete" aria-live="polite">
+          <span className="learning-complete-mark">↻</span>
+          <h1>{result.message}</h1>
+          <p>남은 {(card?.remaining ?? 0).toLocaleString("ko-KR")}개를 다시 풀어요</p>
+        </div>}
+
         {pitchQuestion && <div className="learning-feedback learning-pitch-step">
           <strong className="learning-target-expression" lang={deck.target_language}>{pitchTitle}</strong>
-          {showPitchReading && <div className="learning-reading"><span lang="ja">{pitchQuestion.reading}</span></div>}
           <div
             ref={pitchControl}
             className="learning-pitch-control"

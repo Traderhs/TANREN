@@ -481,10 +481,40 @@ fn grade_pitch_contour(question: &model::PitchQuestion, contour: &[u8]) -> (bool
 fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
-    match session.pending.take() {
-        Some(PendingState::Review { .. }) => {}
+    let reviewed_variant = match session.pending.take() {
+        Some(PendingState::Review { variant, .. }) => variant,
         Some(other) => { session.pending = Some(other); return Err("review is not ready to continue".into()); }
         None => return Err("no review is active".into()),
+    };
+    if session.queue.remaining_count() == 0 {
+        return complete_current_stage(&state, &mut engine);
+    }
+    if session.queue.current_cycle_complete() {
+        let cycle = session.queue.complete_cycle();
+        let card = build_card(&state, session, &reviewed_variant)?;
+        session.pending = Some(PendingState::CycleComplete { variant: reviewed_variant });
+        state.db.save_session(session)?;
+        return Ok(SubmitResult {
+            status: SubmitStatus::CycleComplete,
+            message: Some(format!("{}바퀴 돌았어요", cycle)),
+            failure_type: None,
+            canonical_answer: None,
+            reading: None,
+            pitch: None,
+            card: Some(card),
+        });
+    }
+    next_card(&state, &mut engine, SubmitStatus::Pass)
+}
+
+#[tauri::command]
+fn continue_cycle(state: State<'_, AppState>) -> Result<SubmitResult, String> {
+    let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요.")?;
+    let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요.")?;
+    match session.pending.take() {
+        Some(PendingState::CycleComplete { .. }) => {}
+        Some(other) => { session.pending = Some(other); return Err("cycle is not ready to continue".into()); }
+        None => return Err("no completed cycle is waiting".into()),
     }
     if session.queue.remaining_count() == 0 {
         return complete_current_stage(&state, &mut engine);
@@ -764,7 +794,23 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 card: Some(card),
             })
         }
+        Some(PendingState::CycleComplete { variant }) => {
+            let cycle = session.queue.completed_cycles;
+            let card = build_card(state, session, &variant)?;
+            Ok(SubmitResult {
+                status: SubmitStatus::CycleComplete,
+                message: Some(format!("{}바퀴 돌았어요", cycle)),
+                failure_type: None,
+                canonical_answer: None,
+                reading: None,
+                pitch: None,
+                card: Some(card),
+            })
+        }
         Some(PendingState::Review { variant, mut result }) => {
+            let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
+            result.canonical_answer = Some(format!("{}  ·  {}", entry.term, entry.meanings.join(" / ")));
+            result.reading = entry.reading;
             result.card = Some(build_card(state, session, &variant)?);
             Ok(result)
         }
@@ -1000,6 +1046,7 @@ pub fn run() {
             adjudicate_answer,
             submit_pitch,
             continue_review,
+            continue_cycle,
             library_stats,
             semantic_status,
             voicevox_status,

@@ -200,6 +200,7 @@ pub enum SubmitStatus {
     Ambiguous,
     Pitch,
     Review,
+    CycleComplete,
     StageComplete,
 }
 
