@@ -235,7 +235,7 @@ fn focused_input_window(owner: windows::Win32::Foundation::HWND) -> windows::Win
 #[cfg(windows)]
 fn set_native_imm_mode(hwnd: windows::Win32::Foundation::HWND, language: &str) -> Result<(), String> {
     use windows::Win32::UI::Input::Ime::{ImmGetContext, ImmReleaseContext, ImmSetConversionStatus, ImmSetOpenStatus, IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE, IME_CMODE_ROMAN, IME_SENTENCE_MODE};
-    let conversion = if language == "ja-JP" { IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE | IME_CMODE_ROMAN } else { IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE };
+    let conversion = if language == "ja-JP" { IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE | IME_CMODE_ROMAN } else { IME_CMODE_NATIVE };
     let himc = unsafe { ImmGetContext(hwnd) };
     if !himc.0.is_null() {
         let opened = unsafe { ImmSetOpenStatus(himc, true) }.as_bool();
@@ -298,7 +298,7 @@ fn set_native_tsf_mode(language: &str) -> Result<(), String> {
         let conversion_mode = if language == "ja-JP" {
             TF_CONVERSIONMODE_NATIVE | TF_CONVERSIONMODE_FULLSHAPE | TF_CONVERSIONMODE_ROMAN
         } else {
-            TF_CONVERSIONMODE_NATIVE | TF_CONVERSIONMODE_FULLSHAPE
+            TF_CONVERSIONMODE_NATIVE
         };
         let conversion_value = int_variant(conversion_mode as i32);
         unsafe { open.SetValue(client_id, &open_value) }.map_err(|e| e.to_string())?;
