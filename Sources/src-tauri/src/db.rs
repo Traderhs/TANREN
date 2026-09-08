@@ -1170,6 +1170,35 @@ impl Database {
         Ok(Some(PitchQuestion{kind,reading,morae,phrase_count,allowed_patterns:patterns,confidence,gate_enabled:gate}))
     }
 
+    pub fn japanese_orthographic_reading(&self, entry_id: &str) -> Result<Option<String>, String> {
+        let conn = self.conn()?;
+        let raw: Option<String> = conn.query_row(
+            "SELECT analysis_json FROM japanese_analyses WHERE entry_id=?1 AND deleted_at IS NULL",
+            [entry_id],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some(raw) = raw else { return Ok(None) };
+        let Ok(analysis) = serde_json::from_str::<serde_json::Value>(&raw) else { return Ok(None) };
+        let Some(tokens) = analysis.get("tokens").and_then(serde_json::Value::as_array) else { return Ok(None) };
+        let mut reading = String::new();
+        for token in tokens {
+            let surface = token.get("surface").and_then(serde_json::Value::as_str).unwrap_or("");
+            if let Some(value) = token.get("reading").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty() && *value != "*") {
+                reading.push_str(value);
+                continue;
+            }
+            if surface.chars().all(|c| c.is_whitespace() || "。、！？!?・「」『』（）()".contains(c)) {
+                continue;
+            }
+            if surface.chars().all(|c| ('ぁ'..='ゖ').contains(&c) || ('ァ'..='ヺ').contains(&c) || c == 'ー') {
+                reading.push_str(surface);
+                continue;
+            }
+            return Ok(None);
+        }
+        Ok((!reading.is_empty()).then_some(reading))
+    }
+
     pub fn next_audio_path(&self, entry_id:&str)->Result<Option<String>,String>{
         let mut conn=self.conn()?;
         let tx=conn.transaction().map_err(|e|e.to_string())?;
@@ -1397,7 +1426,7 @@ impl Database {
         ).map_err(|e| e.to_string())
     }
 
-    pub fn requeue_incomplete_lexical_enrichment(&self) -> Result<usize, String> {
+    pub fn requeue_incomplete_japanese_enrichment(&self) -> Result<usize, String> {
         let conn = self.conn()?;
         conn.execute(
             "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 \
@@ -1407,7 +1436,7 @@ impl Database {
                  JOIN japanese_analyses a ON a.entry_id=e.id AND a.deleted_at IS NULL \
                  WHERE e.deleted_at IS NULL \
                    AND e.language='ja-JP' \
-                   AND json_extract(a.analysis_json,'$.scope')='lexical' \
+                   AND json_extract(a.analysis_json,'$.scope') IN ('lexical','phrase','sentence') \
                    AND ( \
                      NOT EXISTS(SELECT 1 FROM audio_assets aa WHERE aa.entry_id=e.id AND aa.deleted_at IS NULL) \
                      OR NOT EXISTS(SELECT 1 FROM pitch_patterns p WHERE p.analysis_id=a.id AND p.deleted_at IS NULL) \
@@ -2060,13 +2089,14 @@ mod tests{
     }
 
     #[test]
-    fn completed_lexical_entries_missing_pitch_or_audio_are_requeued() {
+    fn completed_japanese_entries_missing_pitch_or_audio_are_requeued() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
-        let deck = db.create_deck("incomplete lexical", "ko-KR", "ja-JP").unwrap();
+        let deck = db.create_deck("incomplete Japanese", "ko-KR", "ja-JP").unwrap();
         db.import_entries(&deck.id, "ja-JP", &[
             EntryDraft { term: "いす".into(), meanings: vec!["의자".into()], reading: Some("いす".into()) },
             EntryDraft { term: "十三".into(), meanings: vec!["열셋".into()], reading: Some("じゅーさん".into()) },
+            EntryDraft { term: "今日はいい天気ですね".into(), meanings: vec!["오늘은 좋은 날씨네요".into()], reading: Some("きょーわいいてんきですね".into()) },
         ]).unwrap();
         let entries = db.entries(&deck.id).unwrap();
         let analysis = serde_json::json!({"scope":"lexical","morae":["い","す"]});
@@ -2099,9 +2129,53 @@ mod tests{
             "lexical",
             &audio_only,
         ).unwrap();
+        db.set_entry_analysis(
+            &entries[2].id,
+            Some("きょーわいいてんきですね"),
+            &serde_json::json!({"scope":"phrase","morae":["きょ","ー","わ","い","い","て","ん","き","で","す","ね"]}),
+            "voicevox-test",
+            "fixture phrase without pitch",
+            "PREDICTED",
+            None,
+            None,
+            "phrase",
+            &audio_only,
+        ).unwrap();
         assert!(db.queued_enrichment(1).unwrap().is_empty());
-        assert_eq!(db.requeue_incomplete_lexical_enrichment().unwrap(), 2);
-        assert_eq!(db.queued_enrichment(2).unwrap().len(), 2);
+        assert_eq!(db.requeue_incomplete_japanese_enrichment().unwrap(), 3);
+        assert_eq!(db.queued_enrichment(3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn japanese_analysis_exposes_orthographic_reading_for_grading() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("orthographic reading", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "今日はいい天気ですね".into(),
+            meanings: vec!["오늘은 좋은 날씨네요".into()],
+            reading: Some("きょーわいいてんきですね".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+        db.set_entry_analysis(
+            &entry.id,
+            Some("きょーわいいてんきですね"),
+            &serde_json::json!({
+                "scope":"phrase",
+                "morae":["きょ","ー","わ","い","い","て","ん","き","で","す","ね"],
+                "tokens":[
+                    {"surface":"今日","reading":"キョウ"},
+                    {"surface":"は","reading":"ハ"},
+                    {"surface":"いい","reading":"イイ"},
+                    {"surface":"天気","reading":"テンキ"},
+                    {"surface":"です","reading":"デス"},
+                    {"surface":"ね","reading":"ネ"}
+                ]
+            }),
+            "fixture", "fixture", "PREDICTED", None,
+            Some(&[vec![1,0,0,0,0,0,1,1,1,0,0]]), "phrase", &[],
+        ).unwrap();
+        assert_eq!(db.japanese_orthographic_reading(&entry.id).unwrap().as_deref(), Some("キョウハイイテンキデスネ"));
     }
 
     #[test]

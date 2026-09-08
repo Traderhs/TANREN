@@ -265,6 +265,32 @@ class ScopeAndCacheFixtures(unittest.TestCase):
         self.assertEqual(contour, [0, 1, 0, 1, 0])
         self.assertEqual(version, "test-version")
 
+    def test_voicevox_pitch_contour_accepts_prolonged_vowel_realization(self):
+        with patch.object(jp, "voicevox_metadata", return_value=([{"speaker_id": 7}], "test-version")), \
+             patch.object(jp, "voicevox_request", return_value={
+                 "accent_phrases": [
+                     {
+                         "moras": [
+                             {"text": "キョ"}, {"text": "オ"}, {"text": "ワ"}, {"text": "イ"}, {"text": "イ"},
+                         ],
+                         "accent": 1,
+                     },
+                     {
+                         "moras": [
+                             {"text": "テ"}, {"text": "ン"}, {"text": "キ"}, {"text": "デ"}, {"text": "ス"}, {"text": "ネ"},
+                         ],
+                         "accent": 4,
+                     },
+                 ],
+             }):
+            contour, version = jp.voicevox_pitch_contour(
+                "http://voicevox",
+                "きょーわいいてんきですね",
+                ["きょ", "ー", "わ", "い", "い", "て", "ん", "き", "で", "す", "ね"],
+            )
+        self.assertEqual(contour, [1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0])
+        self.assertEqual(version, "test-version")
+
     def test_existing_persistent_voicevox_audio_is_reused_without_network(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "cached.wav")
