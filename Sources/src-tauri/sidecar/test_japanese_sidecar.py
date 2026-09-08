@@ -57,10 +57,33 @@ class MoraFixtures(unittest.TestCase):
             "しんぶん": ["し", "ん", "ぶ", "ん"],
             "スーパー": ["ス", "ー", "パ", "ー"],
             "コーヒー": ["コ", "ー", "ヒ", "ー"],
+            "にほんごわ、せかいでさん，ぜろぜろぜろまんにん": [
+                "に", "ほ", "ん", "ご", "わ", "せ", "か", "い", "で", "さ", "ん",
+                "ぜ", "ろ", "ぜ", "ろ", "ぜ", "ろ", "ま", "ん", "に", "ん",
+            ],
         }
         for reading, expected in fixtures.items():
             with self.subTest(reading=reading):
                 self.assertEqual(jp.morae(reading), expected)
+
+    def test_openjtalk_removes_only_numeric_thousands_separators(self):
+        class FakeOpenJTalk:
+            __version__ = "test"
+
+            def __init__(self):
+                self.text = None
+
+            def g2p(self, text, kana=False):
+                self.text = text
+                return "サンゼンマンニン"
+
+        fake = FakeOpenJTalk()
+        with patch.object(jp, "import_pyopenjtalk", return_value=fake):
+            reading, version = jp.reading_from_openjtalk("はい、約1億3,000万人です")
+
+        self.assertEqual(fake.text, "はい、約1億3000万人です")
+        self.assertEqual(reading, "さんぜんまんにん")
+        self.assertEqual(version, "test")
 
 
 class ScopeAndCacheFixtures(unittest.TestCase):
