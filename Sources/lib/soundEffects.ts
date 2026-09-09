@@ -23,7 +23,7 @@ function playSample(src: string, masterVolume: number, options: SampleOptions) {
   const play = () => {
     const audio = new Audio(src);
     audio.preload = "auto";
-    audio.volume = clamp01(masterVolume * options.volume);
+    audio.volume = clamp01(masterVolume * options.volume) * 0.5;
     audio.playbackRate = options.playbackRate ?? 1;
     void audio.play().catch(() => undefined);
     if (options.stopAfterMs) {
