@@ -73,6 +73,12 @@ struct AudioSettings {
     playback_rate: f64,
 }
 
+#[derive(Serialize)]
+struct PickedEntryFile {
+    name: String,
+    content: String,
+}
+
 #[derive(Clone, Serialize)]
 struct StartupRuntimeProgress {
     semantic: SemanticRuntimeStatus,
@@ -809,21 +815,39 @@ fn storage_settings(state: State<'_, AppState>) -> Result<StorageSettings, Strin
 fn pick_storage_directory() -> Result<Option<String>, String> {
     #[cfg(windows)]
     {
-        let script = r#"[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); $shell = New-Object -ComObject Shell.Application; $folder = $shell.BrowseForFolder(0, 'TANREN semantic data folder', 0, 0); if ($folder) { $folder.Self.Path }"#;
-        let output = Command::new("powershell.exe")
-            .args(["-NoProfile", "-STA", "-Command", script])
-            .output()
-            .map_err(|e| format!("folder picker could not start: {e}"))?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-        }
-        let path = String::from_utf8(output.stdout).map_err(|e| format!("folder picker returned invalid UTF-8: {e}"))?;
-        let path = path.trim();
-        return Ok((!path.is_empty()).then(|| path.to_string()));
+        let selected = rfd::FileDialog::new()
+            .set_title("TANREN 데이터 저장 위치")
+            .pick_folder();
+        return Ok(selected.map(|path| path.to_string_lossy().into_owned()));
     }
     #[cfg(not(windows))]
     {
         Err("folder picker is currently supported on Windows only".into())
+    }
+}
+
+#[tauri::command]
+fn pick_entry_import_file() -> Result<Option<PickedEntryFile>, String> {
+    #[cfg(windows)]
+    {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("TANREN 표현 파일 열기")
+            .add_filter("표현 파일", &["csv", "tsv", "txt"])
+            .pick_file()
+        else {
+            return Ok(None);
+        };
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("표현 파일을 읽을 수 없어요: {e}"))?;
+        let name = path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("선택한 파일")
+            .to_string();
+        return Ok(Some(PickedEntryFile { name, content }));
+    }
+    #[cfg(not(windows))]
+    {
+        Err("표현 파일 선택은 현재 Windows에서만 지원해요".into())
     }
 }
 
@@ -1216,25 +1240,24 @@ fn audio_settings_snapshot(state: &AppState) -> Result<AudioSettings, String> {
 fn pick_backup_file(save: bool) -> Result<Option<PathBuf>, String> {
     #[cfg(windows)]
     {
-        let dialog = if save { "SaveFileDialog" } else { "OpenFileDialog" };
-        let action = if save {
-            "$dialog.FileName = 'TANREN-backup.tanren'; $dialog.DefaultExt = 'tanren'; $dialog.AddExtension = $true; $dialog.OverwritePrompt = $true;"
+        let dialog = rfd::FileDialog::new()
+            .add_filter("TANREN 백업", &["tanren"]);
+        let selected = if save {
+            dialog
+                .set_title("TANREN 백업 내보내기")
+                .set_file_name("TANREN-backup.tanren")
+                .save_file()
         } else {
-            "$dialog.CheckFileExists = $true;"
+            dialog
+                .set_title("TANREN 백업 가져오기")
+                .pick_file()
         };
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; [Console]::OutputEncoding = [Text.UTF8Encoding]::new(); $dialog = New-Object System.Windows.Forms.{dialog}; $dialog.Filter = 'TANREN 백업 (*.tanren)|*.tanren|모든 파일 (*.*)|*.*'; {action} if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ $dialog.FileName }}"
-        );
-        let output = Command::new("powershell.exe")
-            .args(["-NoProfile", "-STA", "-Command", &script])
-            .output()
-            .map_err(|e| format!("파일 선택기를 열 수 없어요: {e}"))?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-        }
-        let path = String::from_utf8(output.stdout).map_err(|e| format!("파일 경로를 읽을 수 없어요: {e}"))?;
-        let path = path.trim();
-        return Ok((!path.is_empty()).then(|| PathBuf::from(path)));
+        return Ok(selected.map(|mut path| {
+            if save && path.extension().is_none() {
+                path.set_extension("tanren");
+            }
+            path
+        }));
     }
     #[cfg(not(windows))]
     {
@@ -1368,6 +1391,7 @@ pub fn run() {
             startup_dependency_preflight,
             storage_settings,
             pick_storage_directory,
+            pick_entry_import_file,
             set_storage_directory,
             audio_settings,
             set_audio_settings,

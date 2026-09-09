@@ -54,6 +54,7 @@ export const api = {
   startupDependencyPreflight: () => invoke<void>("startup_dependency_preflight"),
   storageSettings: () => invoke<StorageSettings>("storage_settings"),
   pickStorageDirectory: () => invoke<string | null>("pick_storage_directory"),
+  pickEntryImportFile: () => invoke<{ name: string; content: string } | null>("pick_entry_import_file"),
   setStorageDirectory: (path: string | null) => invoke<StorageSettings>("set_storage_directory", { path }),
   audioSettings: () => invoke<AudioSettings>("audio_settings"),
   setAudioSettings: (settings: AudioSettings) => invoke<AudioSettings>("set_audio_settings", {
