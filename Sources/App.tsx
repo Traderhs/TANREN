@@ -1373,7 +1373,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const flipBookRef = useRef<any>(null);
   const bookFoldRef = useRef<HTMLDivElement>(null);
   const bookCoverBackgroundRef = useRef<string | undefined>(undefined);
-  const importFileInputRef = useRef<HTMLInputElement>(null);
   const importPreviewRef = useRef<HTMLDivElement>(null);
   const skipDeleteConfirmDeckIdsRef = useRef(new Set<string>());
   const flutterTimerRef = useRef<number | null>(null);
@@ -1785,17 +1784,12 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     }).catch((cause) => setEntryMessage(String(cause)));
   };
 
-  const chooseImportEntryFile = () => importFileInputRef.current?.click();
-
-  const handleImportEntryFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const input = event.currentTarget;
-    const file = input.files?.[0];
+  const chooseImportEntryFile = async () => {
+    const file = await api.pickEntryImportFile();
     if (!file) return;
-    input.value = "";
-    const text = await file.text();
     setEditingEntryId(null);
     setEntryMessage("");
-    setBulkText(text);
+    setBulkText(file.content);
     setBulkFileName(file.name);
     setEntryDialog("bulk");
   };
@@ -2325,15 +2319,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             </div>
           </div>
         </div>}
-        <input
-          ref={importFileInputRef}
-          className="book-entry-file-input"
-          type="file"
-          accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain"
-          tabIndex={-1}
-          aria-hidden="true"
-          onChange={(event) => void handleImportEntryFile(event)}
-        />
         {entryProcessing && createPortal(
           <div className="entry-processing-overlay" role="dialog" aria-modal="true" aria-labelledby="entry-processing-title">
             <div className="initial-loading-content">
