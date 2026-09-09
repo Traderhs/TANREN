@@ -24,6 +24,8 @@ rand = "0.9"
 rand_chacha = "0.9"
 thiserror = "2.0"
 unicode-normalization = "0.1"
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-27"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"

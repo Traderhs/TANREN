@@ -11,7 +11,10 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::semantic::{BackendIdentity, EmbeddingBackend, SemanticRuntimeStatus};
+use crate::{
+    semantic::{BackendIdentity, EmbeddingBackend, SemanticRuntimeStatus},
+    semantic_nli::{NLI_MODEL_FILE, NLI_TOKENIZER_FILE, ONNX_RUNTIME_ZIP},
+};
 
 const INSTALLER: &str = include_str!("../sidecar/install_semantic.ps1");
 const MODEL_ID: &str = "Qwen/Qwen3-Embedding-8B-GGUF";
@@ -19,6 +22,9 @@ const MODEL_VERSION: &str = "Q4_K_M:90f57aa:llama.cpp-b10621";
 const MODEL_FILE: &str = "Qwen3-Embedding-8B-Q4_K_M.gguf";
 const DIMENSION: usize = 4096;
 const MODEL_SIZE: u64 = 4_676_804_928;
+const NLI_MODEL_SIZE: u64 = 338_679_133;
+const NLI_TOKENIZER_SIZE: u64 = 16_331_396;
+const ONNX_RUNTIME_ZIP_SIZE: u64 = 78_796_801;
 const LLAMA_ZIP_SIZE: u64 = 250_464_283;
 const CUDA_ZIP_SIZE: u64 = 391_443_627;
 
@@ -62,8 +68,16 @@ impl LlamaCppEmbeddingBackend {
     fn prepare_inner(&self) -> Result<(), String> {
         fs::create_dir_all(&self.home).map_err(|e| e.to_string())?;
         let model_path = self.home.join("models").join(MODEL_FILE);
+        let nli_model_path = self.home.join("models").join(NLI_MODEL_FILE);
+        let nli_tokenizer_path = self.home.join("models").join(NLI_TOKENIZER_FILE);
         let server_path = find_file(&self.home.join("runtime"), "llama-server.exe");
-        if !model_path.exists() || server_path.is_none() {
+        let onnx_runtime_path = find_file(&self.home.join("runtime"), "onnxruntime.dll");
+        if !model_path.exists()
+            || !nli_model_path.exists()
+            || !nli_tokenizer_path.exists()
+            || server_path.is_none()
+            || onnx_runtime_path.is_none()
+        {
             self.set_phase("downloading")?;
             let installer_path = self.home.join("install_semantic.ps1");
             if fs::read_to_string(&installer_path).ok().as_deref() != Some(INSTALLER) {
@@ -154,8 +168,11 @@ impl LlamaCppEmbeddingBackend {
     fn download_progress(&self) -> Option<u8> {
         cumulative_asset_progress(&[
             (self.home.join("models").join(MODEL_FILE), MODEL_SIZE),
+            (self.home.join("models").join(NLI_MODEL_FILE), NLI_MODEL_SIZE),
+            (self.home.join("models").join(NLI_TOKENIZER_FILE), NLI_TOKENIZER_SIZE),
             (self.home.join("runtime").join("llama-b10621-bin-win-cuda-12.4-x64.zip"), LLAMA_ZIP_SIZE),
             (self.home.join("runtime").join("cudart-llama-bin-win-cuda-12.4-x64.zip"), CUDA_ZIP_SIZE),
+            (self.home.join("runtime").join(ONNX_RUNTIME_ZIP), ONNX_RUNTIME_ZIP_SIZE),
         ])
     }
 

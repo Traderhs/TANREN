@@ -13,7 +13,6 @@ use crate::{
 };
 
 const QUERY_INSTRUCTION: &str = "Instruct: 한국어 학습 답변과 사전의 한국어 의미가 같은 뜻인지 검색하세요.\nQuery: ";
-const CONTEXT_PASS_OFFSET: f64 = 0.02;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendIdentity {
@@ -43,16 +42,54 @@ pub trait EmbeddingBackend: Send + Sync {
     fn status(&self) -> SemanticRuntimeStatus;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RelationEvidence {
+    pub entailment: f64,
+    pub contradiction: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelationRuntimeStatus {
+    pub phase: String,
+    pub load_progress: Option<u8>,
+    pub error: Option<String>,
+}
+
+pub trait SemanticRelationBackend: Send + Sync {
+    fn relations(&self, pairs: &[(String, String)]) -> Result<Vec<RelationEvidence>, String>;
+    fn status(&self) -> RelationRuntimeStatus;
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SemanticThresholds {
     pub pass: f64,
     pub fail: f64,
     pub minimum_margin: f64,
+    pub context_pass: f64,
+    pub context_support: f64,
+    pub context_rescue_floor: f64,
+    pub descriptive_plain_relatedness: f64,
+    pub descriptive_source_relatedness: f64,
+    pub entailment_pass: f64,
+    pub contradiction_block: f64,
+    pub contradiction_fail: f64,
 }
 
 impl Default for SemanticThresholds {
     fn default() -> Self {
-        Self { pass: 0.80, fail: 0.45, minimum_margin: 0.08 }
+        Self {
+            pass: 0.74,
+            fail: 0.45,
+            minimum_margin: 0.08,
+            context_pass: 0.90,
+            context_support: 0.80,
+            context_rescue_floor: 0.30,
+            descriptive_plain_relatedness: 0.62,
+            descriptive_source_relatedness: 0.65,
+            entailment_pass: 0.70,
+            contradiction_block: 0.08,
+            contradiction_fail: 0.50,
+        }
     }
 }
 
@@ -63,6 +100,14 @@ impl SemanticThresholds {
             pass: threshold_from_env("TANREN_SEMANTIC_PASS_THRESHOLD", defaults.pass),
             fail: threshold_from_env("TANREN_SEMANTIC_FAIL_THRESHOLD", defaults.fail),
             minimum_margin: threshold_from_env("TANREN_SEMANTIC_MINIMUM_MARGIN", defaults.minimum_margin),
+            context_pass: threshold_from_env("TANREN_SEMANTIC_CONTEXT_PASS_THRESHOLD", defaults.context_pass),
+            context_support: threshold_from_env("TANREN_SEMANTIC_CONTEXT_SUPPORT_THRESHOLD", defaults.context_support),
+            context_rescue_floor: threshold_from_env("TANREN_SEMANTIC_CONTEXT_RESCUE_FLOOR", defaults.context_rescue_floor),
+            descriptive_plain_relatedness: threshold_from_env("TANREN_SEMANTIC_DESCRIPTIVE_PLAIN_RELATEDNESS", defaults.descriptive_plain_relatedness),
+            descriptive_source_relatedness: threshold_from_env("TANREN_SEMANTIC_DESCRIPTIVE_SOURCE_RELATEDNESS", defaults.descriptive_source_relatedness),
+            entailment_pass: threshold_from_env("TANREN_SEMANTIC_ENTAILMENT_PASS", defaults.entailment_pass),
+            contradiction_block: threshold_from_env("TANREN_SEMANTIC_CONTRADICTION_BLOCK", defaults.contradiction_block),
+            contradiction_fail: threshold_from_env("TANREN_SEMANTIC_CONTRADICTION_FAIL", defaults.contradiction_fail),
         }
     }
 }
@@ -98,17 +143,32 @@ impl Hash for CacheKey {
 
 pub struct SemanticGrader {
     backend: Arc<dyn EmbeddingBackend>,
+    relation_backend: Arc<dyn SemanticRelationBackend>,
     db: Database,
     thresholds: SemanticThresholds,
     memory_cache: Mutex<HashMap<CacheKey, Vec<f32>>>,
 }
 
 impl SemanticGrader {
-    pub fn new(backend: Arc<dyn EmbeddingBackend>, db: Database, thresholds: SemanticThresholds) -> Self {
-        Self { backend, db, thresholds, memory_cache: Mutex::new(HashMap::new()) }
+    pub fn new(
+        backend: Arc<dyn EmbeddingBackend>,
+        relation_backend: Arc<dyn SemanticRelationBackend>,
+        db: Database,
+        thresholds: SemanticThresholds,
+    ) -> Self {
+        Self { backend, relation_backend, db, thresholds, memory_cache: Mutex::new(HashMap::new()) }
     }
 
-    pub fn status(&self) -> SemanticRuntimeStatus { self.backend.status() }
+    pub fn status(&self) -> SemanticRuntimeStatus {
+        let mut status = self.backend.status();
+        let relation = self.relation_backend.status();
+        if status.phase == "ready" && relation.phase != "ready" {
+            status.phase = relation.phase;
+            status.load_progress = relation.load_progress;
+            status.error = relation.error;
+        }
+        status
+    }
 
     pub fn grade_reading(&self, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String], answer_language: &str, expression_language: &str) -> GradeOutcome {
         if let Some(outcome) = grade_reading_deterministic(entry, answer, accepted, rejected) {
@@ -153,20 +213,63 @@ impl SemanticGrader {
         };
 
         let margin = best_negative.map(|negative| best_positive - negative).unwrap_or(f64::INFINITY);
-        if best_positive >= self.thresholds.pass && margin >= self.thresholds.minimum_margin {
-            GradeOutcome { decision: GradeDecision::Pass, method: "semantic_embedding", score: Some(best_positive) }
-        } else if let Ok(context_positive) = self.contextual_translation_score(entry, &normalized_answer, &positives, answer_language, expression_language) {
-            let context_pass = (self.thresholds.pass + CONTEXT_PASS_OFFSET).min(1.0);
-            if context_positive >= context_pass {
-                GradeOutcome { decision: GradeDecision::Pass, method: "semantic_context_embedding", score: Some(context_positive) }
-            } else if context_positive >= self.thresholds.pass {
-                GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_context_embedding", score: Some(context_positive) }
-            } else if best_negative.is_some_and(|negative| negative >= best_positive && negative >= self.thresholds.fail) {
-                GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_negative", score: Some(best_positive) }
-            } else if best_positive <= self.thresholds.fail {
-                GradeOutcome { decision: GradeDecision::Fail, method: "semantic_embedding", score: Some(best_positive) }
-            } else {
-                GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_embedding", score: Some(best_positive) }
+        let context_positive = self
+            .contextual_translation_score(entry, &normalized_answer, &positives, answer_language, expression_language)
+            .ok();
+        let direct_candidate = best_positive >= self.thresholds.pass && margin >= self.thresholds.minimum_margin;
+        let context_candidate = context_positive.is_some_and(|score| score >= self.thresholds.context_support);
+        let descriptive_relatedness = if best_positive <= self.thresholds.fail
+            && descriptive_length_ratio(&normalized_answer, &positives) >= 3.0
+        {
+            self.descriptive_relatedness_scores(entry, &normalized_answer, &positive_embeddings).ok()
+        } else {
+            None
+        };
+        let descriptive_candidate = descriptive_relatedness.is_some_and(|(plain, source)| {
+            plain >= self.thresholds.descriptive_plain_relatedness
+                && source >= self.thresholds.descriptive_source_relatedness
+        });
+
+        if direct_candidate || context_candidate || descriptive_candidate {
+            let relation = match self.best_relation(entry, &normalized_answer, &positives) {
+                Ok(value) => value,
+                Err(_) => {
+                    return GradeOutcome {
+                        decision: GradeDecision::Ambiguous,
+                        method: "semantic_verifier_unavailable",
+                        score: Some(best_positive),
+                    };
+                }
+            };
+            if relation.contradiction >= self.thresholds.contradiction_fail {
+                return GradeOutcome {
+                    decision: GradeDecision::Fail,
+                    method: "semantic_contradiction",
+                    score: Some(relation.contradiction),
+                };
+            }
+            let context_rescue = context_positive.is_some_and(|score| score >= self.thresholds.context_pass)
+                && best_positive >= self.thresholds.context_rescue_floor
+                && margin >= self.thresholds.minimum_margin
+                && relation.entailment >= self.thresholds.entailment_pass;
+            if (direct_candidate || context_rescue) && relation.contradiction < self.thresholds.contradiction_block {
+                return GradeOutcome {
+                    decision: GradeDecision::Pass,
+                    method: "semantic_consensus",
+                    score: Some(best_positive),
+                };
+            }
+        }
+
+        if best_negative.is_some_and(|negative| negative >= best_positive && negative >= self.thresholds.fail) {
+            GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_negative", score: Some(best_positive) }
+        } else if context_positive.is_some_and(|score| score >= self.thresholds.context_support) {
+            GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_context_embedding", score: context_positive }
+        } else if descriptive_candidate {
+            GradeOutcome {
+                decision: GradeDecision::Ambiguous,
+                method: "semantic_descriptive_related",
+                score: descriptive_relatedness.map(|(plain, source)| plain.min(source)),
             }
         } else if best_positive <= self.thresholds.fail {
             GradeOutcome { decision: GradeDecision::Fail, method: "semantic_embedding", score: Some(best_positive) }
@@ -184,6 +287,54 @@ impl SemanticGrader {
         let positive_embeddings = self.embeddings(&positive_requests)?;
         let best_positive = positive_embeddings.iter().map(|value| cosine(&answer_embedding, value)).fold(-1.0, f64::max);
         Ok(best_positive)
+    }
+
+    fn descriptive_relatedness_scores(&self, entry: &EntryRecord, answer: &str, positive_embeddings: &[Vec<f32>]) -> Result<(f64, f64), String> {
+        let source = normalize_generic(&entry.term);
+        if source.is_empty() {
+            return Err("semantic source term is empty".into());
+        }
+        let values = self.document_embeddings(&[source, answer.to_string()])?;
+        if values.len() != 2 {
+            return Err("semantic descriptive relatedness response count mismatch".into());
+        }
+        let source_relatedness = cosine(&values[0], &values[1]);
+        let plain_relatedness = positive_embeddings
+            .iter()
+            .map(|positive| cosine(&values[1], positive))
+            .fold(-1.0, f64::max);
+        Ok((plain_relatedness, source_relatedness))
+    }
+
+    fn best_relation(&self, entry: &EntryRecord, answer: &str, positives: &[String]) -> Result<RelationEvidence, String> {
+        let source = entry.term.trim();
+        if source.is_empty() {
+            return Err("semantic source term is empty".into());
+        }
+        let mut pairs = Vec::with_capacity(positives.len() * 2);
+        for positive in positives {
+            let positive = semantic_relation_text(source, positive);
+            let answer = semantic_relation_text(source, answer);
+            pairs.push((positive.clone(), answer.clone()));
+            pairs.push((answer, positive));
+        }
+        let evidence = self.relation_backend.relations(&pairs)?;
+        if evidence.len() != pairs.len() {
+            return Err("semantic relation response count mismatch".into());
+        }
+
+        evidence
+            .chunks_exact(2)
+            .map(|directions| RelationEvidence {
+                entailment: directions[0].entailment.max(directions[1].entailment),
+                contradiction: directions[0].contradiction.max(directions[1].contradiction),
+            })
+            .max_by(|left, right| {
+                let left_compatibility = left.entailment - left.contradiction;
+                let right_compatibility = right.entailment - right.contradiction;
+                left_compatibility.total_cmp(&right_compatibility)
+            })
+            .ok_or_else(|| "semantic relation has no positive reference".into())
     }
 
     fn grade_multiple_meanings(&self, entry: &EntryRecord, answer: &str) -> GradeOutcome {
@@ -223,9 +374,52 @@ impl SemanticGrader {
             .map(|answer_embedding| meaning_embeddings.iter().map(|meaning_embedding| cosine(answer_embedding, meaning_embedding)).collect())
             .collect();
 
-        if let Some(matching) = perfect_matching(&matrix, |score| score >= self.thresholds.pass) {
-            let score = matching_floor(&matrix, &matching);
-            return GradeOutcome { decision: GradeDecision::Pass, method: "semantic_multi_embedding", score: Some(score) };
+        if perfect_matching(&matrix, |score| score >= self.thresholds.pass).is_some() {
+            let source = entry.term.trim();
+            if source.is_empty() {
+                return GradeOutcome {
+                    decision: GradeDecision::Ambiguous,
+                    method: "semantic_verifier_unavailable",
+                    score: Some(best_row_floor(&matrix)),
+                };
+            }
+            let mut pairs = Vec::with_capacity(normalized_answers.len() * meanings.len() * 2);
+            for answer in &normalized_answers {
+                for meaning in &meanings {
+                    let meaning = semantic_relation_text(source, meaning);
+                    let answer = semantic_relation_text(source, answer);
+                    pairs.push((meaning.clone(), answer.clone()));
+                    pairs.push((answer, meaning));
+                }
+            }
+            let evidence = match self.relation_backend.relations(&pairs) {
+                Ok(values) if values.len() == pairs.len() => values,
+                _ => {
+                    return GradeOutcome {
+                        decision: GradeDecision::Ambiguous,
+                        method: "semantic_verifier_unavailable",
+                        score: Some(best_row_floor(&matrix)),
+                    };
+                }
+            };
+            let mut verified = vec![vec![0.0; meanings.len()]; normalized_answers.len()];
+            for (index, directions) in evidence.chunks_exact(2).enumerate() {
+                let row = index / meanings.len();
+                let column = index % meanings.len();
+                let contradiction = directions[0].contradiction.max(directions[1].contradiction);
+                if matrix[row][column] >= self.thresholds.pass && contradiction < self.thresholds.contradiction_block {
+                    verified[row][column] = 1.0;
+                }
+            }
+            if let Some(matching) = perfect_matching(&verified, |score| score > 0.5) {
+                let score = matching_floor(&matrix, &matching);
+                return GradeOutcome { decision: GradeDecision::Pass, method: "semantic_multi_consensus", score: Some(score) };
+            }
+            return GradeOutcome {
+                decision: GradeDecision::Ambiguous,
+                method: "semantic_multi_verifier",
+                score: Some(best_row_floor(&matrix)),
+            };
         }
         if let Some(matching) = perfect_matching(&matrix, |score| score > self.thresholds.fail) {
             let score = matching_floor(&matrix, &matching);
@@ -301,7 +495,26 @@ fn normalized_unique<'a>(values: impl Iterator<Item = &'a String>) -> Vec<String
     values.map(|value| normalize_generic(value)).filter(|value| !value.is_empty() && seen.insert(value.clone())).collect()
 }
 
+fn descriptive_length_ratio(answer: &str, positives: &[String]) -> f64 {
+    let answer_len = answer.chars().filter(|c| !c.is_whitespace()).count();
+    let Some(reference_len) = positives
+        .iter()
+        .map(|value| value.chars().filter(|c| !c.is_whitespace()).count())
+        .filter(|len| *len > 0)
+        .min()
+    else {
+        return 0.0;
+    };
+    answer_len as f64 / reference_len as f64
+}
+
 fn contains_hangul(value: &str) -> bool { value.chars().any(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c)) }
+
+fn semantic_relation_text(source: &str, meaning: &str) -> String {
+    let source = source.replace('"', "\\\"");
+    let meaning = meaning.replace('"', "\\\"");
+    format!("The translation of source expression \"{source}\" is \"{meaning}\".")
+}
 
 fn contextual_translation_text(entry: &EntryRecord, meaning: &str, answer_language: &str, expression_language: &str) -> Result<String, String> {
     let term = entry.term.trim();
@@ -377,10 +590,13 @@ fn best_row_floor(matrix: &[Vec<f64>]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{semantic_llama::LlamaCppEmbeddingBackend, semantic_nli::OnnxNliRelationBackend};
+    use std::{path::PathBuf, thread, time::{Duration, Instant}};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     struct FakeBackend { calls: AtomicUsize, unavailable: bool }
+    struct FakeRelationBackend { evidence: RelationEvidence, calls: AtomicUsize }
 
     impl EmbeddingBackend for FakeBackend {
         fn identity(&self) -> BackendIdentity { BackendIdentity { model_id: "fake".into(), model_version: "1".into(), dimension: 4 } }
@@ -388,7 +604,21 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.unavailable { return Err("offline".into()); }
             Ok(texts.iter().map(|text| {
-                if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 찬장") { vec![0.93, 0.3676, 0.0, 0.0] }
+                if text.contains("ja-JP 표현 セックス의 ko-KR 뜻: 자지를 보지에 박는다") { vec![0.0, 0.0, 0.0, 1.0] }
+                else if text == "ja-JP 표현 セックス의 ko-KR 뜻: 섹스" { vec![1.0, 0.0, 0.0, 0.0] }
+                else if text.starts_with(QUERY_INSTRUCTION) && text.ends_with("자지를 보지에 박는다") { vec![0.0, 0.0, 0.0, 1.0] }
+                else if text == "섹스" { vec![1.0, 0.0, 0.0, 0.0] }
+                else if text == "セックス" { vec![0.7, 0.7, 0.0, 0.0] }
+                else if text == "자지를 보지에 박는다" { vec![0.7, 0.7, 0.0, 0.0] }
+                else if text == "見据える" { vec![1.0, 0.0, 0.0, 0.0] }
+                else if text == "棚" { vec![0.0, 1.0, 0.0, 0.0] }
+                else if text.contains("ja-JP 표현 今日はいい天気ですね") && text.contains("오늘 날씨 좋네요") { vec![0.95, 0.3122, 0.0, 0.0] }
+                else if text.contains("ja-JP 표현 今日はいい天気ですね") && text.contains("오늘 날이 안좋네요") { vec![0.95, 0.3122, 0.0, 0.0] }
+                else if text.contains("ja-JP 표현 今日はいい天気ですね") && text.contains("오늘은 좋은 날씨네요") { vec![1.0, 0.0, 0.0, 0.0] }
+                else if text.ends_with("오늘 날씨 좋네요") { vec![0.66, 0.7513, 0.0, 0.0] }
+                else if text.ends_with("오늘 날이 안좋네요") { vec![0.66, 0.7513, 0.0, 0.0] }
+                else if text == "오늘은 좋은 날씨네요" { vec![1.0, 0.0, 0.0, 0.0] }
+                else if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 찬장") { vec![0.93, 0.3676, 0.0, 0.0] }
                 else if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 서랍장") { vec![0.91, 0.4146, 0.0, 0.0] }
                 else if text == "ja-JP 표현 棚(たな)의 ko-KR 뜻: 선반" { vec![1.0, 0.0, 0.0, 0.0] }
                 else if text.contains("ja-JP 표현 棚(たな)의 ko-KR 뜻: 냉장고") { vec![0.0, 0.0, 0.0, 1.0] }
@@ -404,6 +634,17 @@ mod tests {
             }).collect())
         }
         fn status(&self) -> SemanticRuntimeStatus { SemanticRuntimeStatus { phase: "ready".into(), download_progress: None, load_progress: Some(100), model_id: "fake".into(), model_version: "1".into(), dimension: 4, backend: "fake".into(), gpu_requested: false, load_time_ms: Some(0), last_embedding_ms: Some(0), error: None } }
+    }
+
+    impl SemanticRelationBackend for FakeRelationBackend {
+        fn relations(&self, pairs: &[(String, String)]) -> Result<Vec<RelationEvidence>, String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![self.evidence; pairs.len()])
+        }
+
+        fn status(&self) -> RelationRuntimeStatus {
+            RelationRuntimeStatus { phase: "ready".into(), load_progress: Some(100), error: None }
+        }
     }
 
     fn entry() -> EntryRecord { EntryRecord { id: "e".into(), term: "見据える".into(), meanings: vec!["내다보다".into()], reading: None } }
@@ -422,9 +663,31 @@ mod tests {
     }
 
     fn grader(backend: Arc<FakeBackend>) -> SemanticGrader {
+        grader_with_relation(
+            backend,
+            Arc::new(FakeRelationBackend {
+                evidence: RelationEvidence { entailment: 0.9, contradiction: 0.01 },
+                calls: AtomicUsize::new(0),
+            }),
+        )
+    }
+
+    fn grader_with_relation(backend: Arc<FakeBackend>, relation: Arc<FakeRelationBackend>) -> SemanticGrader {
+        grader_with_relation_thresholds(
+            backend,
+            relation,
+            SemanticThresholds { pass: 0.9, fail: 0.4, minimum_margin: 0.1, ..SemanticThresholds::default() },
+        )
+    }
+
+    fn grader_with_relation_thresholds(
+        backend: Arc<FakeBackend>,
+        relation: Arc<FakeRelationBackend>,
+        thresholds: SemanticThresholds,
+    ) -> SemanticGrader {
         let dir = tempdir().unwrap().keep();
         let db = Database::open(dir.join("semantic.db")).unwrap();
-        SemanticGrader::new(backend, db, SemanticThresholds { pass: 0.9, fail: 0.4, minimum_margin: 0.1 })
+        SemanticGrader::new(backend, relation, db, thresholds)
     }
 
     #[test]
@@ -456,17 +719,136 @@ mod tests {
     }
 
     #[test]
-    fn source_term_and_reading_context_can_directly_accept_valid_translation() {
+    fn source_term_and_reading_context_only_escalates_uncertain_translation() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend);
         let related = grader.grade_reading(&shelf_entry(), "찬장", &[], &["수납장".into()], "ko-KR", "ja-JP");
-        assert_eq!(related.decision, GradeDecision::Pass);
-        assert_eq!(related.method, "semantic_context_embedding");
+        assert_eq!(related.decision, GradeDecision::Ambiguous);
+        assert_eq!(related.method, "semantic_negative");
         let nearby = grader.grade_reading(&shelf_entry(), "서랍장", &[], &[], "ko-KR", "ja-JP");
         assert_eq!(nearby.decision, GradeDecision::Ambiguous);
         assert_eq!(nearby.method, "semantic_context_embedding");
         assert_eq!(grader.grade_reading(&shelf_entry(), "수납장", &[], &["수납장".into()], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
         assert_eq!(grader.grade_reading(&shelf_entry(), "냉장고", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
+    }
+
+    #[test]
+    fn independent_relation_verifier_rejects_high_similarity_contradiction() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let relation = Arc::new(FakeRelationBackend {
+            evidence: RelationEvidence { entailment: 0.01, contradiction: 0.99 },
+            calls: AtomicUsize::new(0),
+        });
+        let grader = grader_with_relation_thresholds(backend, relation.clone(), SemanticThresholds::default());
+        let weather = EntryRecord {
+            id: "weather".into(),
+            term: "今日はいい天気ですね".into(),
+            meanings: vec!["오늘은 좋은 날씨네요".into()],
+            reading: Some("きょーわいいてんきですね".into()),
+        };
+        let outcome = grader.grade_reading(&weather, "오늘 날이 안좋네요", &[], &[], "ko-KR", "ja-JP");
+        assert_eq!(outcome.decision, GradeDecision::Fail);
+        assert_eq!(outcome.method, "semantic_contradiction");
+        assert!(relation.calls.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn context_similarity_never_grants_pass_by_itself() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let relation = Arc::new(FakeRelationBackend {
+            evidence: RelationEvidence { entailment: 0.2, contradiction: 0.01 },
+            calls: AtomicUsize::new(0),
+        });
+        let grader = grader_with_relation_thresholds(backend, relation.clone(), SemanticThresholds::default());
+        let weather = EntryRecord {
+            id: "weather".into(),
+            term: "今日はいい天気ですね".into(),
+            meanings: vec!["오늘은 좋은 날씨네요".into()],
+            reading: Some("きょーわいいてんきですね".into()),
+        };
+        let outcome = grader.grade_reading(&weather, "오늘 날이 안좋네요", &[], &[], "ko-KR", "ja-JP");
+        assert_eq!(outcome.decision, GradeDecision::Ambiguous);
+        assert_eq!(outcome.method, "semantic_context_embedding");
+        assert!(relation.calls.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn context_with_independent_entailment_can_rescue_paraphrase() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let relation = Arc::new(FakeRelationBackend {
+            evidence: RelationEvidence { entailment: 0.9, contradiction: 0.01 },
+            calls: AtomicUsize::new(0),
+        });
+        let grader = grader_with_relation_thresholds(backend, relation.clone(), SemanticThresholds::default());
+        let weather = EntryRecord {
+            id: "weather".into(),
+            term: "今日はいい天気ですね".into(),
+            meanings: vec!["오늘은 좋은 날씨네요".into()],
+            reading: Some("きょーわいいてんきですね".into()),
+        };
+        let outcome = grader.grade_reading(&weather, "오늘 날씨 좋네요", &[], &[], "ko-KR", "ja-JP");
+        assert_eq!(outcome.decision, GradeDecision::Pass);
+        assert_eq!(outcome.method, "semantic_consensus");
+        assert!(relation.calls.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn descriptive_relatedness_keeps_elaborated_translation_ambiguous() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let relation = Arc::new(FakeRelationBackend {
+            evidence: RelationEvidence { entailment: 0.20, contradiction: 0.12 },
+            calls: AtomicUsize::new(0),
+        });
+        let grader = grader_with_relation_thresholds(backend, relation.clone(), SemanticThresholds::default());
+        let entry = EntryRecord {
+            id: "sex".into(),
+            term: "セックス".into(),
+            meanings: vec!["섹스".into()],
+            reading: None,
+        };
+        let outcome = grader.grade_reading(&entry, "자지를 보지에 박는다", &[], &[], "ko-KR", "ja-JP");
+        assert_eq!(outcome.decision, GradeDecision::Ambiguous);
+        assert_eq!(outcome.method, "semantic_descriptive_related");
+        assert!(relation.calls.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn installed_pipeline_keeps_descriptive_translation_ambiguous() {
+        let Ok(home) = std::env::var("TANREN_NLI_TEST_HOME") else { return; };
+        let home = PathBuf::from(home);
+        let embedding = LlamaCppEmbeddingBackend::install(home.clone());
+        let relation = OnnxNliRelationBackend::install(home);
+        let started = Instant::now();
+        loop {
+            let embedding_status = embedding.status();
+            let relation_status = relation.status();
+            if embedding_status.phase == "ready" && relation_status.phase == "ready" {
+                break;
+            }
+            if embedding_status.phase == "unavailable" {
+                panic!("semantic embedding backend failed to load: {:?}", embedding_status.error);
+            }
+            if relation_status.phase == "unavailable" {
+                panic!("semantic relation backend failed to load: {:?}", relation_status.error);
+            }
+            if started.elapsed() > Duration::from_secs(60) {
+                panic!("semantic runtime load timed out");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("semantic.db")).unwrap();
+        let grader = SemanticGrader::new(embedding, relation, db, SemanticThresholds::default());
+        let entry = EntryRecord {
+            id: "sex".into(),
+            term: "セックス".into(),
+            meanings: vec!["섹스".into()],
+            reading: None,
+        };
+        let outcome = grader.grade_reading(&entry, "자지를 보지에 박는다", &[], &[], "ko-KR", "ja-JP");
+        assert_eq!(outcome.decision, GradeDecision::Ambiguous);
+        assert_eq!(outcome.method, "semantic_descriptive_related");
     }
 
     #[test]
@@ -484,7 +866,21 @@ mod tests {
         let grader = grader(backend);
         let outcome = grader.grade_reading(&multi_entry(), "시간을 쓰다 / 매달다 / 전화하다", &[], &[], "ko-KR", "ja-JP");
         assert_eq!(outcome.decision, GradeDecision::Pass);
-        assert_eq!(outcome.method, "semantic_multi_embedding");
+        assert_eq!(outcome.method, "semantic_multi_consensus");
+    }
+
+    #[test]
+    fn multiple_meanings_require_relation_consensus() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let relation = Arc::new(FakeRelationBackend {
+            evidence: RelationEvidence { entailment: 0.01, contradiction: 0.99 },
+            calls: AtomicUsize::new(0),
+        });
+        let grader = grader_with_relation(backend, relation.clone());
+        let outcome = grader.grade_reading(&multi_entry(), "시간을 쓰다 / 매달다 / 전화하다", &[], &[], "ko-KR", "ja-JP");
+        assert_eq!(outcome.decision, GradeDecision::Ambiguous);
+        assert_eq!(outcome.method, "semantic_multi_verifier");
+        assert!(relation.calls.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
