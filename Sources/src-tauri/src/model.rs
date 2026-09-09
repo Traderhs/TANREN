@@ -164,6 +164,7 @@ pub struct StudyCard {
     pub audio_path: Option<String>,
     pub recall_timeout_ms: u64,
     pub completion_idle_ms: Option<u64>,
+    pub listening_meaning_completion_idle_ms: Option<u64>,
     pub input_warning: Option<String>,
 }
 
@@ -286,6 +287,10 @@ pub enum FailureType {
     RecallTimeout,
     CompletionTimeout,
     WrongAnswer,
+    ListeningFormWrong,
+    ListeningMeaningWrong,
+    ListeningBothWrong,
+    ListeningFormWrongMeaningUncertain,
     PitchWrong,
     GradingRejected,
 }
@@ -297,6 +302,10 @@ impl FailureType {
             Self::RecallTimeout => "RECALL_TIMEOUT",
             Self::CompletionTimeout => "COMPLETION_TIMEOUT",
             Self::WrongAnswer => "WRONG_ANSWER",
+            Self::ListeningFormWrong => "LISTENING_FORM_WRONG",
+            Self::ListeningMeaningWrong => "LISTENING_MEANING_WRONG",
+            Self::ListeningBothWrong => "LISTENING_BOTH_WRONG",
+            Self::ListeningFormWrongMeaningUncertain => "LISTENING_FORM_WRONG_MEANING_UNCERTAIN",
             Self::PitchWrong => "PITCH_WRONG",
             Self::GradingRejected => "GRADING_REJECTED",
         }

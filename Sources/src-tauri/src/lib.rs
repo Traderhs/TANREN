@@ -303,10 +303,14 @@ fn submit_answer(
     state: State<'_, AppState>,
     variant_id: String,
     answer: String,
+    meaning_answer: Option<String>,
     recall_latency_ms: u64,
     typing_duration_ms: u64,
     interkey_gaps_ms: Vec<u64>,
     ime_composition_ms: u64,
+    meaning_typing_duration_ms: u64,
+    meaning_interkey_gaps_ms: Vec<u64>,
+    meaning_ime_composition_ms: u64,
 ) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
@@ -316,43 +320,83 @@ fn submit_answer(
     let deck = state.db.deck(&session.deck_id)?;
     let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
     let range_label = session.range().label.clone();
+    let is_listening = matches!(variant.mode, StudyMode::Listening);
+    let meaning_answer = meaning_answer.unwrap_or_default();
+    let stored_answer = if is_listening {
+        listening_response_text(&answer, &meaning_answer)
+    } else {
+        answer.clone()
+    };
+    let attempt_typing_duration_ms = if is_listening {
+        typing_duration_ms.saturating_add(meaning_typing_duration_ms)
+    } else {
+        typing_duration_ms
+    };
 
     let answer_trimmed = answer.trim_matches(|c: char| c.is_whitespace() || c == '\u{3000}');
-    if answer_trimmed.is_empty() {
-        return fail_base(&state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms, "manual_unknown", FailureType::ManualUnknown, None);
+    let meaning_trimmed = meaning_answer.trim_matches(|c: char| c.is_whitespace() || c == '\u{3000}');
+    if answer_trimmed.is_empty() || (is_listening && meaning_trimmed.is_empty()) {
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "manual_unknown", FailureType::ManualUnknown, None);
     }
     if recall_latency_ms > deck.recall_timeout_by_mode.for_mode(variant.mode) {
-        return fail_base(&state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms, "recall_timeout", FailureType::RecallTimeout, None);
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "recall_timeout", FailureType::RecallTimeout, None);
     }
 
     let input_language = variant.mode.answer_language(&deck.source_language, &deck.target_language).to_string();
     let profile = state.db.typing_profile(&deck.id, &input_language, variant.mode)?;
     let max_gap = interkey_gaps_ms.iter().copied().max().unwrap_or(0);
     if profile.completion_timed_out(max_gap) {
-        return fail_base(&state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None);
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None);
+    }
+    if is_listening {
+        let meaning_profile = state.db.typing_profile(&deck.id, &deck.source_language, variant.mode)?;
+        let meaning_max_gap = meaning_interkey_gaps_ms.iter().copied().max().unwrap_or(0);
+        if meaning_profile.completion_timed_out(meaning_max_gap) {
+            return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None);
+        }
     }
 
     let (accepted, rejected) = state.db.aliases(&entry.id)?;
+    let mut answer_failure = FailureType::WrongAnswer;
     let outcome = match variant.mode {
         StudyMode::Reading => state.semantic.grade_reading(&entry, &answer, &accepted, &rejected, &deck.source_language, &deck.target_language),
-        StudyMode::Listening | StudyMode::Writing => {
+        StudyMode::Writing => {
             let orthographic_reading = state.db.japanese_orthographic_reading(&entry.id)?;
             grade_form_with_reading(&entry, &answer, deck.strict_orthography, orthographic_reading.as_deref())
+        }
+        StudyMode::Listening => {
+            let orthographic_reading = state.db.japanese_orthographic_reading(&entry.id)?;
+            let form = grade_form_with_reading(&entry, &answer, deck.strict_orthography, orthographic_reading.as_deref());
+            let meaning = state.semantic.grade_reading(
+                &entry,
+                &meaning_answer,
+                &accepted,
+                &rejected,
+                &deck.source_language,
+                &deck.target_language,
+            );
+            let (combined, failure) = combine_listening_outcomes(form, meaning);
+            answer_failure = failure;
+            combined
         }
     };
     match outcome.decision {
         GradeDecision::Fail => fail_base(
-            &state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms,
-            outcome.method, FailureType::WrongAnswer, outcome.score,
+            &state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms,
+            outcome.method, answer_failure, outcome.score,
         ),
         GradeDecision::Ambiguous => {
+            let pending_answer = if is_listening { stored_answer.clone() } else { answer.clone() };
             session.pending = Some(PendingState::Ambiguous {
                 variant,
-                answer,
+                answer: pending_answer,
                 recall_latency_ms,
                 typing_duration_ms,
                 interkey_gaps_ms,
                 ime_composition_ms,
+                meaning_typing_duration_ms,
+                meaning_interkey_gaps_ms,
+                meaning_ime_composition_ms,
                 method: outcome.method.into(),
                 score: outcome.score,
             });
@@ -368,11 +412,22 @@ fn submit_answer(
             })
         }
         GradeDecision::Pass => {
-            record_successful_typing(&state.db, &deck, &variant, &answer, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
+            if is_listening {
+                record_successful_typing_for_language(
+                    &state.db, &deck.id, &deck.target_language, variant.mode, &answer,
+                    &interkey_gaps_ms, typing_duration_ms, ime_composition_ms,
+                )?;
+                record_successful_typing_for_language(
+                    &state.db, &deck.id, &deck.source_language, variant.mode, &meaning_answer,
+                    &meaning_interkey_gaps_ms, meaning_typing_duration_ms, meaning_ime_composition_ms,
+                )?;
+            } else {
+                record_successful_typing(&state.db, &deck, &variant, &stored_answer, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
+            }
             let pitch = state.db.pitch_question(&entry.id, deck.pitch_policy == "include_predicted")?;
             state.db.insert_attempt(
-                &entry.id, &deck.id, variant.mode, session.stage, &range_label, &answer, true, None,
-                pitch.is_none(), outcome.method, outcome.score, recall_latency_ms, typing_duration_ms, None,
+                &entry.id, &deck.id, variant.mode, session.stage, &range_label, &stored_answer, true, None,
+                pitch.is_none(), outcome.method, outcome.score, recall_latency_ms, attempt_typing_duration_ms, None,
             )?;
             if let Some(question) = pitch {
                 session.pending = Some(PendingState::Pitch { variant, question: question.clone() });
@@ -399,6 +454,7 @@ fn timeout_current(
     variant_id: String,
     kind: String,
     answer: String,
+    meaning_answer: Option<String>,
     elapsed_ms: u64,
     typing_duration_ms: u64,
 ) -> Result<SubmitResult, String> {
@@ -414,7 +470,12 @@ fn timeout_current(
         _ => return Err("unknown timeout type".into()),
     };
     let method = if matches!(failure, FailureType::RecallTimeout) { "recall_timeout" } else { "completion_timeout" };
-    fail_base(&state.db, &mut engine, variant, &entry, answer, elapsed_ms, typing_duration_ms, method, failure, None)
+    let stored_answer = if matches!(variant.mode, StudyMode::Listening) {
+        listening_response_text(&answer, meaning_answer.as_deref().unwrap_or_default())
+    } else {
+        answer
+    };
+    fail_base(&state.db, &mut engine, variant, &entry, stored_answer, elapsed_ms, typing_duration_ms, method, failure, None)
 }
 
 #[tauri::command]
@@ -422,23 +483,63 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let pending = ambiguous_for_adjudication(&session.pending, &variant_id)?;
-    let PendingState::Ambiguous { variant, answer: pending_answer, recall_latency_ms, typing_duration_ms, interkey_gaps_ms, ime_composition_ms, method, score } = pending else {
+    let PendingState::Ambiguous {
+        variant,
+        answer: pending_answer,
+        recall_latency_ms,
+        typing_duration_ms,
+        interkey_gaps_ms,
+        ime_composition_ms,
+        meaning_typing_duration_ms,
+        meaning_interkey_gaps_ms,
+        meaning_ime_composition_ms,
+        method,
+        score,
+    } = pending else {
         unreachable!();
     };
-    let answer = pending_answer;
+    let stored_answer = pending_answer;
+    let is_listening = matches!(variant.mode, StudyMode::Listening);
+    let (form_answer, answer) = if is_listening {
+        let (form, meaning) = listening_response_parts(&stored_answer)?;
+        (Some(form.to_string()), meaning.to_string())
+    } else {
+        (None, stored_answer.clone())
+    };
+    let attempt_typing_duration_ms = if is_listening {
+        typing_duration_ms.saturating_add(meaning_typing_duration_ms)
+    } else {
+        typing_duration_ms
+    };
     let deck = state.db.deck(&session.deck_id)?;
     let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
     state.db.set_alias(&entry.id, &answer, accept)?;
     start_semantic_precompute(Arc::clone(&state.semantic), vec![answer.clone()]);
     if !accept {
-        return fail_base(&state.db, &mut engine, variant, &entry, answer, recall_latency_ms, typing_duration_ms, &method, FailureType::GradingRejected, score);
+        let failure = if is_listening {
+            FailureType::ListeningMeaningWrong
+        } else {
+            FailureType::GradingRejected
+        };
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, &method, failure, score);
     }
 
-    record_successful_typing(&state.db, &deck, &variant, &answer, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
+    if is_listening {
+        record_successful_typing_for_language(
+            &state.db, &deck.id, &deck.target_language, variant.mode, form_answer.as_deref().unwrap_or_default(),
+            &interkey_gaps_ms, typing_duration_ms, ime_composition_ms,
+        )?;
+        record_successful_typing_for_language(
+            &state.db, &deck.id, &deck.source_language, variant.mode, &answer,
+            &meaning_interkey_gaps_ms, meaning_typing_duration_ms, meaning_ime_composition_ms,
+        )?;
+    } else {
+        record_successful_typing(&state.db, &deck, &variant, &stored_answer, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
+    }
     let pitch = state.db.pitch_question(&entry.id, deck.pitch_policy == "include_predicted")?;
     state.db.insert_attempt(
-        &entry.id, &deck.id, variant.mode, session.stage, &session.range().label, &answer, true, None,
-        pitch.is_none(), "manual_adjudication_accept", score, recall_latency_ms, typing_duration_ms, None,
+        &entry.id, &deck.id, variant.mode, session.stage, &session.range().label, &stored_answer, true, None,
+        pitch.is_none(), "manual_adjudication_accept", score, recall_latency_ms, attempt_typing_duration_ms, None,
     )?;
     if let Some(question) = pitch {
         session.pending = Some(PendingState::Pitch { variant, question: question.clone() });
@@ -967,6 +1068,44 @@ fn fail_base(
     Ok(result)
 }
 
+fn listening_response_text(form_answer: &str, meaning_answer: &str) -> String {
+    format!("{form_answer}\n{meaning_answer}")
+}
+
+fn listening_response_parts(answer: &str) -> Result<(&str, &str), String> {
+    answer.split_once('\n').ok_or_else(|| "invalid listening response payload".into())
+}
+
+fn combine_listening_outcomes(
+    form: model::GradeOutcome,
+    meaning: model::GradeOutcome,
+) -> (model::GradeOutcome, FailureType) {
+    match (form.decision, meaning.decision) {
+        (GradeDecision::Pass, GradeDecision::Pass) => (
+            model::GradeOutcome { decision: GradeDecision::Pass, method: "listening_joint", score: meaning.score },
+            FailureType::WrongAnswer,
+        ),
+        (GradeDecision::Pass, GradeDecision::Ambiguous) => (meaning, FailureType::WrongAnswer),
+        (GradeDecision::Pass, GradeDecision::Fail) => (
+            model::GradeOutcome { decision: GradeDecision::Fail, method: "listening_meaning_wrong", score: meaning.score },
+            FailureType::ListeningMeaningWrong,
+        ),
+        (GradeDecision::Fail, GradeDecision::Pass) => (
+            model::GradeOutcome { decision: GradeDecision::Fail, method: "listening_form_wrong", score: form.score },
+            FailureType::ListeningFormWrong,
+        ),
+        (GradeDecision::Fail, GradeDecision::Fail) => (
+            model::GradeOutcome { decision: GradeDecision::Fail, method: "listening_both_wrong", score: meaning.score.or(form.score) },
+            FailureType::ListeningBothWrong,
+        ),
+        (GradeDecision::Fail, GradeDecision::Ambiguous) => (
+            model::GradeOutcome { decision: GradeDecision::Fail, method: "listening_form_wrong_meaning_uncertain", score: meaning.score.or(form.score) },
+            FailureType::ListeningFormWrongMeaningUncertain,
+        ),
+        (GradeDecision::Ambiguous, _) => unreachable!("form grading never returns ambiguous"),
+    }
+}
+
 fn review_result(entry: &EntryRecord, failure: Option<&str>, message: &str) -> SubmitResult {
     SubmitResult {
         status: SubmitStatus::Review,
@@ -1012,6 +1151,12 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
     };
     let answer_language = variant.mode.answer_language(&deck.source_language, &deck.target_language).to_string();
     let profile = state.db.typing_profile(&deck.id, &answer_language, variant.mode)?;
+    let listening_meaning_completion_idle_ms = if matches!(variant.mode, StudyMode::Listening) {
+        let meaning_profile = state.db.typing_profile(&deck.id, &deck.source_language, variant.mode)?;
+        deck.adaptive_completion_timer_enabled.then(|| meaning_profile.allowed_idle_ms()).flatten()
+    } else {
+        None
+    };
     let audio_path = state.db.next_audio_path(&entry.id)?;
     if matches!(variant.mode, StudyMode::Listening) && audio_path.is_none() {
         return Err("아직 음성이 준비되지 않았어요 잠시 후 다시 시도해주세요".into());
@@ -1030,6 +1175,7 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
         audio_path,
         recall_timeout_ms: deck.recall_timeout_by_mode.for_mode(variant.mode),
         completion_idle_ms: deck.adaptive_completion_timer_enabled.then(|| profile.allowed_idle_ms()).flatten(),
+        listening_meaning_completion_idle_ms,
         input_warning: None,
     })
 }
@@ -1119,9 +1265,22 @@ fn find_entry(db: &Database, deck_id: &str, entry_id: &str) -> Result<EntryRecor
 
 fn record_successful_typing(db: &Database, deck: &model::DeckRecord, variant: &VariantKey, answer: &str, gaps: &[u64], duration_ms: u64, ime_ms: u64) -> Result<(), String> {
     let language = variant.mode.answer_language(&deck.source_language, &deck.target_language);
-    let mut profile = db.typing_profile(&deck.id, language, variant.mode)?;
+    record_successful_typing_for_language(db, &deck.id, language, variant.mode, answer, gaps, duration_ms, ime_ms)
+}
+
+fn record_successful_typing_for_language(
+    db: &Database,
+    deck_id: &str,
+    language: &str,
+    mode: StudyMode,
+    answer: &str,
+    gaps: &[u64],
+    duration_ms: u64,
+    ime_ms: u64,
+) -> Result<(), String> {
+    let mut profile = db.typing_profile(deck_id, language, mode)?;
     profile.observe(gaps, duration_ms, ime_ms, answer.chars().filter(|c| !c.is_whitespace()).count());
-    db.update_typing_profile(&deck.id, language, variant.mode, &profile)
+    db.update_typing_profile(deck_id, language, mode, &profile)
 }
 
 fn validate_timeout_variant(current: &VariantKey, variant_id: &str) -> Result<(), String> {
@@ -1425,6 +1584,9 @@ mod state_tests {
             typing_duration_ms: 200,
             interkey_gaps_ms: vec![50],
             ime_composition_ms: 0,
+            meaning_typing_duration_ms: 0,
+            meaning_interkey_gaps_ms: Vec::new(),
+            meaning_ime_composition_ms: 0,
             method: "semantic".into(),
             score: Some(0.5),
         }
@@ -1453,6 +1615,32 @@ mod state_tests {
         let current = VariantKey { entry_id: "next".into(), mode: StudyMode::Listening };
         assert_eq!(validate_timeout_variant(&current, "previous:listening").unwrap_err(), "stale study card timeout");
         assert!(validate_timeout_variant(&current, "next:listening").is_ok());
+    }
+
+    #[test]
+    fn listening_response_keeps_form_and_meaning_separate() {
+        let stored = listening_response_text("きょうはいいてんきですね", "오늘은 좋은 날씨네요");
+        let (form, meaning) = listening_response_parts(&stored).unwrap();
+        assert_eq!(form, "きょうはいいてんきですね");
+        assert_eq!(meaning, "오늘은 좋은 날씨네요");
+    }
+
+    #[test]
+    fn listening_joint_feedback_keeps_form_and_meaning_results_separate() {
+        let pass = || model::GradeOutcome { decision: GradeDecision::Pass, method: "pass", score: Some(1.0) };
+        let fail = || model::GradeOutcome { decision: GradeDecision::Fail, method: "fail", score: Some(0.0) };
+
+        let (outcome, failure) = combine_listening_outcomes(fail(), pass());
+        assert_eq!(outcome.decision, GradeDecision::Fail);
+        assert_eq!(failure, FailureType::ListeningFormWrong);
+
+        let (outcome, failure) = combine_listening_outcomes(pass(), fail());
+        assert_eq!(outcome.decision, GradeDecision::Fail);
+        assert_eq!(failure, FailureType::ListeningMeaningWrong);
+
+        let (outcome, failure) = combine_listening_outcomes(fail(), fail());
+        assert_eq!(outcome.decision, GradeDecision::Fail);
+        assert_eq!(failure, FailureType::ListeningBothWrong);
     }
 
     #[test]

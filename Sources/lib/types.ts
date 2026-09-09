@@ -62,6 +62,7 @@ export interface StudyCard {
   audio_path?: string | null;
   recall_timeout_ms: number;
   completion_idle_ms?: number | null;
+  listening_meaning_completion_idle_ms?: number | null;
   input_warning?: string | null;
 }
 

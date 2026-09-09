@@ -112,6 +112,7 @@ export function BookStudy({
   const [result, setResult] = useState(initialResult);
   const [card, setCard] = useState(initialResult.card ?? null);
   const [answer, setAnswer] = useState("");
+  const [meaningAnswer, setMeaningAnswer] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [inputWarning, setInputWarning] = useState("");
@@ -121,6 +122,7 @@ export function BookStudy({
   const [listeningAudioFinished, setListeningAudioFinished] = useState(
     initialResult.card?.mode !== "listening" || !initialResult.card?.audio_path,
   );
+  const [listeningPhase, setListeningPhase] = useState<"form" | "meaning">("form");
   const [imeSegments, setImeSegments] = useState<JapaneseImeSegment[]>([]);
   const [imeReady, setImeReady] = useState(false);
   const [pitch, setPitch] = useState<PitchSelection>(emptyPitchSelection(initialResult.pitch?.morae.length ?? 0));
@@ -131,6 +133,7 @@ export function BookStudy({
 
   const ime = useRef<JapaneseImeSession | null>(null);
   const input = useRef<HTMLInputElement>(null);
+  const meaningInput = useRef<HTMLInputElement>(null);
   const audio = useRef<HTMLAudioElement>(null);
   const learningSurface = useRef<HTMLElement>(null);
   const transitionContent = useRef<HTMLDivElement>(null);
@@ -144,12 +147,21 @@ export function BookStudy({
   const imeCandidateList = useRef<HTMLDivElement>(null);
   const cardRef = useRef(card);
   const answerRef = useRef(answer);
+  const meaningAnswerRef = useRef(meaningAnswer);
+  const listeningPhaseRef = useRef<"form" | "meaning">("form");
+  const listeningFormTiming = useRef({
+    recallLatencyMs: 0,
+    typingDurationMs: 0,
+    interkeyGapsMs: [] as number[],
+    imeCompositionMs: 0,
+  });
   const selection = useRef({ start: 0, end: 0 });
   const lastTotal = useRef(initialResult.card?.total ?? 0);
   const lastStage = useRef(initialResult.card?.stage ?? deck.current_stage);
   const timeoutSent = useRef(false);
   const locked = useRef(false);
   const composing = useRef(false);
+  const meaningComposing = useRef(false);
   const listeningTimerStarted = useRef(
     initialResult.card?.mode !== "listening" || !initialResult.card?.audio_path,
   );
@@ -169,6 +181,7 @@ export function BookStudy({
 
   cardRef.current = card;
   answerRef.current = answer;
+  meaningAnswerRef.current = meaningAnswer;
 
   const active = activeCardTimerRuns(card, result);
   const complete = result.status === "stage_complete";
@@ -196,17 +209,23 @@ export function BookStudy({
   const displayRemaining = card ? Math.max(0, card.remaining - (resolvedPass ? 1 : 0)) : 0;
   const completedCount = complete ? total : card ? Math.max(0, total - displayRemaining) : 0;
   const progress = complete ? 100 : total > 0 ? Math.max(0, Math.min(100, completedCount / total * 100)) : 0;
+  const listeningMeaningPhase = card?.mode === "listening" && listeningPhase === "meaning";
+  const phaseAnswer = listeningMeaningPhase ? meaningAnswer : answer;
+  const phaseComposing = listeningMeaningPhase ? meaningComposing.current : composing.current;
+  const completionIdleMs = listeningMeaningPhase
+    ? card?.listening_meaning_completion_idle_ms
+    : card?.completion_idle_ms;
   const now = timing.current.start + elapsed;
   const recalling = timing.current.first === null;
   const recallLeft = Math.max(0, (card?.recall_timeout_ms ?? 0) - (recalling ? elapsed : timing.current.first! - timing.current.start));
-  const inputDelay = completionDelayMs(card?.completion_idle_ms, composing.current, answer, timing.current.compositionEnd, timing.current.last ?? now);
+  const inputDelay = completionDelayMs(completionIdleMs, phaseComposing, phaseAnswer, timing.current.compositionEnd, timing.current.last ?? now);
   const inputLeft = inputDelay === null ? null : Math.max(0, inputDelay - (now - (timing.current.last ?? now)));
   const inputElapsed = recalling ? 0 : Math.max(0, now - timing.current.first!);
-  const completionTimerEnabled = card?.completion_idle_ms != null;
+  const completionTimerEnabled = completionIdleMs != null;
   const inputClock = recalling
     ? "대기"
     : completionTimerEnabled
-      ? formatTimerSeconds(inputLeft ?? card?.completion_idle_ms ?? 0)
+      ? formatTimerSeconds(inputLeft ?? completionIdleMs ?? 0)
       : formatTimerSeconds(inputElapsed);
   const stageStudyTimeMs = stageStudyDuration.current + (studyActivityStartedAt.current == null
     ? 0
@@ -287,6 +306,17 @@ export function BookStudy({
     timeoutSent.current = false;
     setAnswer("");
     answerRef.current = "";
+    setMeaningAnswer("");
+    meaningAnswerRef.current = "";
+    meaningComposing.current = false;
+    listeningPhaseRef.current = "form";
+    setListeningPhase("form");
+    listeningFormTiming.current = {
+      recallLatencyMs: 0,
+      typingDurationMs: 0,
+      interkeyGapsMs: [],
+      imeCompositionMs: 0,
+    };
     setPlaying(false);
     const listeningReady = nextCard.mode !== "listening" || !nextCard.audio_path;
     listeningTimerStarted.current = listeningReady;
@@ -315,6 +345,14 @@ export function BookStudy({
     const currentCard = cardRef.current;
     if (!currentCard || currentCard.mode !== "listening" || listeningTimerStarted.current) return;
     listeningTimerStarted.current = true;
+    listeningPhaseRef.current = "form";
+    setListeningPhase("form");
+    listeningFormTiming.current = {
+      recallLatencyMs: 0,
+      typingDurationMs: 0,
+      interkeyGapsMs: [],
+      imeCompositionMs: 0,
+    };
     const currentNow = performance.now();
     timing.current = {
       start: currentNow,
@@ -418,6 +456,56 @@ export function BookStudy({
     }
     answerRef.current = value;
     setAnswer(value);
+  }
+
+  function handleMeaningInput(value: string) {
+    const currentNow = performance.now();
+    const currentTiming = timing.current;
+    currentTiming.first = firstMeaningfulInputAt(currentTiming.first, value, currentNow);
+    if (isMeaningfulInput(value) && !meaningComposing.current) {
+      const hadMeaningInput = isMeaningfulInput(meaningAnswerRef.current);
+      if (hadMeaningInput && currentTiming.last !== null) currentTiming.gaps.push(Math.round(currentNow - currentTiming.last));
+      currentTiming.last = currentNow;
+    }
+    meaningAnswerRef.current = value;
+    setMeaningAnswer(value);
+  }
+
+  function focusListeningMeaning() {
+    if (cardRef.current?.mode !== "listening" || listeningPhaseRef.current === "meaning") return;
+    const currentNow = performance.now();
+    const currentTiming = timing.current;
+    const activeCompositionMs = composing.current
+      ? Math.max(0, currentNow - currentTiming.compositionStart)
+      : 0;
+    listeningFormTiming.current = {
+      recallLatencyMs: Math.round((currentTiming.first ?? currentNow) - currentTiming.start),
+      typingDurationMs: currentTiming.first === null ? 0 : Math.round(currentNow - currentTiming.first),
+      interkeyGapsMs: [...currentTiming.gaps],
+      imeCompositionMs: Math.round(currentTiming.compositionMs + activeCompositionMs),
+    };
+    timing.current = {
+      start: currentNow,
+      first: null,
+      last: null,
+      gaps: [],
+      compositionStart: 0,
+      compositionMs: 0,
+      compositionEnd: null,
+    };
+    listeningPhaseRef.current = "meaning";
+    setListeningPhase("meaning");
+    setElapsed(0);
+    ime.current?.reset();
+    setImeSegments([]);
+    requestAnimationFrame(() => meaningInput.current?.focus());
+  }
+
+  function activeAnswerInput() {
+    if (cardRef.current?.mode === "listening" && listeningPhaseRef.current === "meaning") {
+      return meaningInput.current;
+    }
+    return input.current;
   }
 
   function insertText(text: string) {
@@ -526,28 +614,55 @@ export function BookStudy({
 
   useEffect(() => {
     if (!active || busy) return;
-    input.current?.focus();
-  }, [active, busy]);
+    activeAnswerInput()?.focus();
+  }, [active, busy, listeningPhase]);
 
   useEffect(() => {
     if (!active || busy) return;
-    const keepInputFocus = (event: MouseEvent) => {
-      if (event.button !== 0 || event.target === input.current) return;
-      event.preventDefault();
+    let restoreFrame = 0;
+    const restoreActiveInput = () => {
+      window.cancelAnimationFrame(restoreFrame);
+      restoreFrame = window.requestAnimationFrame(() => {
+        activeAnswerInput()?.focus({ preventScroll: true });
+      });
     };
-    const keepInputFocusFromPointer = (event: PointerEvent) => {
-      if (event.button !== 0 || event.target === input.current) return;
-      const target = event.target instanceof Element ? event.target : null;
-      if (target?.closest("button, input, textarea, select, a, [role='button'], [contenteditable='true']")) return;
+
+    const isImeCandidateTarget = (target: EventTarget | null) => (
+      target instanceof Element && Boolean(target.closest(".ime-candidate-list"))
+    );
+
+    const keepActiveInputFromPointer = (event: PointerEvent) => {
+      if (event.button !== 0 || event.target === activeAnswerInput() || isImeCandidateTarget(event.target)) return;
       event.preventDefault();
+      restoreActiveInput();
     };
-    window.addEventListener("pointerdown", keepInputFocusFromPointer, true);
-    document.addEventListener("mousedown", keepInputFocus, true);
+    const keepActiveInputFromMouse = (event: MouseEvent) => {
+      if (event.button !== 0 || event.target === activeAnswerInput() || isImeCandidateTarget(event.target)) return;
+      event.preventDefault();
+      restoreActiveInput();
+    };
+    const recoverActiveInputFocus = (event: FocusEvent) => {
+      if (event.target === activeAnswerInput() || isImeCandidateTarget(event.target)) return;
+      restoreActiveInput();
+    };
+    window.addEventListener("pointerdown", keepActiveInputFromPointer, true);
+    document.addEventListener("mousedown", keepActiveInputFromMouse, true);
+    document.addEventListener("focusin", recoverActiveInputFocus, true);
     return () => {
-      window.removeEventListener("pointerdown", keepInputFocusFromPointer, true);
-      document.removeEventListener("mousedown", keepInputFocus, true);
+      window.cancelAnimationFrame(restoreFrame);
+      window.removeEventListener("pointerdown", keepActiveInputFromPointer, true);
+      document.removeEventListener("mousedown", keepActiveInputFromMouse, true);
+      document.removeEventListener("focusin", recoverActiveInputFocus, true);
     };
-  }, [active, busy, card?.variant_id]);
+  }, [active, busy, card?.variant_id, listeningPhase]);
+
+  useEffect(() => {
+    const blockStudyTabNavigation = (event: KeyboardEvent) => {
+      if (event.key === "Tab") event.preventDefault();
+    };
+    window.addEventListener("keydown", blockStudyTabNavigation, true);
+    return () => window.removeEventListener("keydown", blockStudyTabNavigation, true);
+  }, []);
 
   useEffect(() => {
     if (!review || pitchQuestion || busy) return;
@@ -745,36 +860,72 @@ export function BookStudy({
       const currentNow = performance.now();
       const currentTiming = timing.current;
       setElapsed(currentNow - currentTiming.start);
-      const idle = completionDelayMs(card.completion_idle_ms, composing.current, answerRef.current, currentTiming.compositionEnd, currentTiming.last ?? currentNow);
+      const meaningPhase = card.mode === "listening" && listeningPhaseRef.current === "meaning";
+      const activityText = meaningPhase ? meaningAnswerRef.current : answerRef.current;
+      const activeComposing = meaningPhase ? meaningComposing.current : composing.current;
+      const activeCompletionIdleMs = meaningPhase ? card.listening_meaning_completion_idle_ms : card.completion_idle_ms;
+      const idle = completionDelayMs(activeCompletionIdleMs, activeComposing, activityText, currentTiming.compositionEnd, currentTiming.last ?? currentNow);
       const recall = currentTiming.first === null && currentNow - currentTiming.start >= card.recall_timeout_ms;
       const completion = currentTiming.last !== null && idle !== null && currentNow - currentTiming.last >= idle;
       if ((recall || completion) && !locked.current && !timeoutSent.current) {
         timeoutSent.current = true;
         setSubmittedAnswerKnown(true);
+        const currentTypingDuration = currentTiming.first === null ? 0 : Math.round(currentNow - currentTiming.first);
+        const formTiming = listeningFormTiming.current;
+        const storedRecallLatency = card.mode === "listening"
+          ? meaningPhase
+            ? formTiming.recallLatencyMs
+            : Math.round((currentTiming.first ?? currentNow) - currentTiming.start)
+          : Math.round(currentNow - currentTiming.start);
+        const storedTypingDuration = card.mode === "listening"
+          ? (meaningPhase ? formTiming.typingDurationMs : 0) + currentTypingDuration
+          : currentTiming.first === null ? 0 : Math.round(currentNow - currentTiming.first);
         void run(() => api.timeoutCurrent(
           card.variant_id,
           recall ? "recall" : "completion",
           answerRef.current,
-          Math.round(currentNow - currentTiming.start),
-          currentTiming.first === null ? 0 : Math.round(currentNow - currentTiming.first),
+          card.mode === "listening" ? meaningAnswerRef.current : null,
+          storedRecallLatency,
+          storedTypingDuration,
         ));
       }
     }, 100);
     return () => window.clearInterval(interval);
-  }, [active, card?.variant_id, card?.recall_timeout_ms, card?.completion_idle_ms, card?.mode, listeningAudioFinished, busy, error]);
+  }, [active, card?.variant_id, card?.recall_timeout_ms, card?.completion_idle_ms, card?.listening_meaning_completion_idle_ms, card?.mode, listeningAudioFinished, busy, error]);
 
   function submitAnswer() {
-    if (!card || !active || locked.current || composing.current || (japanese && !imeReady)) return;
+    if (!card || !active || locked.current || composing.current || meaningComposing.current || (japanese && !imeReady)) return;
+    if (card.mode === "listening" && listeningPhaseRef.current !== "meaning") {
+      focusListeningMeaning();
+      return;
+    }
     setSubmittedAnswerKnown(true);
     const currentTiming = timing.current;
     const currentNow = performance.now();
+    const formTiming = listeningFormTiming.current;
+    const isListening = card.mode === "listening";
+    const recallLatencyMs = isListening
+      ? formTiming.recallLatencyMs
+      : Math.round((currentTiming.first ?? currentNow) - currentTiming.start);
+    const typingDurationMs = isListening
+      ? formTiming.typingDurationMs
+      : Math.round(currentNow - (currentTiming.first ?? currentNow));
+    const interkeyGapsMs = isListening ? formTiming.interkeyGapsMs : currentTiming.gaps;
+    const imeCompositionMs = isListening ? formTiming.imeCompositionMs : Math.round(currentTiming.compositionMs);
+    const meaningTypingDurationMs = isListening
+      ? Math.round(currentNow - (currentTiming.first ?? currentNow))
+      : 0;
     void run(() => api.submitAnswer(
       card.variant_id,
       answerRef.current,
-      Math.round((currentTiming.first ?? currentNow) - currentTiming.start),
-      Math.round(currentNow - (currentTiming.first ?? currentNow)),
-      currentTiming.gaps,
-      Math.round(currentTiming.compositionMs),
+      isListening ? meaningAnswerRef.current : null,
+      recallLatencyMs,
+      typingDurationMs,
+      interkeyGapsMs,
+      imeCompositionMs,
+      meaningTypingDurationMs,
+      isListening ? currentTiming.gaps : [],
+      isListening ? Math.round(currentTiming.compositionMs) : 0,
     ));
   }
 
@@ -855,8 +1006,31 @@ export function BookStudy({
       ?? null
     : null;
   const submittedAnswerCorrect = !result.failure_type || result.failure_type === "PITCH_WRONG";
-  const submittedAnswerLabel = answer.trim();
+  const listeningFormCorrect = card?.mode === "listening"
+    ? !result.failure_type || result.failure_type === "PITCH_WRONG" || result.failure_type === "LISTENING_MEANING_WRONG"
+      ? true
+      : ["LISTENING_FORM_WRONG", "LISTENING_BOTH_WRONG", "LISTENING_FORM_WRONG_MEANING_UNCERTAIN"].includes(result.failure_type)
+        ? false
+        : false
+    : null;
+  const listeningMeaningCorrect = card?.mode === "listening"
+    ? !result.failure_type || result.failure_type === "PITCH_WRONG" || result.failure_type === "LISTENING_FORM_WRONG"
+      ? true
+      : ["LISTENING_MEANING_WRONG", "LISTENING_BOTH_WRONG"].includes(result.failure_type)
+        ? false
+        : result.failure_type === "LISTENING_FORM_WRONG_MEANING_UNCERTAIN"
+          ? null
+          : false
+    : null;
+  const submittedAnswerLabel = card?.mode === "listening"
+    ? ambiguous
+      ? meaningAnswer.trim()
+      : [answer.trim(), meaningAnswer.trim()].filter(Boolean).join("  ·  ")
+    : answer.trim();
   const reviewAnswer = card ? reviewAnswerForMode(card.mode, result.canonical_answer) : result.canonical_answer ?? "";
+  const listeningReviewMeaning = card?.mode === "listening"
+    ? reviewAnswerForMode("reading", result.canonical_answer)
+    : "";
   const reviewCue = card
     ? reviewAnswerForMode(card.mode === "reading" ? "writing" : "reading", result.canonical_answer)
     : "";
@@ -915,6 +1089,12 @@ export function BookStudy({
                 spellCheck={false}
                 lang={card?.answer_language}
                 placeholder={answerPlaceholder(card)}
+                onFocus={() => {
+                  if (card?.mode !== "listening" || japanese) return;
+                  void api.activateInputProfile(card.answer_language)
+                    .then((warning) => setInputWarning(warning ?? ""))
+                    .catch((cause) => setInputWarning(String(cause)));
+                }}
                 onSelect={(event) => {
                   if (!preedit) selection.current = {
                     start: event.currentTarget.selectionStart ?? 0,
@@ -951,11 +1131,13 @@ export function BookStudy({
                 }}
                 onKeyDown={(event) => {
                   if (japanese && active) {
+                    const listeningTab = card?.mode === "listening" && event.key === "Tab";
                     if (!imeReady) {
-                      if (event.key !== "Tab") event.preventDefault();
+                      if (event.key !== "Tab" || listeningTab) event.preventDefault();
                       return;
                     }
                     const tap = japaneseImeKeyTap(event.nativeEvent);
+                    const imeTap = listeningTab ? { ...tap, key: "Enter", code: "Enter" } : tap;
                     if (japaneseImeKeyStartsInput(tap)) {
                       const currentNow = performance.now();
                       const currentTiming = timing.current;
@@ -963,10 +1145,13 @@ export function BookStudy({
                       if (currentTiming.last !== null) currentTiming.gaps.push(Math.round(currentNow - currentTiming.last));
                       currentTiming.last = currentNow;
                     }
-                    const submitAfterYomiCommit = event.key === "Enter" && japaneseImeEnterCommitsYomi(imeSegments);
-                    if (ime.current?.feed(tap)) {
+                    const submitAfterYomiCommit = (event.key === "Enter" || listeningTab) && japaneseImeEnterCommitsYomi(imeSegments);
+                    if (ime.current?.feed(imeTap)) {
                       event.preventDefault();
-                      if (submitAfterYomiCommit) submitAnswer();
+                      if (submitAfterYomiCommit) {
+                        if (card?.mode === "listening") focusListeningMeaning();
+                        else submitAnswer();
+                      }
                       return;
                     }
                     if (!["Tab", "Enter"].includes(event.key) && !tap.ctrlKey && !tap.metaKey && !tap.altKey) {
@@ -976,17 +1161,22 @@ export function BookStudy({
                       return;
                     }
                   }
-                  if (event.key === "Enter") {
+                  if (event.key === "Enter" || (card?.mode === "listening" && event.key === "Tab")) {
                     if (event.nativeEvent.isComposing || composing.current || (!japanese && event.keyCode === 229)) {
                       event.preventDefault();
                       return;
                     }
                     event.preventDefault();
-                    submitAnswer();
+                    if (card?.mode === "listening") focusListeningMeaning();
+                    else submitAnswer();
                   }
                 }}
                 onKeyUp={(event) => {
-                  if (japanese && active && ime.current?.feedUp(japaneseImeKeyTap(event.nativeEvent))) event.preventDefault();
+                  if (japanese && active) {
+                    const tap = japaneseImeKeyTap(event.nativeEvent);
+                    const imeTap = card?.mode === "listening" && event.key === "Tab" ? { ...tap, key: "Enter", code: "Enter" } : tap;
+                    if (ime.current?.feedUp(imeTap)) event.preventDefault();
+                  }
                 }}
                 onChange={(event) => {
                   handleInput(event.target.value);
@@ -1010,6 +1200,47 @@ export function BookStudy({
                 ><span>{index < 9 ? index + 1 : ""}</span><strong>{candidate}</strong></button>)}
               </div>}
             </div>
+            {card?.mode === "listening" && <div className="learning-input-row learning-listening-meaning-row">
+              <input
+                ref={meaningInput}
+                value={meaningAnswer}
+                aria-label="뜻 답변"
+                disabled={busy || !listeningAudioFinished}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                lang={deck.source_language}
+                placeholder="뜻을 입력해주세요"
+                onFocus={() => {
+                  void api.activateInputProfile(deck.source_language)
+                    .then((warning) => setInputWarning(warning ?? ""))
+                    .catch((cause) => setInputWarning(String(cause)));
+                }}
+                onCompositionStart={() => {
+                  meaningComposing.current = true;
+                  timing.current.compositionStart = performance.now();
+                }}
+                onCompositionEnd={(event) => {
+                  meaningComposing.current = false;
+                  const currentNow = performance.now();
+                  timing.current.compositionMs += currentNow - timing.current.compositionStart;
+                  timing.current.compositionEnd = currentNow;
+                  timing.current.first = firstMeaningfulInputAt(timing.current.first, event.currentTarget.value, currentNow);
+                  timing.current.last = currentNow;
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter") return;
+                  if (event.nativeEvent.isComposing || meaningComposing.current || event.keyCode === 229) {
+                    event.preventDefault();
+                    return;
+                  }
+                  event.preventDefault();
+                  submitAnswer();
+                }}
+                onChange={(event) => handleMeaningInput(event.target.value)}
+              />
+            </div>}
             {japanese && !imeReady && <p className="learning-input-status">일본어 입력 준비 중…</p>}
             <div className="learning-timers" aria-label="학습 타이머">
               <div className={`learning-timer ${recalling ? "is-active" : ""}`} role="timer" aria-label="회상 남은 시간">
@@ -1091,13 +1322,25 @@ export function BookStudy({
 
         {review && !pitchQuestion && <div className={`learning-feedback learning-answer-review ${result.failure_type ? "needs-review" : "is-correct"}`} aria-live="polite">
           <div className="learning-review-cue">
-            <strong lang={card?.mode === "reading" ? deck.target_language : deck.source_language}>{reviewCue}</strong>
+            {card?.mode !== "listening" && <strong lang={card?.mode === "reading" ? deck.target_language : deck.source_language}>{reviewCue}</strong>}
             {card?.audio_path && <button className="learning-review-audio" aria-label="발음 듣기" title="발음 듣기" onClick={() => playAudio()}>▶</button>}
           </div>
           <div className={`learning-review-result-stack ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
             <div className={`learning-answer-comparison ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
-              <div className="learning-correct-answer"><span>정답</span><strong lang={card?.mode === "reading" ? deck.source_language : deck.target_language}>{reviewAnswer}</strong></div>
-              {submittedAnswerKnown && <div className={`learning-user-answer ${submittedAnswerCorrect ? "is-correct" : "is-incorrect"}`}><span>응답</span><strong>{submittedAnswerLabel}</strong></div>}
+              <div className="learning-correct-answer">
+                <span>정답</span>
+                {card?.mode === "listening" ? <>
+                  <strong lang={deck.target_language}>{reviewAnswer}</strong>
+                  <strong lang={deck.source_language}>{listeningReviewMeaning}</strong>
+                </> : <strong lang={card?.mode === "reading" ? deck.source_language : deck.target_language}>{reviewAnswer}</strong>}
+              </div>
+              {submittedAnswerKnown && <div className={`learning-user-answer ${card?.mode === "listening" ? "" : submittedAnswerCorrect ? "is-correct" : "is-incorrect"}`}>
+                <span>응답</span>
+                {card?.mode === "listening" ? <>
+                  <strong className={listeningFormCorrect ? "is-correct" : "is-incorrect"} lang={deck.target_language}>{answer.trim()}</strong>
+                  <strong className={listeningMeaningCorrect == null ? "" : listeningMeaningCorrect ? "is-correct" : "is-incorrect"} lang={deck.source_language}>{meaningAnswer.trim()}</strong>
+                </> : <strong>{submittedAnswerLabel}</strong>}
+              </div>}
             </div>
             {submittedPitch && submittedPitchQuestion && expectedPitch && <div className="learning-pitch-review">
               <div><PitchTrace
