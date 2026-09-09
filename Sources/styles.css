@@ -5491,7 +5491,7 @@ textarea:focus {
 .book-inline-entry-row {
   min-height: 34px;
   display: grid;
-  grid-template-columns: 40px minmax(74px,.82fr) minmax(66px,.72fr) minmax(104px,1.45fr) 54px 44px 36px;
+  grid-template-columns: 40px minmax(74px,.82fr) minmax(66px,.72fr) minmax(104px,1.45fr) 72px 44px 36px;
   align-items: center;
   gap: 7px;
   padding: 0 5px;
