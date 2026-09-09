@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import HTMLFlipBook from "react-pageflip";
-import { Canvas } from "@react-three/fiber";
+import { Canvas, useThree } from "@react-three/fiber";
 import { RoundedBox } from "@react-three/drei";
 import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api } from "./lib/api";
@@ -99,6 +99,35 @@ function formatStudyRangeLabel(label?: string | null, separator = " - ") {
   return `${start.toLocaleString("ko-KR")}${separator}${end.toLocaleString("ko-KR")}`;
 }
 
+function OpenBookCamera() {
+  const { camera, gl, scene, setSize, invalidate } = useThree();
+  useLayoutEffect(() => {
+    const stack = gl.domElement.closest(".open-book-stage")?.querySelector<HTMLElement>(".book-flip-stack");
+    if (!stack) return;
+    const surface = gl.domElement.closest<HTMLElement>(".book-3d-open");
+    if (!surface) return;
+    const fit = () => {
+      const bounds = surface.getBoundingClientRect();
+      const page = stack.getBoundingClientRect();
+      const scale = Math.min(1, page.width / OPEN_BOOK_TARGET_WIDTH);
+      // Scale the canvas's 4px center offset with the paper and spine.
+      surface.style.transform = scale < 1 ? `translateY(${-4 * (1 - scale)}px)` : "";
+      setSize(surface.clientWidth, surface.clientHeight, bounds.top, bounds.left);
+      camera.zoom = 156 * OPEN_BOOK_SCALE * scale;
+      camera.updateProjectionMatrix();
+      // ResizeObserver runs before paint; update the bitmap with the DOM in this frame.
+      gl.render(scene, camera);
+      invalidate();
+    };
+    const observer = new ResizeObserver(fit);
+    observer.observe(stack);
+    observer.observe(surface);
+    fit();
+    return () => observer.disconnect();
+  }, [camera, gl, scene, setSize, invalidate]);
+  return null;
+}
+
 function OpenBook3D({ openingStarted, onReady }: { openingStarted: boolean; onReady: () => void }) {
   return <div className="book-3d book-3d-open" aria-hidden="true">
     <Canvas
@@ -106,13 +135,14 @@ function OpenBook3D({ openingStarted, onReady }: { openingStarted: boolean; onRe
       camera={{ position: [0, 0.1, 10], zoom: 156 * OPEN_BOOK_SCALE }}
       dpr={[1, 1.5]}
       gl={{ alpha: true, antialias: true }}
-      resize={{ scroll: false }}
+      resize={{ scroll: false, offsetSize: true }}
       onCreated={() => {
         window.requestAnimationFrame(() => {
           window.requestAnimationFrame(onReady);
         });
       }}
     >
+      <OpenBookCamera />
       <ambientLight intensity={0.92} />
       <directionalLight position={[2.4, 5.8, 7.5]} intensity={1.55} />
       <directionalLight position={[-4, -1, 4]} intensity={0.38} />
@@ -175,6 +205,7 @@ function App() {
   const [initialRuntimeReady, setInitialRuntimeReady] = useState(false);
   const [audioSettings, setAudioSettings] = useState<AudioSettings>({ volume: 1, playback_rate: 1 });
   const homeScrollRef = useRef<HTMLDivElement>(null);
+  const homeSectionRef = useRef(0);
   const homeWheelLockRef = useRef(false);
   const homeShelfWheelAtRef = useRef(0);
   const homeShelfScrollTargetRef = useRef<number | null>(null);
@@ -226,6 +257,23 @@ function App() {
   };
 
   useEffect(() => void refresh(), []);
+  useLayoutEffect(() => {
+    const scroller = homeScrollRef.current;
+    if (view !== "decks" || !scroller) return;
+    homeSectionRef.current = 0;
+    let width = scroller.clientWidth;
+    let height = scroller.clientHeight;
+    const observer = new ResizeObserver(() => {
+      if (width === scroller.clientWidth && height === scroller.clientHeight) return;
+      width = scroller.clientWidth;
+      height = scroller.clientHeight;
+      const sections = scroller.querySelectorAll<HTMLElement>(".home-snap-section");
+      const section = sections[homeSectionRef.current];
+      if (section) scroller.scrollTo({ top: section.offsetTop, behavior: "instant" });
+    });
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [view]);
   useEffect(() => {
     let active = true;
     let unlisten: (() => void) | undefined;
@@ -470,7 +518,7 @@ function App() {
         bookRangeWheelAt = now;
       }
 
-      const statsScroller = target?.closest<HTMLElement>(".home-stats-section > .stats-dashboard");
+      const statsScroller = target?.closest<HTMLElement>(".home-stats-section > .stats-dashboard, .home-settings-section > .settings-dashboard");
       if (statsScroller && statsScroller.scrollHeight > statsScroller.clientHeight) {
         const deltaY = normalizeWheelDelta(event, statsScroller.clientHeight);
         const canScrollUp = deltaY < 0 && statsScroller.scrollTop > 2;
@@ -544,6 +592,7 @@ function App() {
       if (nextIndex === currentIndex) return;
 
       homeWheelLockRef.current = true;
+      homeSectionRef.current = nextIndex;
       scroller.scrollTo({ top: sections[nextIndex].offsetTop, behavior: "smooth" });
       unlockTimer = window.setTimeout(unlock, 420);
     };
@@ -576,6 +625,7 @@ function App() {
       const nextIndex = Math.max(0, Math.min(sections.length - 1, currentIndex + direction));
       if (nextIndex === currentIndex) return;
       event.preventDefault();
+      homeSectionRef.current = nextIndex;
       scroller.scrollTo({ top: sections[nextIndex].offsetTop, behavior: "smooth" });
     };
 
@@ -638,6 +688,7 @@ function App() {
     const sections = Array.from(scroller.querySelectorAll<HTMLElement>(".home-snap-section"));
     const target = sections[index];
     if (!target) return;
+    homeSectionRef.current = index;
     scroller.scrollTo({ top: target.offsetTop, behavior: "smooth" });
   };
 
@@ -1890,9 +1941,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             width={590}
             height={690}
             size="stretch"
-            minWidth={390}
+            minWidth={280}
             maxWidth={OPEN_BOOK_PAGE_MAX_WIDTH}
-            minHeight={500}
+            minHeight={300}
             maxHeight={OPEN_BOOK_PAGE_MAX_HEIGHT}
             startPage={reduceMotion || bookSettled ? BOOK_CONTENT_PAGE : 0}
             drawShadow={!reduceMotion}

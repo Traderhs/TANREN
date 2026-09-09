@@ -676,18 +676,21 @@ button.secondary {
 .book-flip-stack {
   position: relative;
   z-index: 1;
-  width: 100%;
+  width: min(calc(100% - 48px), calc((100vh - 96px) * 118 / 69));
   max-width: 1400px;
+  container-type: inline-size;
 }
 
 .book-paper-center-edge {
+  --paper-edge-scale: calc(100cqw / 1400px);
   position: absolute;
   z-index: 4;
   left: 50%;
   bottom: -5px;
   width: 46px;
   height: 5px;
-  transform: translateX(-50%);
+  transform: translateX(-50%) scaleX(var(--paper-edge-scale)) scaleY(calc(.4 + .6 * var(--paper-edge-scale)));
+  transform-origin: top center;
   pointer-events: none;
   border-radius: 0 0 3px 3px;
   background: linear-gradient(to bottom, #918873 0%, #837a66 38%, #726957 72%, #6b6250 100%);
@@ -4616,6 +4619,11 @@ textarea:focus {
   }
 }
 
+@media (max-width: 1280px) {
+  .stats-summary-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .home-stats-section>.stats-dashboard-global { display: block; }
+}
+
 @media (max-width: 1000px) {
   .stats-summary-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -4684,10 +4692,12 @@ textarea:focus {
 
 .home-settings-section>.settings-dashboard {
   width: min(1500px, calc(100% - 72px));
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   padding: 56px 28px 50px;
   box-sizing: border-box;
-  justify-content: center;
+  overflow-y: auto;
+  justify-content: safe center;
 }
 
 .settings-grid {
@@ -6612,3 +6622,66 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
   font-weight: 400;
 }
 .learning-answer:has(input[aria-label="내 답변"]) { margin-bottom: 24px; }
+
+/* Keep the desktop spread intact while fitting the available window. */
+@media (max-width: 1400px) {
+  .home-library-section>.home-content:not(.is-book-open) { padding-bottom: 48px; }
+  .home-library-section .home-create {
+    position: relative;
+    right: auto;
+    flex: 0 0 auto;
+    align-self: flex-end;
+    margin: 0 28px 20px 0;
+  }
+  .book-shelf { overflow-x: auto; }
+  .book-shelf-row {
+    width: max(100%, 1390px);
+    grid-template-columns: repeat(5, 250px);
+    justify-content: space-between;
+    gap: 18px;
+  }
+}
+
+@media (max-height: 900px) {
+  .home-library-section .book-shelf-row { min-height: min(414px, calc(100vh - 142px)); }
+  .book-shelf .deck-book {
+    width: min(250px, calc((100vh - 176px) * 250 / 368));
+    height: min(368px, calc(100vh - 176px));
+  }
+}
+
+@media (max-width: 820px) {
+  .open-book-stage {
+    min-height: 0;
+    justify-content: center;
+    overflow: hidden;
+  }
+}
+
+.home-library-section>.home-content { min-height: 0; }
+
+@container (max-width: 1200px) {
+  .book-page-inner,
+  .book-page-inner-right { padding: 20px; }
+  .book-inline-entry-row { min-width: 490px; }
+  .book-stage-middle.has-clear-times { grid-template-columns: 1fr; gap: 4px; }
+  .book-stage-clear-times { justify-content: center; }
+}
+
+@container (max-width: 900px) {
+  .book-page-inner,
+  .book-page-inner-right { padding: 14px; }
+  .book-title-page { margin-block: 16px 8px; padding: 0 calc(25% + 20px) 0 0; }
+  .book-title-page h2 {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .book-progress-summary { padding-left: 10px; }
+  .book-progress-rate strong { font-size: 26px; }
+  .home-shell .book-stage-card.ghost {
+    grid-template-columns: 58px minmax(0, 1fr) 16px;
+    gap: 6px;
+    padding-inline: 6px !important;
+  }
+}
