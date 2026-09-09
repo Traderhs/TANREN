@@ -1,5 +1,6 @@
 import { FormEvent, forwardRef, memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import HTMLFlipBook from "react-pageflip";
@@ -15,6 +16,64 @@ import type { SubmitResult } from "./lib/types";
 import type { AudioSettings, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
 
 type View = "decks" | "editor" | "settings";
+
+function AppTitleBar() {
+  const appWindow = getCurrentWindow();
+  const [isMaximized, setIsMaximized] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    const syncMaximized = async () => {
+      const maximized = await appWindow.isMaximized();
+      if (!disposed) setIsMaximized(maximized);
+    };
+
+    void syncMaximized();
+    void appWindow.onResized(() => void syncMaximized()).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [appWindow]);
+
+  const runWindowAction = (action: () => Promise<void>) => {
+    void action().catch(() => undefined);
+  };
+
+  return <header
+    className="app-titlebar"
+    data-tauri-drag-region
+    onDoubleClick={() => runWindowAction(() => appWindow.toggleMaximize())}
+  >
+    <div className="app-titlebar-name" data-tauri-drag-region>
+      <span className="app-titlebar-mark" data-tauri-drag-region>T</span>
+    </div>
+    <div className="app-titlebar-controls" onDoubleClick={(event) => event.stopPropagation()}>
+      <button type="button" className="app-titlebar-button" aria-label="최소화" title="최소화" onClick={() => runWindowAction(() => appWindow.minimize())}>
+        <svg className="app-titlebar-minimize" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M4 8h8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+        </svg>
+      </button>
+      <button type="button" className="app-titlebar-button" aria-label={isMaximized ? "복원" : "최대화"} title={isMaximized ? "복원" : "최대화"} onClick={() => runWindowAction(() => appWindow.toggleMaximize())}>
+        <svg className="app-titlebar-maximize" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          {isMaximized ? <>
+            <path d="M3 1H10.2Q11 1 11 1.8V9" />
+            <rect x="1" y="3" width="8" height="8" rx="0.8" ry="0.8" />
+          </> : <rect x="1.2" y="1.2" width="8.8" height="8.8" rx="1" ry="1" />}
+        </svg>
+      </button>
+      <button type="button" className="app-titlebar-button app-titlebar-close" aria-label="닫기" title="닫기" onClick={() => runWindowAction(() => appWindow.close())}>
+        <span className="app-titlebar-close-icon" aria-hidden="true" />
+      </button>
+    </div>
+  </header>;
+}
 
 const BOOK_FLUTTER_LEAF_COUNT = 8;
 const BOOK_CONTENT_PAGE = BOOK_FLUTTER_LEAF_COUNT + 1;
@@ -703,6 +762,8 @@ function App() {
   };
 
   return (
+    <>
+    <AppTitleBar />
     <main className={`app-shell ${view === "decks" ? "home-shell" : ""}`}>
       {view !== "decks" && <header className="topbar">
         <button className="brand" onClick={() => void openDecks()}>
@@ -794,6 +855,7 @@ function App() {
         </div>
       </div>}
     </main>
+    </>
   );
 }
 

@@ -20,6 +20,8 @@
   --scrollbar-size: 6px;
   --scrollbar-thumb: rgba(216, 173, 92, .38);
   --scrollbar-thumb-hover: rgba(216, 173, 92, .58);
+  --app-titlebar-height: 32px;
+  --app-viewport-height: calc(100vh - var(--app-titlebar-height));
 }
 
 * {
@@ -92,9 +94,127 @@ summary:focus-visible {
 }
 
 .app-shell {
-  min-height: 100vh;
+  min-height: var(--app-viewport-height);
   background: var(--bg);
 }
+
+.app-titlebar {
+  position: relative;
+  z-index: 10000;
+  width: 100%;
+  height: var(--app-titlebar-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 0 0 var(--app-titlebar-height);
+  padding-left: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, .07);
+  background: #090b0d;
+  color: #b7babd;
+  user-select: none;
+}
+
+.app-titlebar-name {
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .14em;
+}
+
+.app-titlebar-mark {
+  display: inline-block;
+  color: #d8ad5c;
+  margin-left: 8px;
+  font-size: 20px;
+  letter-spacing: 0;
+}
+
+.app-titlebar-controls {
+  height: 100%;
+  display: flex;
+  align-items: stretch;
+}
+
+.app-titlebar-button {
+  position: relative;
+  width: 46px;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 0 !important;
+  outline: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none !important;
+  color: #a8abad;
+  font-weight: 400;
+  transition: none;
+  transform: none;
+}
+
+.app-titlebar-button:focus,
+.app-titlebar-button:focus-visible {
+  border: 0 !important;
+  outline: 0;
+  box-shadow: none !important;
+}
+
+.app-titlebar-button:hover {
+  background: rgba(255, 255, 255, .10);
+  color: #dedfe0;
+  transform: none;
+}
+
+.app-titlebar-button:active {
+  background: rgba(255, 255, 255, .16);
+  color: #dedfe0;
+}
+
+.app-titlebar-close:hover {
+  background: rgba(216, 70, 82, 0.75);
+  color: #fff;
+}
+
+.app-titlebar-close:active {
+  background: rgba(210, 52, 65, 0.9);
+  color: #fff;
+}
+
+.app-titlebar-minimize {
+  width: 16px;
+  height: 16px;
+}
+
+.app-titlebar-maximize {
+  width: 12px;
+  height: 12px;
+  shape-rendering: geometricPrecision;
+}
+
+.app-titlebar-close-icon {
+  position: relative;
+  width: 10px;
+  height: 10px;
+}
+
+.app-titlebar-close-icon::before,
+.app-titlebar-close-icon::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: 0;
+  width: 10px;
+  height: 1px;
+  background: currentColor;
+}
+
+.app-titlebar-close-icon::before { transform: rotate(45deg); }
+.app-titlebar-close-icon::after { transform: rotate(-45deg); }
 
 .topbar {
   height: 64px;
@@ -141,7 +261,7 @@ summary:focus-visible {
   gap: 8px;
 }
 
-button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button) {
+button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):not(.app-titlebar-button) {
   min-height: 42px;
   padding: 0 16px;
   border: 1px solid #e4e5e6;
@@ -152,7 +272,7 @@ button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-boo
   transition: transform .14s ease, background .14s ease, border-color .14s ease;
 }
 
-button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):hover {
+button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):not(.app-titlebar-button):hover {
   transform: translateY(-1px);
   background: #fff;
 }
@@ -226,7 +346,7 @@ button.secondary {
   --home-faint: #565f69;
   --home-brand: #d6b16a;
   --home-brand-strong: #e4c17d;
-  min-height: 100vh;
+  min-height: var(--app-viewport-height);
   background: var(--home-bg);
   color: var(--home-text);
 }
@@ -271,7 +391,7 @@ button.secondary {
 
 .home-content.is-book-open {
   width: min(1240px, calc(100% - 64px));
-  height: calc(100vh - 60px);
+  height: calc(var(--app-viewport-height) - 60px);
   padding: 0;
   display: flex;
   align-items: center;
@@ -676,7 +796,7 @@ button.secondary {
 .book-flip-stack {
   position: relative;
   z-index: 1;
-  width: min(calc(100% - 48px), calc((100vh - 96px) * 118 / 69));
+  width: min(calc(100% - 48px), calc((var(--app-viewport-height) - 96px) * 118 / 69));
   max-width: 1400px;
   container-type: inline-size;
 }
@@ -1929,7 +2049,7 @@ code {
   .home-content.is-book-open {
     width: min(100% - 24px, 760px);
     height: auto;
-    min-height: calc(100vh - 60px);
+    min-height: calc(var(--app-viewport-height) - 60px);
     padding: 20px 0;
   }
 
@@ -2096,7 +2216,7 @@ body::before {
 }
 
 .app-shell {
-  min-height: 100vh;
+  min-height: var(--app-viewport-height);
   padding: 14px;
   background: transparent;
 }
@@ -2165,7 +2285,7 @@ body::before {
   color: #f3f0e9;
 }
 
-button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button) {
+button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):not(.app-titlebar-button) {
   min-height: 34px;
   padding: 0 11px;
   border: 1px solid rgba(255, 255, 255, .12);
@@ -2179,14 +2299,14 @@ button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-boo
   transition: border-color .08s ease, color .08s ease, background-color .08s ease;
 }
 
-button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):hover {
+button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):not(.app-titlebar-button):hover {
   transform: none;
   border-color: rgba(255, 255, 255, .24);
   background: rgba(255, 255, 255, .025);
   color: #eceae4;
 }
 
-button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):not(:disabled):active {
+button:not(.brand):not(.ghost):not(.deck-primary):not(.range-card):not(.deck-book):not(.book-range):not(.mora-toggle):not(.pitch-submit):not(.compact-button):not(.app-titlebar-button):not(:disabled):active {
   border-color: rgba(238, 207, 143, .36);
   background: rgba(216, 173, 92, .10);
   color: #e6c983;
@@ -2291,7 +2411,7 @@ textarea:focus {
 
 .home-content.is-book-open {
   width: min(1380px, calc(100% - 12px));
-  height: calc(100vh - 104px);
+  height: calc(var(--app-viewport-height) - 104px);
   margin-top: 14px;
   padding: 0 28px;
 }
@@ -2743,7 +2863,7 @@ textarea:focus {
   }
 
   .home-content.is-book-open {
-    min-height: calc(100vh - 86px);
+    min-height: calc(var(--app-viewport-height) - 86px);
     padding: 14px;
   }
 
@@ -2760,7 +2880,7 @@ textarea:focus {
   }
 
   .study {
-    height: calc(100vh - 16px);
+    height: calc(var(--app-viewport-height) - 16px);
     border-radius: 18px;
   }
 
@@ -2789,7 +2909,7 @@ textarea:focus {
 
 .library-frame {
   width: min(1380px, calc(100% - 64px));
-  height: min(790px, calc(100vh - 56px));
+  height: min(790px, calc(var(--app-viewport-height) - 56px));
   min-height: 620px;
   margin: 28px auto;
   display: grid;
@@ -3131,7 +3251,7 @@ textarea:focus {
 @media (max-width: 920px) {
   .library-frame {
     width: calc(100% - 24px);
-    height: calc(100vh - 24px);
+    height: calc(var(--app-viewport-height) - 24px);
     min-height: 560px;
     margin: 12px auto;
     grid-template-columns: 88px minmax(0, 1fr);
@@ -3174,7 +3294,7 @@ textarea:focus {
 /* -------------------------------------------------------------------------- */
 
 .home-shell {
-  min-height: 100vh;
+  min-height: var(--app-viewport-height);
   padding: 0;
   background:
     radial-gradient(900px 640px at 6% 2%, rgba(210, 211, 208, .23), transparent 58%),
@@ -3196,7 +3316,7 @@ textarea:focus {
 
 .library-frame {
   width: 100%;
-  height: 100vh;
+  height: var(--app-viewport-height);
   min-height: 610px;
   margin: 0;
   display: grid;
@@ -3779,7 +3899,7 @@ textarea:focus {
 @media (max-width: 920px) {
   .library-frame {
     width: 100%;
-    height: 100vh;
+    height: var(--app-viewport-height);
     min-height: 560px;
     margin: 0;
     grid-template-columns: 84px minmax(0, 1fr);
@@ -3824,7 +3944,7 @@ textarea:focus {
 .library-frame.home-scroll {
   display: block;
   width: 100%;
-  height: 100vh;
+  height: var(--app-viewport-height);
   min-height: 0;
   overflow-x: hidden;
   overflow-y: hidden;
@@ -3836,7 +3956,7 @@ textarea:focus {
 
 .home-snap-section {
   width: 100%;
-  min-height: 100vh;
+  min-height: var(--app-viewport-height);
   position: relative;
   display: flex;
   align-items: stretch;
@@ -3909,7 +4029,7 @@ textarea:focus {
 
 .home-library-section>.home-content {
   width: 100%;
-  height: 100vh;
+  height: var(--app-viewport-height);
   min-height: 610px;
   margin: 0;
   padding: 38px 30px 30px 46px;
@@ -3928,7 +4048,7 @@ textarea:focus {
 .home-stats-section>.content,
 .home-settings-section>.content {
   width: min(1180px, calc(100% - 96px));
-  min-height: 100vh;
+  min-height: var(--app-viewport-height);
   margin: 0 auto;
   padding: 72px 0 60px;
   display: flex;
@@ -3942,7 +4062,7 @@ textarea:focus {
 
 .home-empty-section {
   width: min(1180px, calc(100% - 96px));
-  min-height: 100vh;
+  min-height: var(--app-viewport-height);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -3979,11 +4099,11 @@ textarea:focus {
 
 @media (max-width: 920px) {
   .library-frame.home-scroll {
-    height: 100vh;
+    height: var(--app-viewport-height);
   }
 
   .home-library-section>.home-content {
-    height: 100vh;
+    height: var(--app-viewport-height);
     min-height: 560px;
     padding: 22px 18px 20px;
   }
@@ -4156,7 +4276,7 @@ textarea:focus {
 
 .home-stats-section>.stats-dashboard {
   width: min(1500px, calc(100% - 72px));
-  height: 100vh;
+  height: var(--app-viewport-height);
   min-height: 0;
   margin: 0 auto;
   padding: 56px 28px 50px;
@@ -4692,7 +4812,7 @@ textarea:focus {
 
 .home-settings-section>.settings-dashboard {
   width: min(1500px, calc(100% - 72px));
-  height: 100vh;
+  height: var(--app-viewport-height);
   min-height: 0;
   padding: 56px 28px 50px;
   box-sizing: border-box;
@@ -6643,10 +6763,10 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
 }
 
 @media (max-height: 900px) {
-  .home-library-section .book-shelf-row { min-height: min(414px, calc(100vh - 142px)); }
+  .home-library-section .book-shelf-row { min-height: min(414px, calc(var(--app-viewport-height) - 142px)); }
   .book-shelf .deck-book {
-    width: min(250px, calc((100vh - 176px) * 250 / 368));
-    height: min(368px, calc(100vh - 176px));
+    width: min(250px, calc((var(--app-viewport-height) - 176px) * 250 / 368));
+    height: min(368px, calc(var(--app-viewport-height) - 176px));
   }
 }
 
