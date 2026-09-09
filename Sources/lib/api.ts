@@ -31,15 +31,20 @@ export const api = {
   submitAnswer: (
     variantId: string,
     answer: string,
+    meaningAnswer: string | null,
     recallLatencyMs: number,
     typingDurationMs: number,
     interkeyGapsMs: number[],
     imeCompositionMs: number,
+    meaningTypingDurationMs: number,
+    meaningInterkeyGapsMs: number[],
+    meaningImeCompositionMs: number,
   ) => invoke<SubmitResult>("submit_answer", {
-    variantId, answer, recallLatencyMs, typingDurationMs, interkeyGapsMs, imeCompositionMs,
+    variantId, answer, meaningAnswer, recallLatencyMs, typingDurationMs, interkeyGapsMs, imeCompositionMs,
+    meaningTypingDurationMs, meaningInterkeyGapsMs, meaningImeCompositionMs,
   }),
-  timeoutCurrent: (variantId: string, kind: "recall" | "completion", answer: string, elapsedMs: number, typingDurationMs: number) =>
-    invoke<SubmitResult>("timeout_current", { variantId, kind, answer, elapsedMs, typingDurationMs }),
+  timeoutCurrent: (variantId: string, kind: "recall" | "completion", answer: string, meaningAnswer: string | null, elapsedMs: number, typingDurationMs: number) =>
+    invoke<SubmitResult>("timeout_current", { variantId, kind, answer, meaningAnswer, elapsedMs, typingDurationMs }),
   submitPitch: (variantId: string, patterns: number[]) =>
     invoke<SubmitResult>("submit_pitch", { variantId, patterns }),
   continueReview: () => invoke<SubmitResult>("continue_review"),

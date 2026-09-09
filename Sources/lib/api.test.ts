@@ -16,9 +16,19 @@ describe("study command payloads", () => {
 
   it("binds timeout requests to the card variant that created the timer", async () => {
     invoke.mockResolvedValue({ status: "review" });
-    await api.timeoutCurrent("entry:listening", "completion", "答", 4200, 1200);
+    await api.timeoutCurrent("entry:listening", "completion", "答", "뜻", 4200, 1200);
     expect(invoke).toHaveBeenCalledWith("timeout_current", {
-      variantId: "entry:listening", kind: "completion", answer: "答", elapsedMs: 4200, typingDurationMs: 1200,
+      variantId: "entry:listening", kind: "completion", answer: "答", meaningAnswer: "뜻", elapsedMs: 4200, typingDurationMs: 1200,
+    });
+  });
+
+  it("submits listening form and meaning together", async () => {
+    invoke.mockResolvedValue({ status: "review" });
+    await api.submitAnswer("entry:listening", "答", "뜻", 800, 1200, [120, 90], 200, 900, [140, 110], 150);
+    expect(invoke).toHaveBeenCalledWith("submit_answer", {
+      variantId: "entry:listening", answer: "答", meaningAnswer: "뜻", recallLatencyMs: 800,
+      typingDurationMs: 1200, interkeyGapsMs: [120, 90], imeCompositionMs: 200,
+      meaningTypingDurationMs: 900, meaningInterkeyGapsMs: [140, 110], meaningImeCompositionMs: 150,
     });
   });
 

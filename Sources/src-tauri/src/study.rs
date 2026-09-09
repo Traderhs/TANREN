@@ -17,6 +17,12 @@ pub enum PendingState {
         typing_duration_ms: u64,
         interkey_gaps_ms: Vec<u64>,
         ime_composition_ms: u64,
+        #[serde(default)]
+        meaning_typing_duration_ms: u64,
+        #[serde(default)]
+        meaning_interkey_gaps_ms: Vec<u64>,
+        #[serde(default)]
+        meaning_ime_composition_ms: u64,
         method: String,
         score: Option<f64>,
     },
@@ -602,6 +608,7 @@ mod tests {
         active.pending = Some(PendingState::Ambiguous {
             variant: variant.clone(), answer: "pending".into(), recall_latency_ms: 10,
             typing_duration_ms: 20, interkey_gaps_ms: vec![5], ime_composition_ms: 0,
+            meaning_typing_duration_ms: 0, meaning_interkey_gaps_ms: Vec::new(), meaning_ime_composition_ms: 0,
             method: "semantic".into(), score: Some(0.5),
         });
         let resumed: StudySession = serde_json::from_str(&serde_json::to_string(&active).unwrap()).unwrap();

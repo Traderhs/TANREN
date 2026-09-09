@@ -6551,6 +6551,8 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
 .learning-answer-review .learning-user-answer>strong { max-width: 100%; font-size: 26px; overflow-wrap: anywhere; }
 .learning-answer-review .learning-user-answer.is-correct>strong { color: #84c79b; }
 .learning-answer-review .learning-user-answer.is-incorrect>strong { color: #d98787; }
+.learning-answer-review .learning-user-answer>strong.is-correct { color: #84c79b; }
+.learning-answer-review .learning-user-answer>strong.is-incorrect { color: #d98787; }
 .learning-answer-review .learning-correct-answer>strong { max-width: 100%; font-size: 26px; overflow-wrap: anywhere; }
 .learning-adjudication .learning-feedback-actions {
   width: auto;
@@ -6680,6 +6682,7 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
 .book-learning .learning-input-row:hover input { background: transparent !important; }
 .book-learning .learning-input-row input:focus { box-shadow: none; }
 .book-learning .learning-input-row input::placeholder { font-size: 16px; color: #7f8779; }
+.book-learning .learning-listening-meaning-row { margin-top: 10px; }
 
 .ime-candidate-list {
   position: absolute;
