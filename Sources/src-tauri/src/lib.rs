@@ -58,6 +58,7 @@ struct AppState {
 const SEMANTIC_STORAGE_SETTING: &str = "semantic_storage_dir";
 const AUDIO_VOLUME_SETTING: &str = "audio_volume";
 const AUDIO_PLAYBACK_RATE_SETTING: &str = "audio_playback_rate";
+const EFFECT_VOLUME_SETTING: &str = "effect_volume";
 
 #[derive(Serialize)]
 struct StorageSettings {
@@ -71,6 +72,7 @@ struct StorageSettings {
 struct AudioSettings {
     volume: f64,
     playback_rate: f64,
+    effect_volume: f64,
 }
 
 #[derive(Serialize)]
@@ -869,11 +871,13 @@ fn audio_settings(state: State<'_, AppState>) -> Result<AudioSettings, String> {
 }
 
 #[tauri::command]
-fn set_audio_settings(state: State<'_, AppState>, volume: f64, playback_rate: f64) -> Result<AudioSettings, String> {
+fn set_audio_settings(state: State<'_, AppState>, volume: f64, playback_rate: f64, effect_volume: f64) -> Result<AudioSettings, String> {
     let volume = volume.clamp(0.0, 1.0);
     let playback_rate = playback_rate.clamp(0.5, 2.0);
+    let effect_volume = effect_volume.clamp(0.0, 1.0);
     state.db.set_setting(AUDIO_VOLUME_SETTING, Some(&volume.to_string()))?;
     state.db.set_setting(AUDIO_PLAYBACK_RATE_SETTING, Some(&playback_rate.to_string()))?;
+    state.db.set_setting(EFFECT_VOLUME_SETTING, Some(&effect_volume.to_string()))?;
     audio_settings_snapshot(&state)
 }
 
@@ -1234,7 +1238,9 @@ fn audio_settings_snapshot(state: &AppState) -> Result<AudioSettings, String> {
         .and_then(|value| value.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.0, 1.0);
     let playback_rate = state.db.setting(AUDIO_PLAYBACK_RATE_SETTING)?
         .and_then(|value| value.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.5, 2.0);
-    Ok(AudioSettings { volume, playback_rate })
+    let effect_volume = state.db.setting(EFFECT_VOLUME_SETTING)?
+        .and_then(|value| value.parse::<f64>().ok()).unwrap_or(1.0).clamp(0.0, 1.0);
+    Ok(AudioSettings { volume, playback_rate, effect_volume })
 }
 
 fn pick_backup_file(save: bool) -> Result<Option<PathBuf>, String> {

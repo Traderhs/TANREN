@@ -15,6 +15,7 @@ import {
 import { completionDelayMs, firstMeaningfulInputAt, isMeaningfulInput } from "./lib/studyTimers";
 import { japaneseImeEnterCommitsYomi, japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { JapaneseImeSegment, JapaneseImeSession } from "./lib/japaneseIme";
+import { playEffectSound } from "./lib/soundEffects";
 import type { AudioSettings, DeckSummary, PitchQuestion, StudyCard, SubmitResult } from "./lib/types";
 
 function answerPlaceholder(card: StudyCard | null) {
@@ -334,7 +335,7 @@ export function BookStudy({
     return () => cancelAnimationFrame(frame);
   }, [active, busy, card?.variant_id, card?.mode, listeningAudioFinished]);
 
-  async function run(action: () => Promise<SubmitResult | void>) {
+  async function run(action: () => Promise<SubmitResult | void>, reviewCorrectOverride?: boolean) {
     if (locked.current) return;
     locked.current = true;
     setBusy(true);
@@ -342,6 +343,13 @@ export function BookStudy({
     try {
       const next = await action();
       if (!next) return;
+
+      if (next.status === "review") {
+        const reviewCorrect = !next.failure_type && reviewCorrectOverride !== false;
+        playEffectSound(reviewCorrect ? "correct" : "incorrect", audioSettings.effect_volume);
+      } else if (next.status === "stage_complete") {
+        playEffectSound("complete", audioSettings.effect_volume);
+      }
 
       const previousCard = cardRef.current;
       const nextCard = cardAfterResult(previousCard, next);
@@ -803,9 +811,12 @@ export function BookStudy({
     if (!card || !pitchQuestion) return;
     const contour = pitchSubmission(pitch);
     if (!contour) return;
+    const pitchCorrect = pitchQuestion.allowed_patterns.some((pattern) => (
+      pattern.length === contour.length && pattern.every((level, index) => level === contour[index])
+    ));
     setSubmittedPitch([...pitch]);
     setSubmittedPitchQuestion(pitchQuestion);
-    void run(() => api.submitPitch(card.variant_id, contour));
+    void run(() => api.submitPitch(card.variant_id, contour), pitchCorrect);
   }
 
   function pitchKeydown(event: ReactKeyboardEvent<HTMLDivElement>, index: number) {
