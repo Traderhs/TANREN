@@ -12,6 +12,7 @@ import { prepareBookClosing } from "./lib/bookClosing";
 import { parseEntryText } from "./lib/importParser";
 import { BookStudy } from "./BookStudy";
 import { loadJapaneseImeRuntime } from "./lib/japaneseIme";
+import { playEffectSound } from "./lib/soundEffects";
 import type { SubmitResult } from "./lib/types";
 import type { AudioSettings, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
 
@@ -80,6 +81,7 @@ const BOOK_CONTENT_PAGE = BOOK_FLUTTER_LEAF_COUNT + 1;
 const BOOK_STUDY_FLUTTER_LEAF_COUNT = 8;
 const BOOK_STUDY_PAGE = BOOK_CONTENT_PAGE + 2 + BOOK_STUDY_FLUTTER_LEAF_COUNT;
 const BOOK_COVER_HOLD_MS = 380;
+
 const OPEN_BOOK_BASE_WIDTH = 1240;
 const OPEN_BOOK_TARGET_WIDTH = 1400;
 const OPEN_BOOK_SCALE = OPEN_BOOK_TARGET_WIDTH / OPEN_BOOK_BASE_WIDTH;
@@ -262,7 +264,7 @@ function App() {
   const [imeRuntimePhase, setImeRuntimePhase] = useState("starting");
   const [imeLoadProgress, setImeLoadProgress] = useState(0);
   const [initialRuntimeReady, setInitialRuntimeReady] = useState(false);
-  const [audioSettings, setAudioSettings] = useState<AudioSettings>({ volume: 1, playback_rate: 1 });
+  const [audioSettings, setAudioSettings] = useState<AudioSettings>({ volume: 1, playback_rate: 1, effect_volume: 1 });
   const homeScrollRef = useRef<HTMLDivElement>(null);
   const homeSectionRef = useRef(0);
   const homeWheelLockRef = useRef(false);
@@ -961,12 +963,16 @@ function SettingsView({ voicevoxStatus, audioSettings, onAudioSettingsChange, on
       </article>
 
       <article className="settings-panel">
-        <header><span>02</span><h2>음성</h2></header>
-        <p className="settings-panel-help">학습 중 재생되는 음성을 조절해요</p>
+        <header><span>02</span><h2>음량</h2></header>
+        <p className="settings-panel-help">효과음과 학습 음성을 조절해요</p>
         <div className="settings-control-list">
           <label className="settings-range-row">
-            <div><strong>음량</strong><span>{Math.round(audioSettings.volume * 100)}%</span></div>
-            <input type="range" min="0" max="1" step="0.05" value={audioSettings.volume} onChange={(event) => updateAudio({ ...audioSettings, volume: Number(event.target.value) })} />
+            <div><strong>효과음</strong><span>{Math.round(audioSettings.effect_volume * 100)}%</span></div>
+            <input type="range" min="0" max="1" step="0.05" value={audioSettings.effect_volume} onChange={(event) => updateAudio({ ...audioSettings, effect_volume: Number(event.target.value) })} />
+          </label>
+          <label className="settings-range-row">
+            <div><strong>학습 음성</strong><span>{Math.round(audioSettings.volume * 100)}%</span></div>
+            <input aria-label="학습 음성" type="range" min="0" max="1" step="0.05" value={audioSettings.volume} onChange={(event) => updateAudio({ ...audioSettings, volume: Number(event.target.value) })} />
           </label>
           <label className="settings-range-row">
             <div><strong>재생 속도</strong><span>{audioSettings.playback_rate.toFixed(1)}×</span></div>
@@ -1611,6 +1617,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
         showBookStudy();
         return;
       }
+      playEffectSound("page-flutter", audioSettings.effect_volume);
       pageFlip.flipNext("top");
       scheduleStudyFlutter(sessionKey, 16);
     }, delayMs);
@@ -1669,11 +1676,13 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             scheduleBookFlutter(sessionKey, 16);
             return;
           }
+          playEffectSound("page-flutter", audioSettings.effect_volume);
           readyFlip.flipNext("top");
           scheduleBookFlutter(sessionKey, 16);
         });
         return;
       }
+      playEffectSound("page-flutter", audioSettings.effect_volume);
       pageFlip.flipNext("top");
       scheduleBookFlutter(sessionKey, 16);
     }, delayMs);
@@ -1728,6 +1737,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     const rightPage = stack?.querySelector<HTMLElement>(".tanren-flip-book .book-inside-right");
     const cover = stack?.querySelector<HTMLElement>(".book-shelf-cover-page .ebook-cover");
     if (reduceMotion || !fold || !stack || !leftPage || !rightPage || !cover) {
+      playEffectSound("book-close", audioSettings.effect_volume);
       finishClosingBook();
       return;
     }
@@ -1991,7 +2001,10 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
         <div className="book-flip-stack" style={{ maxWidth: OPEN_BOOK_TARGET_WIDTH }}>
           <div ref={bookFoldRef} className="book-fold" aria-hidden="true"
             onAnimationEnd={(event) => {
-              if (event.animationName === "book-volume-close" && bookClosingRef.current) finishClosingBook();
+              if (event.animationName === "book-volume-close" && bookClosingRef.current) {
+                playEffectSound("book-close", audioSettings.effect_volume);
+                finishClosingBook();
+              }
             }} />
           <span className="book-paper-center-edge" aria-hidden="true" />
           <HTMLFlipBook

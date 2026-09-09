@@ -184,4 +184,5 @@ export interface StorageSettings {
 export interface AudioSettings {
   volume: number;
   playback_rate: number;
+  effect_volume: number;
 }

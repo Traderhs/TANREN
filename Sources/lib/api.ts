@@ -60,6 +60,7 @@ export const api = {
   setAudioSettings: (settings: AudioSettings) => invoke<AudioSettings>("set_audio_settings", {
     volume: settings.volume,
     playbackRate: settings.playback_rate,
+    effectVolume: settings.effect_volume,
   }),
   exportBackup: () => invoke<string | null>("export_backup"),
   importBackup: () => invoke<boolean>("import_backup"),
