@@ -933,6 +933,11 @@ function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDelete }: {
   const requestIdRef = useRef(0);
   const listRef = useRef<HTMLDivElement>(null);
 
+  const updateOverflowTooltip = (element: HTMLElement, text: string) => {
+    if (element.scrollWidth > element.clientWidth) element.title = text;
+    else element.removeAttribute("title");
+  };
+
   useEffect(() => {
     let disposed = false;
     const loadEntries = async (scrollToBottom = false) => {
@@ -1101,18 +1106,18 @@ function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDelete }: {
         <button type="button" className="ghost book-inline-entry-sort" onClick={() => toggleSort("term")}>표현{sortMark("term")}</button>
         <button type="button" className="ghost book-inline-entry-sort" onClick={() => toggleSort("reading")}>발음{sortMark("reading")}</button>
         <button type="button" className="ghost book-inline-entry-sort" onClick={() => toggleSort("meaning")}>뜻{sortMark("meaning")}</button>
-        <button type="button" className="ghost book-inline-entry-sort is-numeric" onClick={() => toggleSort("attempts")}>{sortMarkBefore("attempts")}시도</button>
+        <button type="button" className="ghost book-inline-entry-sort is-numeric" onClick={() => toggleSort("attempts")}>{sortMarkBefore("attempts")}누적 시도</button>
         <span className="book-inline-entry-settings-head">편집</span>
         <span className="book-inline-entry-delete-head">삭제</span>
       </div>
       {loading ? <div className="book-inline-entry-empty">불러오는 중</div>
         : filteredEntries.length === 0 ? <div className="book-inline-entry-empty">{entries.length === 0 ? "아직 표현이 없어요" : "검색 결과가 없어요"}</div>
           : sortedEntries.map((entry) => <div className="book-inline-entry-row" key={entry.id} role="row">
-            <span className="book-inline-entry-number">{(entryNumbers.get(entry.id) ?? 0).toLocaleString("ko-KR")}</span>
-            <strong>{entry.term}</strong>
-            <span className="book-inline-entry-reading">{entry.reading || "—"}</span>
-            <span className="book-inline-entry-meaning">{entry.meanings.join(" / ")}</span>
-            <span className="book-inline-entry-attempts">{entry.attempts.toLocaleString("ko-KR")}회</span>
+            <span className="book-inline-entry-number" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, (entryNumbers.get(entry.id) ?? 0).toLocaleString("ko-KR"))}>{(entryNumbers.get(entry.id) ?? 0).toLocaleString("ko-KR")}</span>
+            <strong onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, entry.term)}>{entry.term}</strong>
+            <span className="book-inline-entry-reading" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, entry.reading || "—")}>{entry.reading || "—"}</span>
+            <span className="book-inline-entry-meaning" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, entry.meanings.join(" / "))}>{entry.meanings.join(" / ")}</span>
+            <span className="book-inline-entry-attempts" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, `${entry.attempts.toLocaleString("ko-KR")}회`)}>{entry.attempts.toLocaleString("ko-KR")}회</span>
             <button type="button" className="book-inline-entry-settings" onClick={() => onEdit(entry)} aria-label={`${entry.term} 편집`} title="표현 편집">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M4 20h4.2L19 9.2a2 2 0 0 0 0-2.8l-1.4-1.4a2 2 0 0 0-2.8 0L4 15.8V20Z" />
