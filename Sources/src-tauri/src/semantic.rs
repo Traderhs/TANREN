@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::{
     db::Database,
     grading::{grade_reading_deterministic, normalize_generic, split_reading_answer},
-    model::{EntryRecord, GradeDecision, GradeOutcome},
+    model::{EntryRecord, GradeDecision, GradeOutcome, MeaningGrade},
 };
 
 const QUERY_INSTRUCTION: &str = "Instruct: 한국어 학습 답변과 사전의 한국어 의미가 같은 뜻인지 검색하세요.\nQuery: ";
@@ -190,6 +190,22 @@ impl SemanticGrader {
         }
 
         (self.grade_single_meaning(entry, answer, accepted, rejected, answer_language, expression_language), Vec::new())
+    }
+
+    pub fn grade_overfilled_meanings(&self, entry: &EntryRecord, answer: &str, answer_language: &str, expression_language: &str) -> Option<Vec<MeaningGrade>> {
+        let answers = split_overfilled_meaning_answer(entry, answer)?;
+        let passes = answers.iter().map(|answer| {
+            entry.meanings.iter().map(|meaning| {
+                let mut pair_entry = entry.clone();
+                pair_entry.meanings = vec![meaning.clone()];
+                self.grade_reading(&pair_entry, answer, &[], &[], answer_language, expression_language).decision == GradeDecision::Pass
+            }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        let matched = maximum_pass_matching(&passes);
+        Some(answers.into_iter().enumerate().map(|(index, submitted_answer)| MeaningGrade {
+            submitted_answer,
+            correct: matched[index],
+        }).collect())
     }
 
     fn grade_single_meaning(&self, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String], answer_language: &str, expression_language: &str) -> GradeOutcome {
@@ -549,6 +565,40 @@ fn normalized_embedding(mut value: Vec<f32>) -> Result<Vec<f32>, String> {
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 { a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum() }
+
+fn split_overfilled_meaning_answer(entry: &EntryRecord, answer: &str) -> Option<Vec<String>> {
+    let expected_count = entry.meanings.len();
+    if expected_count <= 1 { return None; }
+    let parts = split_reading_answer(answer, expected_count);
+    if parts.len() > expected_count { return Some(parts); }
+    if entry.meanings.iter().any(|meaning| meaning.chars().any(char::is_whitespace)) { return None; }
+    let whitespace_parts = answer.split_whitespace().map(ToOwned::to_owned).collect::<Vec<_>>();
+    (whitespace_parts.len() > expected_count).then_some(whitespace_parts)
+}
+
+fn maximum_pass_matching(matrix: &[Vec<bool>]) -> Vec<bool> {
+    fn augment(row: usize, matrix: &[Vec<bool>], seen: &mut [bool], column_to_row: &mut [Option<usize>]) -> bool {
+        for column in 0..matrix[row].len() {
+            if seen[column] || !matrix[row][column] { continue; }
+            seen[column] = true;
+            if column_to_row[column].is_none_or(|previous_row| augment(previous_row, matrix, seen, column_to_row)) {
+                column_to_row[column] = Some(row);
+                return true;
+            }
+        }
+        false
+    }
+
+    let column_count = matrix.first().map_or(0, Vec::len);
+    let mut column_to_row = vec![None; column_count];
+    for row in 0..matrix.len() {
+        let mut seen = vec![false; column_count];
+        augment(row, matrix, &mut seen, &mut column_to_row);
+    }
+    let mut matched = vec![false; matrix.len()];
+    for row in column_to_row.into_iter().flatten() { matched[row] = true; }
+    matched
+}
 
 fn perfect_matching(matrix: &[Vec<f64>], allowed: impl Fn(f64) -> bool + Copy) -> Option<Vec<usize>> {
     fn augment(
@@ -955,6 +1005,21 @@ mod tests {
         );
         assert_eq!(outcome.decision, GradeDecision::Ambiguous);
         assert!(!adjudications.is_empty());
+    }
+
+    #[test]
+    fn overfilled_multiple_meanings_keep_partial_review_colors() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: true });
+        let grader = grader(backend);
+        let entry = EntryRecord {
+            id: "toru".into(), term: "とる".into(), meanings: vec!["가지다".into(), "들다".into()], reading: Some("とる".into()),
+        };
+        let grades = grader.grade_overfilled_meanings(&entry, "가지다 들다 가져오다", "ko-KR", "ja-JP").unwrap();
+        assert_eq!(grades.iter().map(|grade| grade.submitted_answer.as_str()).collect::<Vec<_>>(), vec!["가지다", "들다", "가져오다"]);
+        assert_eq!(grades.iter().map(|grade| grade.correct).collect::<Vec<_>>(), vec![true, true, false]);
+
+        let duplicate = grader.grade_overfilled_meanings(&entry, "가지다 들다 가지다", "ko-KR", "ja-JP").unwrap();
+        assert_eq!(duplicate.iter().map(|grade| grade.correct).collect::<Vec<_>>(), vec![true, true, false]);
     }
 
     #[test]
