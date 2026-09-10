@@ -123,12 +123,12 @@ struct EntryDetails {
 }
 
 #[tauri::command]
-fn list_decks(state: State<'_, AppState>) -> Result<Vec<DeckSummary>, String> {
+async fn list_decks(state: State<'_, AppState>) -> Result<Vec<DeckSummary>, String> {
     state.db.list_decks()
 }
 
 #[tauri::command]
-fn list_entries(state: State<'_, AppState>, deck_id: String) -> Result<Vec<EntryListRecord>, String> {
+async fn list_entries(state: State<'_, AppState>, deck_id: String) -> Result<Vec<EntryListRecord>, String> {
     state.db.entry_list(&deck_id)
 }
 
@@ -138,6 +138,12 @@ fn entry_details(state: State<'_, AppState>, deck_id: String, entry_id: String) 
     let pitch = state.db.pitch_question(&entry_id, true)?;
     let audio_path = state.db.first_audio_path(&entry_id)?;
     Ok(EntryDetails { entry, pitch, audio_path })
+}
+
+#[tauri::command]
+async fn stage_schedules(state: State<'_, AppState>, deck_id: String, stages: Vec<u32>) -> Result<Vec<StageScheduleSummary>, String> {
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || db.stage_schedule_summaries(&deck_id, &stages)).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -157,7 +163,7 @@ fn create_deck(
 }
 
 #[tauri::command]
-fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<EntryDraft>) -> Result<ImportEntriesResult, String> {
+async fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<EntryDraft>) -> Result<ImportEntriesResult, String> {
     let deck = state.db.deck(&deck_id)?;
     let (result, entry_ids) = state.db.import_entries_tracked(&deck_id, &deck.target_language, &entries)?;
     start_enrichment_worker(
@@ -171,7 +177,7 @@ fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<Entr
 }
 
 #[tauri::command]
-fn enrichment_progress(state: State<'_, AppState>, entry_ids: Vec<String>) -> Result<EnrichmentProgress, String> {
+async fn enrichment_progress(state: State<'_, AppState>, entry_ids: Vec<String>) -> Result<EnrichmentProgress, String> {
     start_enrichment_worker(
         state.db.clone(),
         state.analyzer.clone(),
@@ -1692,6 +1698,7 @@ pub fn run() {
             list_entries,
             entry_details,
             stage_schedule,
+            stage_schedules,
             create_deck,
             import_entries,
             enrichment_progress,

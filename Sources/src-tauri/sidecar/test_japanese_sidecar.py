@@ -262,7 +262,8 @@ class ScopeAndCacheFixtures(unittest.TestCase):
                     jp.morae(reading),
                     None,
                     "audio",
-                )
+                    shared_cache_dir=os.path.join(os.path.dirname(os.path.abspath("audio")), ".voicevox-cache"),
+            )
 
     def test_voicevox_pitch_contour_accepts_phonetic_particle_morae(self):
         with patch.object(jp, "voicevox_metadata", return_value=([{"speaker_id": 7}], "test-version")), \
@@ -525,6 +526,66 @@ class ScopeAndCacheFixtures(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(jp, "voicevox_request", side_effect=fake_request):
             jp.synthesize_voicevox("http://voicevox", "がっこう", ["が", "っ", "こ", "う"], 0, 7, os.path.join(directory, "heiban.wav"))
         self.assertEqual(captured["accent"], 4)
+
+
+class SharedQueryFixtures(unittest.TestCase):
+    def test_shared_wave_cache_reuses_exact_identity_and_keeps_entry_files_independent(self):
+        from pathlib import Path
+        profile = {"voice_profile": "test", "speaker_id": 1, "speaker_name": "test",
+                   "age_band": "adult", "gender_presentation": "neutral"}
+        calls = []
+        def request(base, path, params=None, body=None, binary=False):
+            calls.append(path)
+            if path == "/audio_query": return {"accent_phrases": [{"accent": 1, "moras": [{"text": "ア", "pitch": 5.0}]}]}
+            if path == "/mora_data": return body
+            if path == "/synthesis": return b"RIFF" + b"\0" * 4 + b"WAVE" + b"\0" * 40
+            raise AssertionError(path)
+        with tempfile.TemporaryDirectory() as directory, patch.object(jp, "voicevox_metadata", return_value=([profile], "test")), patch.object(jp, "voicevox_request", side_effect=request):
+            root = Path(directory)
+            cache = str(root / "cache")
+            first = jp.generate_voicevox_assets("http://engine", "あ", ["あ"], 0, str(root / "one"), cache)
+            second = jp.generate_voicevox_assets("http://engine", "あ", ["あ"], 0, str(root / "two"), cache)
+            self.assertEqual(calls.count("/synthesis"), 1)
+            self.assertEqual(calls.count("/audio_query"), 1)
+            self.assertNotEqual(first[0]["path"], second[0]["path"])
+            original = Path(first[0]["path"]).read_bytes()
+            self.assertEqual(original, Path(second[0]["path"]).read_bytes())
+            Path(first[0]["path"]).unlink()
+            Path(second[0]["path"]).write_bytes(b"changed independent entry")
+            third = jp.generate_voicevox_assets("http://engine", "あ", ["あ"], 0, str(root / "three"), cache)
+            self.assertEqual(Path(third[0]["path"]).read_bytes(), original)
+            self.assertEqual(calls.count("/synthesis"), 1)
+            jp.generate_voicevox_assets("http://engine", "あ", ["あ"], 1, str(root / "accent"), cache)
+            jp.generate_voicevox_assets("http://engine", "い", ["い"], 0, str(root / "reading"), cache)
+            profile["speed_scale"] = 0.9
+            jp.generate_voicevox_assets("http://engine", "あ", ["あ"], 0, str(root / "speed"), cache)
+            self.assertEqual(calls.count("/synthesis"), 4)
+
+    def test_lexical_shared_query_preserves_each_speakers_synthesis_input(self):
+        import copy
+        queries = []
+        source = {"accent_phrases": [{"accent": 1, "moras": [
+            {"text": "イ", "vowel": "i", "pitch": 5.2},
+            {"text": "ス", "vowel": "U", "pitch": 0.0},
+        ]}], "volumeScale": 1.0}
+        def request(base, path, params=None, body=None, binary=False):
+            if path == "/audio_query": return copy.deepcopy(source)
+            if path == "/mora_data":
+                result = copy.deepcopy(body)
+                result[0]["moras"][0]["pitch"] = 5.0 + params["speaker"] * 0.01
+                return result
+            if path == "/synthesis":
+                queries.append(copy.deepcopy(body))
+                return b"RIFF" + b"\0" * 4 + b"WAVE" + b"\0" * 40
+            raise AssertionError(path)
+        with tempfile.TemporaryDirectory() as directory, patch.object(jp, "voicevox_request", side_effect=request) as mocked:
+            for speaker in [1, 8, 20]:
+                jp.synthesize_voicevox("http://engine", "いす", ["い", "す"], 0, speaker, os.path.join(directory, f"old-{speaker}.wav"))
+                jp.synthesize_voicevox("http://engine", "いす", ["い", "す"], 0, speaker, os.path.join(directory, f"new-{speaker}.wav"), source_query=source)
+                self.assertEqual(queries[-2], queries[-1])
+            self.assertEqual(sum(call.args[1] == "/audio_query" for call in mocked.call_args_list), 3)
+        self.assertEqual(source["accent_phrases"][0]["accent"], 1)
+        self.assertEqual(source["accent_phrases"][0]["moras"][0]["pitch"], 5.2)
 
 
 if __name__ == "__main__":

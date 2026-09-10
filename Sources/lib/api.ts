@@ -5,6 +5,7 @@ export const api = {
   listDecks: () => invoke<DeckSummary[]>("list_decks"),
   listEntries: (deckId: string) => invoke<EntryListRecord[]>("list_entries", { deckId }),
   entryDetails: (deckId: string, entryId: string) => invoke<EntryDetails>("entry_details", { deckId, entryId }),
+  stageSchedules: (deckId: string, stages: number[]) => invoke<StageScheduleSummary[]>("stage_schedules", { deckId, stages }),
   stageSchedule: (deckId: string, stage: number) => invoke<StageScheduleSummary>("stage_schedule", { deckId, stage }),
   createDeck: (name: string) =>
     invoke<DeckSummary>("create_deck", {
