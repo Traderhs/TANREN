@@ -382,10 +382,19 @@ fn submit_answer(
             (combined, adjudications)
         }
     };
+    let overfilled_meaning_grades = if outcome.decision == GradeDecision::Fail {
+        match variant.mode {
+            StudyMode::Reading => state.semantic.grade_overfilled_meanings(&entry, &answer, &deck.source_language, &deck.target_language),
+            StudyMode::Listening => state.semantic.grade_overfilled_meanings(&entry, &meaning_answer, &deck.source_language, &deck.target_language),
+            StudyMode::Writing => None,
+        }
+    } else {
+        None
+    };
     match outcome.decision {
         GradeDecision::Fail => fail_base(
             &state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms,
-            outcome.method, answer_failure, outcome.score, None,
+            outcome.method, answer_failure, outcome.score, overfilled_meaning_grades,
         ),
         GradeDecision::Ambiguous => {
             let pending_answer = if is_listening { stored_answer.clone() } else { answer.clone() };
