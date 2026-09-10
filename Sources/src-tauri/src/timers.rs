@@ -49,8 +49,16 @@ impl TypingProfileState {
         }
     }
 
-    pub fn completion_timed_out(&self, max_idle_gap_ms: u64) -> bool {
+    pub fn allowed_completion_ms(&self, expected_answer_chars: usize) -> Option<u64> {
+        let idle_buffer = self.allowed_idle_ms()?;
+        let chars_per_second = self.median_chars_per_second()?.max(0.1);
+        let typing_ms = ((expected_answer_chars.max(1) as f64 / chars_per_second) * 1_000.0).ceil() as u64;
+        Some(typing_ms.saturating_add(idle_buffer))
+    }
+
+    pub fn completion_timed_out(&self, max_idle_gap_ms: u64, typing_duration_ms: u64, expected_answer_chars: usize) -> bool {
         self.allowed_idle_ms().is_some_and(|limit| max_idle_gap_ms > limit)
+            || self.allowed_completion_ms(expected_answer_chars).is_some_and(|limit| typing_duration_ms > limit)
     }
 }
 
@@ -83,8 +91,19 @@ mod tests {
     fn mature_profile_detects_thinking_pause() {
         let mut profile = TypingProfileState::default();
         for _ in 0..320 { profile.observe(&[160, 220, 240, 190], 900, 0, 4); }
-        assert!(!profile.completion_timed_out(600));
-        assert!(profile.completion_timed_out(5_500));
+        assert!(!profile.completion_timed_out(600, 1_500, 4));
+        assert!(profile.completion_timed_out(5_500, 1_500, 4));
+    }
+
+    #[test]
+    fn completion_budget_scales_with_expected_answer_length() {
+        let mut profile = TypingProfileState::default();
+        for _ in 0..320 { profile.observe(&[180, 220, 200], 2_000, 0, 4); }
+        let short = profile.allowed_completion_ms(4).unwrap();
+        let multiple_meanings = profile.allowed_completion_ms(12).unwrap();
+        assert!(multiple_meanings > short);
+        assert!(!profile.completion_timed_out(500, short, 12));
+        assert!(profile.completion_timed_out(500, multiple_meanings + 1, 12));
     }
 
     #[test]

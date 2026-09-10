@@ -347,13 +347,14 @@ fn submit_answer(
     let input_language = variant.mode.answer_language(&deck.source_language, &deck.target_language).to_string();
     let profile = state.db.typing_profile(&deck.id, &input_language, variant.mode)?;
     let max_gap = interkey_gaps_ms.iter().copied().max().unwrap_or(0);
-    if profile.completion_timed_out(max_gap) {
+    let expected_input_chars = expected_answer_chars(&entry, variant.mode);
+    if profile.completion_timed_out(max_gap, typing_duration_ms, expected_input_chars) {
         return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None);
     }
     if is_listening {
         let meaning_profile = state.db.typing_profile(&deck.id, &deck.source_language, variant.mode)?;
         let meaning_max_gap = meaning_interkey_gaps_ms.iter().copied().max().unwrap_or(0);
-        if meaning_profile.completion_timed_out(meaning_max_gap) {
+        if meaning_profile.completion_timed_out(meaning_max_gap, meaning_typing_duration_ms, expected_meaning_chars(&entry)) {
             return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None);
         }
     }
@@ -1264,9 +1265,16 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
     };
     let answer_language = variant.mode.answer_language(&deck.source_language, &deck.target_language).to_string();
     let profile = state.db.typing_profile(&deck.id, &answer_language, variant.mode)?;
+    let expected_input_chars = expected_answer_chars(entry, variant.mode);
     let listening_meaning_completion_idle_ms = if matches!(variant.mode, StudyMode::Listening) {
         let meaning_profile = state.db.typing_profile(&deck.id, &deck.source_language, variant.mode)?;
         deck.adaptive_completion_timer_enabled.then(|| meaning_profile.allowed_idle_ms()).flatten()
+    } else {
+        None
+    };
+    let listening_meaning_completion_timeout_ms = if matches!(variant.mode, StudyMode::Listening) {
+        let meaning_profile = state.db.typing_profile(&deck.id, &deck.source_language, variant.mode)?;
+        deck.adaptive_completion_timer_enabled.then(|| meaning_profile.allowed_completion_ms(expected_meaning_chars(entry))).flatten()
     } else {
         None
     };
@@ -1288,7 +1296,9 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
         audio_path,
         recall_timeout_ms: deck.recall_timeout_by_mode.for_mode(variant.mode),
         completion_idle_ms: deck.adaptive_completion_timer_enabled.then(|| profile.allowed_idle_ms()).flatten(),
+        completion_timeout_ms: deck.adaptive_completion_timer_enabled.then(|| profile.allowed_completion_ms(expected_input_chars)).flatten(),
         listening_meaning_completion_idle_ms,
+        listening_meaning_completion_timeout_ms,
         input_warning: None,
     })
 }
@@ -1382,6 +1392,21 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
 
 fn find_entry(db: &Database, deck_id: &str, entry_id: &str) -> Result<EntryRecord, String> {
     db.entries(deck_id)?.into_iter().find(|e| e.id == entry_id).ok_or_else(|| "표현을 찾지 못했어요".into())
+}
+
+fn non_whitespace_chars(value: &str) -> usize {
+    value.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+fn expected_meaning_chars(entry: &EntryRecord) -> usize {
+    entry.meanings.iter().map(|meaning| non_whitespace_chars(meaning)).sum::<usize>().max(1)
+}
+
+fn expected_answer_chars(entry: &EntryRecord, mode: StudyMode) -> usize {
+    match mode {
+        StudyMode::Reading => expected_meaning_chars(entry),
+        StudyMode::Listening | StudyMode::Writing => non_whitespace_chars(&entry.term).max(1),
+    }
 }
 
 fn record_successful_typing(db: &Database, deck: &model::DeckRecord, variant: &VariantKey, answer: &str, gaps: &[u64], duration_ms: u64, ime_ms: u64) -> Result<(), String> {
