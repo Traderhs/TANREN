@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "ensure:tauri": "powershell -ExecutionPolicy Bypass -File tools/ensure_tauri.ps1",
-    "dev": "npm run ensure:tauri && tauri dev --config src-tauri/tauri.dev.conf.json",
+    "dev": "npm run ensure:tauri && powershell -ExecutionPolicy Bypass -File tools/compact_cargo_cache.ps1 && tauri dev --config src-tauri/tauri.dev.conf.json",
     "ime:sync": "powershell -ExecutionPolicy Bypass -File tools/sync_hechima.ps1",
     "web:dev": "vite",
     "build": "npm run ime:sync && tsc && vite build",
@@ -14,8 +14,8 @@
     "sidecar:sync": "powershell -ExecutionPolicy Bypass -File tools/sync_sidecar.ps1",
     "sidecar:test": "powershell -ExecutionPolicy Bypass -File tools/test_sidecar.ps1",
     "tauri": "npm run ensure:tauri && tauri",
-    "desktop": "npm run ensure:tauri && tauri dev --config src-tauri/tauri.dev.conf.json",
-    "package": "npm run ensure:tauri && tauri build"
+    "desktop": "npm run ensure:tauri && powershell -ExecutionPolicy Bypass -File tools/compact_cargo_cache.ps1 && tauri dev --config src-tauri/tauri.dev.conf.json",
+    "package": "npm run ensure:tauri && powershell -ExecutionPolicy Bypass -File tools/package.ps1"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",

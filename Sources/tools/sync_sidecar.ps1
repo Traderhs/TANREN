@@ -1,3 +1,5 @@
+param([switch]$DevOnly)
+
 $ErrorActionPreference = "Stop"
 
 function Set-TanrenProgress {
@@ -25,7 +27,8 @@ $Script = Join-Path $Sources "src-tauri\sidecar\japanese_sidecar.py"
 $Requirements = Join-Path $Sources "src-tauri\sidecar\requirements-build.txt"
 $RuntimeRequirements = Join-Path $Sources "src-tauri\sidecar\requirements.txt"
 $BuildScript = Join-Path $Sources "tools\build_sidecar.ps1"
-$Marker = Join-Path $Output ".tanren-language-source"
+$MarkerName = if ($DevOnly) { ".tanren-language-dev-source" } else { ".tanren-language-source" }
+$Marker = Join-Path $Output $MarkerName
 $VersionMarker = Join-Path $Output ".tanren-language-versions.json"
 
 function Resolve-LatestVersions {
@@ -70,7 +73,7 @@ try {
     if (Test-Path $VersionMarker) {
         $Versions = Get-Content $VersionMarker -Raw | ConvertFrom-Json
         Write-Warning "sidecar latest-version check failed; using cached version metadata"
-    } elseif ((Test-Path $Executable) -and (Test-Path $Marker)) {
+    } elseif (($DevOnly -or (Test-Path $Executable)) -and (Test-Path $Marker)) {
         $BuiltFingerprint = (Get-Content $Marker -Raw).Trim()
         if ($BuiltFingerprint -eq $SourceFingerprint) {
             Set-TanrenPhase "done"
@@ -114,28 +117,32 @@ function Test-InstalledState {
     return $true
 }
 
-if ((Test-Path $Executable) -and (Test-Path $Marker)) {
+if (($DevOnly -or (Test-Path $Executable)) -and (Test-Path $Marker)) {
     $BuiltFingerprint = (Get-Content $Marker -Raw).Trim()
     if (($BuiltFingerprint -eq $Fingerprint) -and (Test-InstalledState $Versions)) {
         Set-TanrenProgress 100
         Set-TanrenPhase "done"
-        Write-Host "TANREN language sidecar is up to date."
+        Write-Host $(if ($DevOnly) { "TANREN development language runtime is up to date." } else { "TANREN language sidecar is up to date." })
         exit 0
     }
 }
 
-Write-Host "TANREN language sidecar is stale; rebuilding..."
+Write-Host $(if ($DevOnly) { "TANREN development language runtime is stale; preparing..." } else { "TANREN language sidecar is stale; rebuilding..." })
 Set-TanrenPhase "downloading"
 Set-TanrenProgress 28
-& powershell -ExecutionPolicy Bypass -File $BuildScript `
-    -PyOpenJTalkVersion ([string]$Versions.pyopenjtalk_plus) `
-    -FugashiVersion ([string]$Versions.fugashi) `
-    -UniDicPackageVersion ([string]$Versions.unidic_package) `
-    -UniDicVersion ([string]$Versions.unidic_cwj) `
-    -UniDicUrl ([string]$Versions.unidic_url) `
-    -Fingerprint $Fingerprint
+$BuildArgs = @(
+    "-ExecutionPolicy", "Bypass", "-File", $BuildScript,
+    "-PyOpenJTalkVersion", [string]$Versions.pyopenjtalk_plus,
+    "-FugashiVersion", [string]$Versions.fugashi,
+    "-UniDicPackageVersion", [string]$Versions.unidic_package,
+    "-UniDicVersion", [string]$Versions.unidic_cwj,
+    "-UniDicUrl", [string]$Versions.unidic_url,
+    "-Fingerprint", $Fingerprint
+)
+if ($DevOnly) { $BuildArgs += "-DevOnly" }
+& powershell @BuildArgs
 if ($LASTEXITCODE -ne 0) {
-    if (Test-Path $Executable) {
+    if ((-not $DevOnly) -and (Test-Path $Executable)) {
         Set-TanrenPhase "done"
         Write-Warning "latest sidecar update failed; keeping existing binary"
         exit 0

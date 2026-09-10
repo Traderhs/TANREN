@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "externalBin": [
+      "../../Results/sidecar/tanren-language"
+    ],
+    "resources": {
+      "../../Results/sidecar/tanren-unidic/**/*": "tanren-unidic/"
+    }
+  }
+}
