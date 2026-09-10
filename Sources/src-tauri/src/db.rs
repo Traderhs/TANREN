@@ -1409,8 +1409,41 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
     pub fn set_entry_analysis(&self, entry_id:&str, reading:Option<&str>, analysis_json:&serde_json::Value, provider:&str, source:&str, confidence:&str, model_version:Option<&str>, pitch_patterns:Option<&[Vec<u8>]>, scope:&str, audio:&[AudioAssetDraft]) -> Result<(),String>{
+        self.set_entry_analysis_inner(entry_id, None, reading, analysis_json, provider, source, confidence, model_version, pitch_patterns, scope, audio).map(|_| ())
+    }
+
+    pub fn set_entry_analysis_if_pronunciation_current(&self, entry:&EntryRecord, reading:Option<&str>, analysis_json:&serde_json::Value, provider:&str, source:&str, confidence:&str, model_version:Option<&str>, pitch_patterns:Option<&[Vec<u8>]>, scope:&str, audio:&[AudioAssetDraft]) -> Result<bool,String>{
+        self.set_entry_analysis_inner(
+            &entry.id,
+            Some((&entry.term, entry.reading.as_deref())),
+            reading,
+            analysis_json,
+            provider,
+            source,
+            confidence,
+            model_version,
+            pitch_patterns,
+            scope,
+            audio,
+        )
+    }
+
+    fn set_entry_analysis_inner(&self, entry_id:&str, expected_pronunciation:Option<(&str,Option<&str>)>, reading:Option<&str>, analysis_json:&serde_json::Value, provider:&str, source:&str, confidence:&str, model_version:Option<&str>, pitch_patterns:Option<&[Vec<u8>]>, scope:&str, audio:&[AudioAssetDraft]) -> Result<bool,String>{
         let mut conn=self.conn()?; let tx=conn.transaction().map_err(|e|e.to_string())?; let timestamp=now();
+        if let Some((expected_term, expected_reading)) = expected_pronunciation {
+            let current: Option<(String, Option<String>)> = tx.query_row(
+                "SELECT term,reading FROM entries WHERE id=?1 AND deleted_at IS NULL",
+                [entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(|e|e.to_string())?;
+            if current.as_ref().is_none_or(|(term, current_reading)| {
+                term != expected_term || current_reading.as_deref().unwrap_or("") != expected_reading.unwrap_or("")
+            }) {
+                return Ok(false);
+            }
+        }
         tx.execute("UPDATE entries SET reading=COALESCE(?1,reading),updated_at=?2,revision=revision+1 WHERE id=?3",params![reading,timestamp,entry_id]).map_err(|e|e.to_string())?;
         let analysis_id:Option<String>=tx.query_row("SELECT id FROM japanese_analyses WHERE entry_id=?1",[entry_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         let analysis_existed = analysis_id.is_some();
@@ -1448,7 +1481,8 @@ impl Database {
         let analysis_revision: i64 = tx.query_row("SELECT revision FROM japanese_analyses WHERE id=?1", [&aid], |row| row.get(0)).map_err(|e| e.to_string())?;
         journal(&tx, entry_id, "entry", &self.device_id, entry_revision, "update", &serde_json::json!({"reading":reading}))?;
         journal(&tx, &aid, "japanese_analysis", &self.device_id, analysis_revision, if analysis_existed { "update" } else { "insert" }, &serde_json::json!({"entry_id":entry_id,"provider":provider,"source":source,"confidence":confidence,"model_version":model_version}))?;
-        tx.commit().map_err(|e|e.to_string())
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(true)
     }
 
     pub fn queued_enrichment(&self, limit:usize)->Result<Vec<EntryRecord>,String>{
@@ -2037,6 +2071,48 @@ mod tests{
         let status: String = db.conn().unwrap().query_row("SELECT status FROM enrichment_jobs WHERE entry_id=?1", [&entry.id], |row| row.get(0)).unwrap();
         assert_eq!(status, "queued");
 
+    }
+
+    #[test]
+    fn stale_enrichment_cannot_overwrite_edited_pronunciation() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("stale pronunciation", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "月".into(), meanings: vec!["달".into()], reading: Some("つき".into()),
+        }]).unwrap();
+        let stale = db.entries(&deck.id).unwrap().remove(0);
+
+        db.update_entry(&deck.id, &stale.id, &EntryDraft {
+            term: "月見".into(), meanings: vec!["달맞이".into()], reading: Some("つきみ".into()),
+        }).unwrap();
+
+        let stale_analysis = serde_json::json!({"scope":"lexical","morae":["つ","き"]});
+        let stale_audio = [AudioAssetDraft {
+            cache_key: "stale".into(), path: "stale.wav".into(), provider: "fixture".into(),
+            voice_profile: "fixture".into(), age_band: "young_adult".into(), gender_presentation: "feminine".into(),
+            speaker_id: None, speaker_name: None, accent_type: Some(1),
+        }];
+        let accepted = db.set_entry_analysis_if_pronunciation_current(
+            &stale,
+            Some("つき"),
+            &stale_analysis,
+            "fixture",
+            "fixture",
+            "CONSENSUS",
+            None,
+            Some(&[vec![1,0]]),
+            "lexical",
+            &stale_audio,
+        ).unwrap();
+
+        assert!(!accepted);
+        let current = db.entries(&deck.id).unwrap().remove(0);
+        assert_eq!(current.term, "月見");
+        assert_eq!(current.reading.as_deref(), Some("つきみ"));
+        assert!(db.first_audio_path(&stale.id).unwrap().is_none());
+        let status: String = db.conn().unwrap().query_row("SELECT status FROM enrichment_jobs WHERE entry_id=?1", [&stale.id], |row| row.get(0)).unwrap();
+        assert_eq!(status, "queued");
     }
 
     #[test]

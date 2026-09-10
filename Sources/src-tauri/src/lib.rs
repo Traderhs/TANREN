@@ -1325,8 +1325,8 @@ fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Ar
             for entry in jobs {
                 match analyzer.analyze(&entry) {
                     Ok((analysis, audio)) => {
-                        if let Err(error) = db.set_entry_analysis(
-                            &entry.id,
+                        match db.set_entry_analysis_if_pronunciation_current(
+                            &entry,
                             analysis.reading.as_deref(),
                             &analysis.analysis_json(),
                             &analysis.provider,
@@ -1337,7 +1337,15 @@ fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Ar
                             &analysis.scope,
                             &audio,
                         ) {
-                            let _ = db.fail_enrichment(&entry.id, &error);
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if let Err(error) = analyzer.invalidate_audio(&entry.id) {
+                                    let _ = db.fail_enrichment(&entry.id, &error);
+                                }
+                            }
+                            Err(error) => {
+                                let _ = db.fail_enrichment(&entry.id, &error);
+                            }
                         }
                     }
                     Err(error) => { let _ = db.fail_enrichment(&entry.id, &error); }
