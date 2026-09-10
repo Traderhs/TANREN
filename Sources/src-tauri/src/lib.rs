@@ -1446,6 +1446,10 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let icon = tauri::image::Image::from_bytes(include_bytes!("../../public/tanren.ico"))?;
+                window.set_icon(icon)?;
+            }
             let app_data = std::env::var_os("TANREN_APP_DATA_HOME").map(PathBuf::from)
                 .unwrap_or(app.path().app_data_dir().map_err(|e| e.to_string())?);
             let db = Database::open(app_data.join("tanren.db"))?;

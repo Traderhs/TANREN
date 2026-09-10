@@ -53,7 +53,7 @@ function AppTitleBar() {
     onDoubleClick={() => runWindowAction(() => appWindow.toggleMaximize())}
   >
     <div className="app-titlebar-name" data-tauri-drag-region>
-      <span className="app-titlebar-mark" data-tauri-drag-region>T</span>
+      <img className="app-titlebar-mark" src="/tanren.ico" alt="" aria-hidden="true" data-tauri-drag-region />
     </div>
     <div className="app-titlebar-controls" onDoubleClick={(event) => event.stopPropagation()}>
       <button type="button" className="app-titlebar-button" aria-label="최소화" title="최소화" onClick={() => runWindowAction(() => appWindow.minimize())}>

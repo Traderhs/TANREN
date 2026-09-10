@@ -34,7 +34,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico"],
+    "icon": ["../public/tanren.ico"],
     "externalBin": ["../../Results/sidecar/tanren-language"],
     "resources": {
       "../../Results/sidecar/tanren-unidic/**/*": "tanren-unidic/"
