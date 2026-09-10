@@ -557,7 +557,8 @@ function App() {
         const now = performance.now();
         const wheelGapMs = now - bookRangeWheelAt;
         const maxScrollTop = Math.max(0, bookRangeScroller.scrollHeight - bookRangeScroller.clientHeight);
-        const effectiveScrollTop = bookRangeScrollElement === bookRangeScroller && bookRangeScrollTarget !== null
+        const effectiveScrollTop = bookRangeScrollElement === bookRangeScroller
+          && bookRangeScrollFrame !== null && bookRangeScrollTarget !== null
           ? bookRangeScrollTarget
           : bookRangeScroller.scrollTop;
         const canScrollUp = deltaY < 0 && effectiveScrollTop > 2;
