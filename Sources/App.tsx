@@ -2474,7 +2474,6 @@ function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise
       <input value={name} maxLength={MAX_DECK_NAME_LENGTH} onChange={(event) => setName(event.target.value)} aria-label="책 이름" />
       <div className="mode-options">
         {(["reading", "listening", "writing"] as StudyMode[]).map((mode) => <label key={mode}><input type="checkbox" checked={modes.includes(mode)} onChange={() => toggleMode(mode)} /> {STUDY_MODE_LABELS[mode]}</label>)}
-        <label title="추가 예정"><input type="checkbox" disabled /> Speaking <span>(추가 예정)</span></label>
       </div>
       <div className="actions"><button disabled={!name.trim() || modes.length === 0} onClick={() => void save()}>저장하기</button><button className="ghost danger" onClick={() => void remove()}>삭제하기</button></div>
     </div>
@@ -2608,14 +2607,13 @@ function StatsMetric({ label, value, help, featured = false }: { label: string; 
 }
 
 type GrowthMetric = "attempts" | "seen_entry_count" | "base_accuracy" | "pitch_accuracy" | "median_recall_latency_ms" | "study_time_ms";
-type GrowthScope = "all" | "reading" | "writing" | "listening" | "speaking";
+type GrowthScope = "all" | "reading" | "writing" | "listening";
 
 const GROWTH_SCOPES: Record<GrowthScope, string> = {
   all: "전체",
   reading: "Reading",
   writing: "Writing",
   listening: "Listening",
-  speaking: "Speaking",
 };
 
 const GROWTH_METRICS: Record<GrowthMetric, { label: string; format: (value: number | null) => string; value: (point: LibraryStats["history"][number]) => number | null }> = {
@@ -2833,7 +2831,7 @@ function GrowthChart({ stats }: { stats: LibraryStats }) {
 
   const metricInfo = GROWTH_METRICS[metric];
   const chartData = stats.history.map((point, index) => {
-    const modePoint = scope === "all" || scope === "speaking" ? null : point.modes[scope];
+    const modePoint = scope === "all" ? null : point.modes[scope];
     const value = scope === "all" ? metricInfo.value(point) : modePoint?.[metric] ?? null;
     return {
       index,

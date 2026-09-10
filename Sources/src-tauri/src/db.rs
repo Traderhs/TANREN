@@ -12,7 +12,7 @@ use crate::{
     timers::TypingProfileState,
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 16;
 
 fn contains_han(value: &str) -> bool {
     value.chars().any(|character| matches!(character as u32,
@@ -28,6 +28,31 @@ fn validate_reading_for_language(target_language: &str, reading: Option<&str>) -
     if target_language == "ja-JP" && reading.is_some_and(contains_han) {
         return Err("일본어 발음에는 한자를 입력할 수 없어요".into());
     }
+    Ok(())
+}
+
+fn purge_retired_mode(tx: &Transaction<'_>, mode: &str) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM sync_journal WHERE entity_type='attempt' AND entity_id IN (SELECT id FROM attempts WHERE variant=?1)",
+        [mode],
+    ).map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM attempts WHERE variant=?1", [mode]).map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM study_activity WHERE mode=?1", [mode]).map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM typing_profiles WHERE study_mode=?1", [mode]).map_err(|e| e.to_string())?;
+    let state_pattern = format!("%\"{mode}\"%");
+    tx.execute(
+        "DELETE FROM sync_journal WHERE entity_type='stage_state' AND entity_id IN (SELECT deck_id || ':' || stage FROM stage_states WHERE state_json LIKE ?1)",
+        [&state_pattern],
+    ).map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM stage_states WHERE state_json LIKE ?1", [&state_pattern]).map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM sync_journal WHERE entity_type='deck' AND json_type(payload,'$.enabled_modes')='array' AND EXISTS (SELECT 1 FROM json_each(json_extract(sync_journal.payload,'$.enabled_modes')) WHERE value=?1)",
+        [mode],
+    ).map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE decks SET enabled_modes=CASE WHEN (SELECT COUNT(*) FROM json_each(decks.enabled_modes) WHERE value<>?1)=0 THEN '[\"reading\",\"listening\",\"writing\"]' ELSE (SELECT json_group_array(value) FROM json_each(decks.enabled_modes) WHERE value<>?1) END, recall_timeout_by_mode=json_remove(recall_timeout_by_mode,'$.' || ?1)",
+        [mode],
+    ).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -125,7 +150,7 @@ impl Database {
             |row| row.get(0),
         ).map_err(|e| e.to_string())?;
         if has_schema {
-            let version: i64 = conn.query_row(
+            let mut version: i64 = conn.query_row(
                 "SELECT version FROM schema_info WHERE id=1",
                 [],
                 |row| row.get(0),
@@ -138,10 +163,25 @@ impl Database {
                 ).map_err(|e| e.to_string())?;
                 tx.execute(
                     "UPDATE schema_info SET version=?1 WHERE id=1",
-                    [SCHEMA_VERSION],
+                    [14],
                 ).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
-            } else if version != SCHEMA_VERSION {
+                version = 14;
+            }
+            if version == 14 {
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [SCHEMA_VERSION]).map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                version = SCHEMA_VERSION;
+            }
+            if version == 15 {
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                purge_retired_mode(&tx, "speaking")?;
+                tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [SCHEMA_VERSION]).map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                version = SCHEMA_VERSION;
+            }
+            if version != SCHEMA_VERSION {
             return Err("현재 버전과 호환되지 않는 TANREN 데이터예요".into());
             }
         } else {
@@ -1577,6 +1617,7 @@ impl Database {
                 for row in rows { insert_json_row(&tx, table, row)?; }
             }
         }
+        purge_retired_mode(&tx, "speaking")?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(deck_id)
     }
@@ -1619,7 +1660,7 @@ impl Database {
             [],
             |row| row.get(0),
         ).map_err(|e| format!("백업 버전을 확인하지 못했어요: {e}"))?;
-        if version != SCHEMA_VERSION {
+        if !matches!(version, 13 | 14 | 15 | SCHEMA_VERSION) {
             return Err("현재 버전과 맞지 않는 TANREN 백업이에요".into());
         }
         let integrity: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(|e| e.to_string())?;
@@ -1711,6 +1752,31 @@ mod tests{
         db.import_entries(&deck.id,"ja-JP",&[EntryDraft{term:"見据える".into(),meanings:vec!["내다보다".into()],reading:Some("みすえる".into())}]).unwrap();
         drop(db);
         let reopened=Database::open(&path).unwrap(); assert_eq!(reopened.entries(&deck.id).unwrap().len(),1); assert_eq!(reopened.list_decks().unwrap()[0].entry_count,1);
+    }
+
+    #[test]
+    fn retired_mode_migration_purges_mode_data() {
+        let dir=tempdir().unwrap();let path=dir.path().join("migration.db");
+        let db=Database::open(&path).unwrap();
+        let deck=db.create_deck("existing","ko-KR","ja-JP").unwrap();
+        let conn=db.conn().unwrap();
+        conn.execute("UPDATE schema_info SET version=15",[]).unwrap();
+        conn.execute("UPDATE decks SET enabled_modes='[\"reading\",\"speaking\"]',recall_timeout_by_mode='{\"reading\":2100,\"listening\":3000,\"writing\":4200,\"speaking\":3000}' WHERE id=?1",[&deck.id]).unwrap();
+        conn.execute("INSERT INTO study_activity(date,deck_id,mode,duration_ms,updated_at,device_id) VALUES('2026-01-01',?1,'speaking',1000,'2026-01-01','test')",[&deck.id]).unwrap();
+        conn.execute("INSERT INTO stage_states(deck_id,stage,state_json,updated_at,device_id) VALUES(?1,1,'{\"mode\":\"speaking\"}','2026-01-01','test')",[&deck.id]).unwrap();
+        conn.execute("INSERT INTO sync_journal(op_id,entity_id,entity_type,device_id,revision,operation,payload,timestamp) VALUES('keep-user-text','entry-note','entry','test',1,'update','{\"note\":\"speaking practice\"}','2026-01-01')",[]).unwrap();
+        drop(conn);drop(db);
+        let db=Database::open(&path).unwrap();
+        let loaded=db.deck(&deck.id).unwrap();
+        assert_eq!(loaded.enabled_modes,vec![StudyMode::Reading]);
+        assert_eq!(loaded.recall_timeout_by_mode.reading,2100);
+        let conn=db.conn().unwrap();
+        let speaking_activity:i64=conn.query_row("SELECT COUNT(*) FROM study_activity WHERE mode='speaking'",[],|row|row.get(0)).unwrap();
+        let speaking_state:i64=conn.query_row("SELECT COUNT(*) FROM stage_states WHERE state_json LIKE '%speaking%'",[],|row|row.get(0)).unwrap();
+        let preserved_user_text:i64=conn.query_row("SELECT COUNT(*) FROM sync_journal WHERE op_id='keep-user-text'",[],|row|row.get(0)).unwrap();
+        assert_eq!((speaking_activity,speaking_state),(0,0));
+        assert_eq!(preserved_user_text,1);
+        assert_eq!(conn.query_row("SELECT version FROM schema_info WHERE id=1",[],|row|row.get::<_,i64>(0)).unwrap(),SCHEMA_VERSION);
     }
 
     #[test]
