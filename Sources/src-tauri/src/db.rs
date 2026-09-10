@@ -435,6 +435,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_entries_import ON entries(deck_id,term,meanings,COALESCE(reading,'')) WHERE deleted_at IS NULL;
             CREATE INDEX IF NOT EXISTS idx_entries_deck_position ON entries(deck_id,position);
             CREATE INDEX IF NOT EXISTS idx_attempts_deck_entry ON attempts(deck_id,entry_id);
+            CREATE INDEX IF NOT EXISTS idx_audio_assets_entry_live ON audio_assets(entry_id) WHERE deleted_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_pitch_patterns_analysis_live ON pitch_patterns(analysis_id) WHERE deleted_at IS NULL;
 
             CREATE TABLE IF NOT EXISTS app_settings (
               key TEXT PRIMARY KEY,
