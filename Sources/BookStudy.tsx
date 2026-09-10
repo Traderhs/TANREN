@@ -215,17 +215,23 @@ export function BookStudy({
   const completionIdleMs = listeningMeaningPhase
     ? card?.listening_meaning_completion_idle_ms
     : card?.completion_idle_ms;
+  const completionTimeoutMs = listeningMeaningPhase
+    ? card?.listening_meaning_completion_timeout_ms
+    : card?.completion_timeout_ms;
   const now = timing.current.start + elapsed;
   const recalling = timing.current.first === null;
   const recallLeft = Math.max(0, (card?.recall_timeout_ms ?? 0) - (recalling ? elapsed : timing.current.first! - timing.current.start));
   const inputDelay = completionDelayMs(completionIdleMs, phaseComposing, phaseAnswer, timing.current.compositionEnd, timing.current.last ?? now);
   const inputLeft = inputDelay === null ? null : Math.max(0, inputDelay - (now - (timing.current.last ?? now)));
   const inputElapsed = recalling ? 0 : Math.max(0, now - timing.current.first!);
-  const completionTimerEnabled = completionIdleMs != null;
+  const completionTotalLeft = !recalling && completionTimeoutMs != null
+    ? Math.max(0, completionTimeoutMs - inputElapsed)
+    : null;
+  const completionTimerEnabled = completionTimeoutMs != null || completionIdleMs != null;
   const inputClock = recalling
     ? "대기"
     : completionTimerEnabled
-      ? formatTimerSeconds(inputLeft ?? completionIdleMs ?? 0)
+      ? formatTimerSeconds(completionTotalLeft ?? inputLeft ?? completionIdleMs ?? 0)
       : formatTimerSeconds(inputElapsed);
   const stageStudyTimeMs = stageStudyDuration.current + (studyActivityStartedAt.current == null
     ? 0
@@ -864,9 +870,15 @@ export function BookStudy({
       const activityText = meaningPhase ? meaningAnswerRef.current : answerRef.current;
       const activeComposing = meaningPhase ? meaningComposing.current : composing.current;
       const activeCompletionIdleMs = meaningPhase ? card.listening_meaning_completion_idle_ms : card.completion_idle_ms;
+      const activeCompletionTimeoutMs = meaningPhase ? card.listening_meaning_completion_timeout_ms : card.completion_timeout_ms;
       const idle = completionDelayMs(activeCompletionIdleMs, activeComposing, activityText, currentTiming.compositionEnd, currentTiming.last ?? currentNow);
       const recall = currentTiming.first === null && currentNow - currentTiming.start >= card.recall_timeout_ms;
-      const completion = currentTiming.last !== null && idle !== null && currentNow - currentTiming.last >= idle;
+      const idleCompletion = currentTiming.last !== null && idle !== null && currentNow - currentTiming.last >= idle;
+      const totalCompletion = !activeComposing
+        && currentTiming.first !== null
+        && activeCompletionTimeoutMs != null
+        && currentNow - currentTiming.first >= activeCompletionTimeoutMs;
+      const completion = idleCompletion || totalCompletion;
       if ((recall || completion) && !locked.current && !timeoutSent.current) {
         timeoutSent.current = true;
         setSubmittedAnswerKnown(true);
@@ -891,7 +903,7 @@ export function BookStudy({
       }
     }, 100);
     return () => window.clearInterval(interval);
-  }, [active, card?.variant_id, card?.recall_timeout_ms, card?.completion_idle_ms, card?.listening_meaning_completion_idle_ms, card?.mode, listeningAudioFinished, busy, error]);
+  }, [active, card?.variant_id, card?.recall_timeout_ms, card?.completion_idle_ms, card?.completion_timeout_ms, card?.listening_meaning_completion_idle_ms, card?.listening_meaning_completion_timeout_ms, card?.mode, listeningAudioFinished, busy, error]);
 
   function submitAnswer() {
     if (!card || !active || locked.current || composing.current || meaningComposing.current || (japanese && !imeReady)) return;

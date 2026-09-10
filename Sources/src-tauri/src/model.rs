@@ -164,7 +164,9 @@ pub struct StudyCard {
     pub audio_path: Option<String>,
     pub recall_timeout_ms: u64,
     pub completion_idle_ms: Option<u64>,
+    pub completion_timeout_ms: Option<u64>,
     pub listening_meaning_completion_idle_ms: Option<u64>,
+    pub listening_meaning_completion_timeout_ms: Option<u64>,
     pub input_warning: Option<String>,
 }
 
