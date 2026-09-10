@@ -114,27 +114,41 @@ impl LanguageSidecar {
 
     fn spawn(app: &AppHandle, script_path: &Path) -> Result<LanguageSidecarProcess, String> {
         #[cfg(debug_assertions)]
-        if let Some(executable) = debug_sidecar_executable() {
-            if let Ok((events, child)) = app.shell().command(executable).spawn() {
-                return Ok(LanguageSidecarProcess { child, events });
-            }
+        {
+            let (python, dictionary) = debug_sidecar_runtime()?;
+            let (events, child) = app
+                .shell()
+                .command(python)
+                .arg("-u")
+                .arg(script_path)
+                .env("TANREN_UNIDIC_DIR", dictionary)
+                .spawn()
+                .map_err(|error| format!("development language sidecar could not start: {error}"))?;
+            return Ok(LanguageSidecarProcess { child, events });
         }
 
-        let bundled = app.shell().sidecar("tanren-language");
-        if let Ok(command) = bundled {
-            if let Ok((events, child)) = command.spawn() {
-                return Ok(LanguageSidecarProcess { child, events });
+        #[cfg(not(debug_assertions))]
+        {
+            let runtime_temp = bundled_sidecar_temp();
+            if let Ok(command) = app.shell().sidecar("tanren-language") {
+                let command = command
+                    .env("TEMP", &runtime_temp)
+                    .env("TMP", &runtime_temp)
+                    .env("TMPDIR", &runtime_temp);
+                if let Ok((events, child)) = command.spawn() {
+                    return Ok(LanguageSidecarProcess { child, events });
+                }
             }
-        }
 
-        let (events, child) = app
-            .shell()
-            .command("python")
-            .arg("-u")
-            .arg(script_path)
-            .spawn()
-            .map_err(|error| format!("language sidecar could not start: {error}"))?;
-        Ok(LanguageSidecarProcess { child, events })
+            let (events, child) = app
+                .shell()
+                .command("python")
+                .arg("-u")
+                .arg(script_path)
+                .spawn()
+                .map_err(|error| format!("language sidecar could not start: {error}"))?;
+            Ok(LanguageSidecarProcess { child, events })
+        }
     }
 
     fn request(&mut self, app: &AppHandle, script_path: &Path, request: &serde_json::Value) -> Result<Vec<u8>, String> {
@@ -159,32 +173,51 @@ impl LanguageSidecar {
     }
 }
 
-#[cfg(debug_assertions)]
-fn debug_sidecar_executable() -> Option<PathBuf> {
-    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .parent()?
-        .join("Results")
-        .join("sidecar");
-    let mut candidates = fs::read_dir(output)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
+#[cfg(not(debug_assertions))]
+fn bundled_sidecar_temp() -> PathBuf {
+    let root = std::env::temp_dir().join("tanren-language-sidecar");
+    let _ = fs::create_dir_all(&root);
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
             let path = entry.path();
-            let name = path.file_name()?.to_str()?;
-            (path.is_file()
-                && name.starts_with("tanren-language-")
-                && name.ends_with(".exe"))
-                .then_some(path)
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|path| {
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
-    candidates.pop()
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("_MEI") {
+                let _ = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+            }
+        }
+    }
+    root
 }
+
+#[cfg(debug_assertions)]
+fn debug_sidecar_runtime() -> Result<(PathBuf, PathBuf), String> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or("development TANREN root could not be resolved")?;
+    let python = root
+        .join("Results")
+        .join("python-sidecar-env")
+        .join("Scripts")
+        .join("python.exe");
+    let dictionary = root.join("Results").join("sidecar").join("tanren-unidic");
+    if !python.is_file() {
+        return Err(format!(
+            "development language sidecar Python is missing: {}",
+            python.display()
+        ));
+    }
+    if !dictionary.join("sys.dic").is_file() {
+        return Err(format!(
+            "development UniDic is missing: {}",
+            dictionary.display()
+        ));
+    }
+    Ok((python, dictionary))
+}
+
 
 impl JapaneseAnalyzer {
     pub fn install(app: AppHandle, app_data: &Path, audio_dir: PathBuf, voicevox: Arc<VoicevoxRuntime>) -> Result<Self, String> {

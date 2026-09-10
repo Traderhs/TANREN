@@ -349,6 +349,10 @@ def token_data(text: str) -> tuple[list[dict[str, Any]], list[int] | None, str |
     global _FUGASHI_TAGGER, _FUGASHI_VERSION
     try:
         if _FUGASHI_TAGGER is None:
+            unidic_override = os.environ.get("TANREN_UNIDIC_DIR")
+            if unidic_override:
+                import unidic  # type: ignore
+                unidic.DICDIR = unidic_override
             import fugashi  # type: ignore
             _FUGASHI_TAGGER = fugashi.Tagger()
             _FUGASHI_VERSION = getattr(fugashi, "__version__", None)

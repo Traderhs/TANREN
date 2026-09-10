@@ -44,3 +44,17 @@ windows = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3.21"
+
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug = 1
+incremental = false
+
+[profile.test.package."*"]
+debug = 0

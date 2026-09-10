@@ -33,11 +33,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["../public/tanren.ico"],
-    "externalBin": ["../../Results/sidecar/tanren-language"],
-    "resources": {
-      "../../Results/sidecar/tanren-unidic/**/*": "tanren-unidic/"
-    }
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "../public/tanren.ico"
+    ]
   }
 }

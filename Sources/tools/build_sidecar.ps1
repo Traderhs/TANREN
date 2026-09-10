@@ -1,5 +1,6 @@
 param(
     [string]$Python = "python",
+    [switch]$DevOnly,
     [string]$PyOpenJTalkVersion,
     [string]$FugashiVersion,
     [string]$UniDicPackageVersion,
@@ -160,10 +161,29 @@ if (-not [string]::IsNullOrWhiteSpace($UniDicSource)) {
         & cmd.exe /d /c rmdir "$dicDir"
         if ($LASTEXITCODE -ne 0) { throw "temporary UniDic dictionary junction removal failed with exit code $LASTEXITCODE" }
     }
-    Set-UniDicFrozenDictionaryLocation $EnvPython
+    if (-not $DevOnly) { Set-UniDicFrozenDictionaryLocation $EnvPython }
     Remove-Item -LiteralPath $BundledDictionary -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $BundledDictionary | Out-Null
-    Copy-Item -Path (Join-Path $UniDicSource "*") -Destination $BundledDictionary -Recurse -Force
+    Get-ChildItem -LiteralPath $UniDicSource -Recurse -Force | ForEach-Object {
+        $relative = $_.FullName.Substring($UniDicSource.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
+        $destination = Join-Path $BundledDictionary $relative
+        if ($_.PSIsContainer) {
+            New-Item -ItemType Directory -Force -Path $destination | Out-Null
+        } else {
+            $parent = Split-Path -Parent $destination
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            try {
+                New-Item -ItemType HardLink -Path $destination -Target $_.FullName -ErrorAction Stop | Out-Null
+            } catch {
+                Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
+            }
+        }
+    }
+}
+
+if ($DevOnly) {
+    Write-Host "TANREN development language runtime is ready."
+    exit 0
 }
 
 New-Item -ItemType Directory -Force $Output | Out-Null

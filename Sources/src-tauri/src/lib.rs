@@ -14,7 +14,9 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, Mutex,
 };
-use std::{path::{Path, PathBuf}, process::Command};
+use std::path::{Path, PathBuf};
+#[cfg(debug_assertions)]
+use std::process::Command;
 
 use db::Database;
 use grading::grade_form_with_reading;
@@ -768,7 +770,7 @@ fn observed_sidecar_progress(sources: &Path, floor: u8) -> u8 {
 }
 
 #[cfg(debug_assertions)]
-fn run_dev_dependency_sync(script_name: &str, progress: &AtomicU8, phase: &AtomicU8) -> Result<(), String> {
+fn run_dev_dependency_sync(script_name: &str, script_args: &[&str], progress: &AtomicU8, phase: &AtomicU8) -> Result<(), String> {
     let sources = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| "TANREN source directory could not be resolved".to_string())?
@@ -789,7 +791,11 @@ fn run_dev_dependency_sync(script_name: &str, progress: &AtomicU8, phase: &Atomi
     let mut command = Command::new("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&script)
+        .arg(&script);
+    for arg in script_args {
+        command.arg(arg);
+    }
+    command
         .env("TANREN_PROGRESS_FILE", &progress_file)
         .env("TANREN_PHASE_FILE", &phase_file)
         .stdin(std::process::Stdio::null());
@@ -865,12 +871,12 @@ async fn startup_dependency_preflight(state: State<'_, AppState>) -> Result<(), 
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(debug_assertions)]
         {
-            if let Err(error) = run_dev_dependency_sync("sync_sidecar.ps1", &language_download_progress, &language_sync_phase) {
+            if let Err(error) = run_dev_dependency_sync("sync_sidecar.ps1", &["-DevOnly"], &language_download_progress, &language_sync_phase) {
                 eprintln!("TANREN language dependency sync skipped: {error}");
                 language_download_progress.store(100, Ordering::Release);
                 language_sync_phase.store(2, Ordering::Release);
             }
-            if let Err(error) = run_dev_dependency_sync("sync_hechima.ps1", &input_download_progress, &input_sync_phase) {
+            if let Err(error) = run_dev_dependency_sync("sync_hechima.ps1", &[], &input_download_progress, &input_sync_phase) {
                 eprintln!("TANREN input dependency sync skipped: {error}");
                 input_download_progress.store(100, Ordering::Release);
                 input_sync_phase.store(2, Ordering::Release);
