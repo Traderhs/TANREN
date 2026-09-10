@@ -459,7 +459,10 @@ impl SemanticGrader {
 
     pub fn precompute_documents(&self, texts: &[String]) -> Result<(), String> {
         let normalized = normalized_unique(texts.iter());
-        self.document_embeddings(&normalized).map(|_| ())
+        for batch in normalized.chunks(32) {
+            self.document_embeddings(batch)?;
+        }
+        Ok(())
     }
 
     fn document_embeddings(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
@@ -762,6 +765,20 @@ mod tests {
         assert_eq!(grader.grade_reading(&entry(), "앞날", &["앞날".into()], &[], "ko-KR", "ja-JP").decision, GradeDecision::Pass);
         assert_eq!(grader.grade_reading(&entry(), "과거", &[], &["과거".into()], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn bulk_precompute_batches_and_preserves_cached_vectors() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let grader = grader(backend.clone());
+        let texts: Vec<_> = (0..9000).map(|index| format!("meaning {index}")).collect();
+        grader.precompute_documents(&texts).unwrap();
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 9000usize.div_ceil(32));
+        let cached = grader.document_embeddings(&texts).unwrap();
+        assert_eq!(cached.len(), 9000);
+        assert!(cached.iter().all(|value| value == &vec![0.0, 0.0, 0.0, 1.0]));
+        grader.precompute_documents(&texts).unwrap();
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 9000usize.div_ceil(32));
     }
 
     #[test]

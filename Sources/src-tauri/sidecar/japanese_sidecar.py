@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import copy
+import hashlib
+import shutil
 import io
 import os
 import re
@@ -680,13 +683,14 @@ def synthesize_voicevox(
     path: str,
     speed_scale: float = 1.0,
     pitch_scale: float = 0.0,
+    source_query: dict[str, Any] | None = None,
 ) -> None:
     if valid_wav(path):
         return
     # Let the text frontend resolve Japanese long vowels and devoicing. Forcing
     # katakana can turn e.g. おはよう's final long /o/ into a separate /u/.
     reading_text = hira(reading)
-    query = voicevox_request(base_url, "/audio_query", {"text": reading_text, "speaker": speaker_id})
+    query = copy.deepcopy(source_query) if source_query is not None else voicevox_request(base_url, "/audio_query", {"text": reading_text, "speaker": speaker_id})
     if accent_type is not None:
         nucleus = accent_type if accent_type > 0 else len(expected_morae)
         # Preserve the text frontend's devoicing and phoneme realization whenever
@@ -749,6 +753,7 @@ def generate_voicevox_assets(
     expected_morae: list[str],
     accent_type: int | None,
     audio_dir: str,
+    shared_cache_dir: str | None = None,
 ) -> list[dict[str, Any]]:
     profiles, version = voicevox_metadata(base_url)
     paths = {
@@ -757,13 +762,44 @@ def generate_voicevox_assets(
         )
         for profile in profiles
     }
+    cached_paths = {}
+    if shared_cache_dir:
+        os.makedirs(shared_cache_dir, exist_ok=True)
+        for profile in profiles:
+            identity = json.dumps([VOICE_AUDIO_REVISION, version, reading, expected_morae,
+                                   accent_type, profile], ensure_ascii=False, sort_keys=True)
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            cached_paths[profile["voice_profile"]] = os.path.join(shared_cache_dir, digest + ".wav")
     expected_paths = {
         os.path.normcase(os.path.abspath(path))
         for path in paths.values()
     }
 
+    # Lexical synthesis replaces all speaker-dependent mora data below. The
+    # text frontend and query envelope can therefore be shared across voices.
+    # Native phrase/sentence queries retain their existing per-speaker path.
+    source_query = None
+    missing_profiles = [profile for profile in profiles if not valid_wav(paths[profile["voice_profile"]])]
+    synthesis_profiles = [profile for profile in missing_profiles
+                          if not valid_wav(cached_paths.get(profile["voice_profile"], ""))]
+    if synthesis_profiles and accent_type is not None:
+        try:
+            source_query = voicevox_request(base_url, "/audio_query", {
+                "text": hira(reading), "speaker": synthesis_profiles[0]["speaker_id"],
+            })
+        except Exception:
+            # Preserve the scheduler's per-profile retries if preparation fails.
+            source_query = None
+
     def synthesize_profile(profile: dict[str, Any]) -> dict[str, Any]:
         path = paths[profile["voice_profile"]]
+        cached_path = cached_paths.get(profile["voice_profile"])
+        if not valid_wav(path) and cached_path and valid_wav(cached_path):
+            os.makedirs(audio_dir, exist_ok=True)
+            # Entry files stay independent: pronunciation edits and deletion
+            # cannot change another entry's cached waveform.
+            shutil.copyfile(cached_path, path + ".partial")
+            os.replace(path + ".partial", path)
         synthesize_voicevox(
             base_url,
             reading,
@@ -773,7 +809,20 @@ def generate_voicevox_assets(
             path,
             float(profile.get("speed_scale", 1.0)),
             float(profile.get("pitch_scale", 0.0)),
+            source_query,
         )
+        if cached_path and not valid_wav(cached_path):
+            # The producer always replaces WAVs atomically; linking this first
+            # immutable result avoids storing a second copy of unique audio.
+            try:
+                os.link(path, cached_path)
+            except FileExistsError:
+                if not valid_wav(cached_path):
+                    shutil.copyfile(path, cached_path + ".partial")
+                    os.replace(cached_path + ".partial", cached_path)
+            except OSError:
+                shutil.copyfile(path, cached_path + ".partial")
+                os.replace(cached_path + ".partial", cached_path)
         accent_identity = str(accent_type) if accent_type is not None else "native"
         return {
             "cache_key": f"voicevox:{VOICE_AUDIO_REVISION}:{version}:{reading}:{accent_identity}:{profile['voice_profile']}:{profile['speaker_id']}",
@@ -788,13 +837,12 @@ def generate_voicevox_assets(
             "age_basis": profile.get("age_basis", "character_or_voice_profile"),
         }
 
-    missing_profiles = [
-        profile for profile in profiles
-        if not valid_wav(paths[profile["voice_profile"]])
-    ]
-    if missing_profiles:
-        _TTS_SCHEDULER.map(missing_profiles, synthesize_profile)
-    assets = [synthesize_profile(profile) for profile in profiles]
+    generated = dict(zip(
+        (profile["voice_profile"] for profile in missing_profiles),
+        _TTS_SCHEDULER.map(missing_profiles, synthesize_profile),
+    ))
+    assets = [generated[profile["voice_profile"]] if profile["voice_profile"] in generated
+              else synthesize_profile(profile) for profile in profiles]
     if os.path.isdir(audio_dir):
         for name in os.listdir(audio_dir):
             stale = os.path.join(audio_dir, name)
@@ -889,6 +937,7 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
             mora_list,
             accent_types[0] if accent_types else None,
             str(audio_dir),
+            shared_cache_dir=os.path.join(os.path.dirname(os.path.abspath(str(audio_dir))), ".voicevox-cache"),
         )
     return {
         "normalized_text": text,

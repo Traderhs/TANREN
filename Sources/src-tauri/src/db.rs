@@ -432,6 +432,10 @@ impl Database {
               updated_at TEXT NOT NULL
             );
 
+            CREATE INDEX IF NOT EXISTS idx_entries_import ON entries(deck_id,term,meanings,COALESCE(reading,'')) WHERE deleted_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_entries_deck_position ON entries(deck_id,position);
+            CREATE INDEX IF NOT EXISTS idx_attempts_deck_entry ON attempts(deck_id,entry_id);
+
             CREATE TABLE IF NOT EXISTS app_settings (
               key TEXT PRIMARY KEY,
               value TEXT NOT NULL,
@@ -615,45 +619,41 @@ impl Database {
     }
 
     pub fn stage_schedule_summary(&self, deck_id: &str, stage: u32) -> Result<StageScheduleSummary, String> {
+        self.stage_schedule_summaries(deck_id, &[stage])?.pop().ok_or("존재하지 않는 단계예요".into())
+    }
+
+    pub fn stage_schedule_summaries(&self, deck_id: &str, stages: &[u32]) -> Result<Vec<StageScheduleSummary>, String> {
         let deck = self.deck(deck_id)?;
-        let slots = if let Some(slots) = self.load_stage_schedule(deck_id, stage)? {
-            slots
-        } else {
-            let slots = self.effective_stage_slots(deck_id)?;
-            if stage_study_range(slots.len(), deck.increment_size, deck.checkpoint_size, stage).is_none() {
-            return Err("존재하지 않는 단계예요".into());
-            }
-            slots
-        };
-        let study_range = stage_study_range(slots.len(), deck.increment_size, deck.checkpoint_size, stage)
-            .ok_or("존재하지 않는 단계예요")?;
         let conn = self.conn()?;
-        let active: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM stage_states WHERE deck_id=?1 AND stage=?2)",
-            params![deck_id, stage as i64],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        let (clear_times_ms, clear_cycles): (Vec<u64>, Vec<u32>) = {
-            let mut stmt = conn.prepare(
-                "SELECT duration_ms,cycle_count FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at,id",
-            ).map_err(|e| e.to_string())?;
-            let rows = stmt.query_map(params![deck_id, stage as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            (
-                rows.iter().map(|(duration, _)| (*duration).max(0) as u64).collect(),
-                rows.iter().map(|(_, cycles)| (*cycles).max(1) as u32).collect(),
-            )
-        };
-        // The stage checkmark is historical: once a stage has been cleared at
-        // least once, starting another pass must not remove the ✓ indicator.
-        // is_stage_completed() intentionally remains stricter and answers
-        // whether the current schedule snapshot has been cleared.
-        let completed = !clear_times_ms.is_empty();
-        Ok(StageScheduleSummary { stage, study_range, completed, active, clear_times_ms, clear_cycles })
+        let mut fallback_count = None;
+        let mut summaries = Vec::with_capacity(stages.len());
+        let mut slots_query = conn.prepare("SELECT entry_slots_json FROM stage_schedules WHERE deck_id=?1 AND stage=?2").map_err(|e| e.to_string())?;
+        let mut active_query = conn.prepare("SELECT EXISTS(SELECT 1 FROM stage_states WHERE deck_id=?1 AND stage=?2)").map_err(|e| e.to_string())?;
+        let mut clears_query = conn.prepare("SELECT duration_ms,cycle_count FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at,id").map_err(|e| e.to_string())?;
+        for &stage in stages {
+            let raw: Option<String> = slots_query.query_row(params![deck_id, stage as i64], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
+            let slot_count = match raw {
+                Some(raw) => serde_json::from_str::<Vec<Option<String>>>(&raw).map_err(|e| e.to_string())?.len(),
+                None => match fallback_count {
+                    Some(count) => count,
+                    None => {
+                        let count = self.effective_stage_slots(deck_id)?.len();
+                        fallback_count = Some(count);
+                        count
+                    }
+                },
+            };
+            let study_range = stage_study_range(slot_count, deck.increment_size, deck.checkpoint_size, stage).ok_or("존재하지 않는 단계예요")?;
+            let active = active_query.query_row(params![deck_id, stage as i64], |row| row.get(0)).map_err(|e| e.to_string())?;
+            let clears = clears_query.query_map(params![deck_id, stage as i64], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+            let clear_times_ms: Vec<_> = clears.iter().map(|(duration, _)| (*duration).max(0) as u64).collect();
+            let clear_cycles = clears.iter().map(|(_, cycles)| (*cycles).max(1) as u32).collect();
+            // Completion remains historical even while another pass is active.
+            let completed = !clear_times_ms.is_empty();
+            summaries.push(StageScheduleSummary { stage, study_range, completed, active, clear_times_ms, clear_cycles });
+        }
+        Ok(summaries)
     }
 
     fn effective_stage_slots(&self, deck_id: &str) -> Result<Vec<Option<String>>, String> {
@@ -1899,6 +1899,40 @@ mod tests{
             |row| row.get(0),
         ).unwrap();
         assert_eq!(journal_attempts, 1);
+    }
+
+    #[test]
+    fn bulk_import_preserves_order_duplicates_and_queued_jobs() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("bulk", "ko-KR", "ja-JP").unwrap();
+        let drafts: Vec<_> = (0..9000).map(|index| EntryDraft {
+            term: format!("word {index}"), meanings: vec![format!("meaning {index}")], reading: None,
+        }).collect();
+        let started = std::time::Instant::now();
+        let (result, ids) = db.import_entries_tracked(&deck.id, "ja-JP", &drafts).unwrap();
+        eprintln!("9000 entry import: {:?}", started.elapsed());
+        assert_eq!(result, ImportResult { inserted: 9000, duplicates: 0 });
+        assert_eq!(ids.len(), 9000);
+        let stages: Vec<_> = (1..=db.total_stages(&deck.id).unwrap()).collect();
+        let started = std::time::Instant::now();
+        let summaries = db.stage_schedule_summaries(&deck.id, &stages).unwrap();
+        eprintln!("{} stage summaries: {:?}", summaries.len(), started.elapsed());
+        assert_eq!(summaries.len(), stages.len());
+        for summary in &summaries {
+            assert_eq!(serde_json::to_value(summary).unwrap(), serde_json::to_value(db.stage_schedule_summary(&deck.id, summary.stage).unwrap()).unwrap());
+        }
+
+        assert_eq!(db.enrichment_progress(&ids).unwrap(), (9000, 0, 0, None));
+        let entries = db.entries(&deck.id).unwrap();
+        assert_eq!(entries.iter().map(|entry| &entry.term).collect::<Vec<_>>(), drafts.iter().map(|draft| &draft.term).collect::<Vec<_>>());
+        assert_eq!(db.import_entries(&deck.id, "ja-JP", &drafts).unwrap(), ImportResult { inserted: 0, duplicates: 9000 });
+        let conn = db.conn().unwrap();
+        let plan: String = conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM entries WHERE deck_id=?1 AND term=?2 AND meanings=?3 AND COALESCE(reading,'')=COALESCE(?4,'') AND deleted_at IS NULL",
+            params![deck.id, "word 0", "[]", ""], |row| row.get(3),
+        ).unwrap();
+        assert!(plan.contains("idx_entries_import"), "{plan}");
     }
 
     #[test]
