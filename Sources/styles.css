@@ -6553,6 +6553,8 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
 .learning-answer-review .learning-user-answer.is-incorrect>strong { color: #d98787; }
 .learning-answer-review .learning-user-answer>strong.is-correct { color: #84c79b; }
 .learning-answer-review .learning-user-answer>strong.is-incorrect { color: #d98787; }
+.learning-answer-review .learning-meaning-grades>.is-correct { color: #84c79b; }
+.learning-answer-review .learning-meaning-grades>.is-incorrect { color: #d98787; }
 .learning-answer-review .learning-correct-answer>strong { max-width: 100%; font-size: 26px; overflow-wrap: anywhere; }
 .learning-adjudication .learning-feedback-actions {
   width: auto;

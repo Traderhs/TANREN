@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use db::Database;
-use grading::grade_form_with_reading;
+use grading::{grade_form_with_reading, normalize_generic, split_reading_answer};
 use japanese::{JapaneseAnalyzer, VOICE_AUDIO_REVISION};
 use model::{
-    DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
-    PitchQuestion, StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
+    AdjudicationPrompt, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
+    MeaningGrade, PitchQuestion, StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
 };
 use rand::random;
 use study::{PendingState, StudySession};
@@ -338,38 +338,38 @@ fn submit_answer(
     let answer_trimmed = answer.trim_matches(|c: char| c.is_whitespace() || c == '\u{3000}');
     let meaning_trimmed = meaning_answer.trim_matches(|c: char| c.is_whitespace() || c == '\u{3000}');
     if answer_trimmed.is_empty() || (is_listening && meaning_trimmed.is_empty()) {
-        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "manual_unknown", FailureType::ManualUnknown, None);
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "manual_unknown", FailureType::ManualUnknown, None, None);
     }
     if recall_latency_ms > deck.recall_timeout_by_mode.for_mode(variant.mode) {
-        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "recall_timeout", FailureType::RecallTimeout, None);
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "recall_timeout", FailureType::RecallTimeout, None, None);
     }
 
     let input_language = variant.mode.answer_language(&deck.source_language, &deck.target_language).to_string();
     let profile = state.db.typing_profile(&deck.id, &input_language, variant.mode)?;
     let max_gap = interkey_gaps_ms.iter().copied().max().unwrap_or(0);
     if profile.completion_timed_out(max_gap) {
-        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None);
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None);
     }
     if is_listening {
         let meaning_profile = state.db.typing_profile(&deck.id, &deck.source_language, variant.mode)?;
         let meaning_max_gap = meaning_interkey_gaps_ms.iter().copied().max().unwrap_or(0);
         if meaning_profile.completion_timed_out(meaning_max_gap) {
-            return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None);
+            return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None);
         }
     }
 
     let (accepted, rejected) = state.db.aliases(&entry.id)?;
     let mut answer_failure = FailureType::WrongAnswer;
-    let outcome = match variant.mode {
-        StudyMode::Reading => state.semantic.grade_reading(&entry, &answer, &accepted, &rejected, &deck.source_language, &deck.target_language),
+    let (outcome, meaning_adjudications) = match variant.mode {
+        StudyMode::Reading => state.semantic.grade_reading_with_adjudications(&entry, &answer, &accepted, &rejected, &deck.source_language, &deck.target_language),
         StudyMode::Writing => {
             let orthographic_reading = state.db.japanese_orthographic_reading(&entry.id)?;
-            grade_form_with_reading(&entry, &answer, deck.strict_orthography, orthographic_reading.as_deref())
+            (grade_form_with_reading(&entry, &answer, deck.strict_orthography, orthographic_reading.as_deref()), Vec::new())
         }
         StudyMode::Listening => {
             let orthographic_reading = state.db.japanese_orthographic_reading(&entry.id)?;
             let form = grade_form_with_reading(&entry, &answer, deck.strict_orthography, orthographic_reading.as_deref());
-            let meaning = state.semantic.grade_reading(
+            let (meaning, adjudications) = state.semantic.grade_reading_with_adjudications(
                 &entry,
                 &meaning_answer,
                 &accepted,
@@ -379,16 +379,24 @@ fn submit_answer(
             );
             let (combined, failure) = combine_listening_outcomes(form, meaning);
             answer_failure = failure;
-            combined
+            (combined, adjudications)
         }
     };
     match outcome.decision {
         GradeDecision::Fail => fail_base(
             &state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms,
-            outcome.method, answer_failure, outcome.score,
+            outcome.method, answer_failure, outcome.score, None,
         ),
         GradeDecision::Ambiguous => {
             let pending_answer = if is_listening { stored_answer.clone() } else { answer.clone() };
+            let adjudication_total = meaning_adjudications.len();
+            let adjudications = meaning_adjudications.into_iter().enumerate().map(|(index, item)| AdjudicationPrompt {
+                canonical_answer: item.canonical_answer,
+                submitted_answer: item.submitted_answer,
+                current: index + 1,
+                total: adjudication_total,
+            }).collect::<Vec<_>>();
+            let current_adjudication = adjudications.first().cloned();
             session.pending = Some(PendingState::Ambiguous {
                 variant,
                 answer: pending_answer,
@@ -401,15 +409,21 @@ fn submit_answer(
                 meaning_ime_composition_ms,
                 method: outcome.method.into(),
                 score: outcome.score,
+                adjudications,
+                adjudication_index: 0,
+                adjudication_rejected: false,
+                adjudication_rejected_answers: Vec::new(),
             });
             state.db.save_session(session)?;
             Ok(SubmitResult {
                 status: SubmitStatus::Ambiguous,
-            message: Some("이 답은 직접 판정이 필요해요".into()),
+                message: Some("이 답은 직접 판정이 필요해요".into()),
                 failure_type: None,
                 canonical_answer: Some(entry.meanings.join(" / ")),
                 reading: entry.reading,
                 pitch: None,
+                adjudication: current_adjudication,
+                meaning_grades: None,
                 card: None,
             })
         }
@@ -432,12 +446,12 @@ fn submit_answer(
                 pitch.is_none(), outcome.method, outcome.score, recall_latency_ms, attempt_typing_duration_ms, None,
             )?;
             if let Some(question) = pitch {
-                session.pending = Some(PendingState::Pitch { variant, question: question.clone() });
+                session.pending = Some(PendingState::Pitch { variant, question: question.clone(), meaning_grades: None });
                 state.db.save_session(session)?;
                 Ok(SubmitResult {
                     status: SubmitStatus::Pitch, message: None, failure_type: None,
                     canonical_answer: Some(entry.term.clone()), reading: entry.reading,
-                    pitch: Some(question), card: None,
+                    pitch: Some(question), adjudication: None, meaning_grades: None, card: None,
                 })
             } else {
                 session.resolve_current(&variant, true)?;
@@ -477,7 +491,7 @@ fn timeout_current(
     } else {
         answer
     };
-    fail_base(&state.db, &mut engine, variant, &entry, stored_answer, elapsed_ms, typing_duration_ms, method, failure, None)
+    fail_base(&state.db, &mut engine, variant, &entry, stored_answer, elapsed_ms, typing_duration_ms, method, failure, None, None)
 }
 
 #[tauri::command]
@@ -497,6 +511,10 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
         meaning_ime_composition_ms,
         method,
         score,
+        adjudications,
+        adjudication_index,
+        adjudication_rejected,
+        adjudication_rejected_answers,
     } = pending else {
         unreachable!();
     };
@@ -515,6 +533,59 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
     };
     let deck = state.db.deck(&session.deck_id)?;
     let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
+
+    let mut rejected_answers = adjudication_rejected_answers;
+    let accept = if adjudications.is_empty() {
+        accept
+    } else {
+        if !accept {
+            if let Some(current) = adjudications.get(adjudication_index) {
+                if !rejected_answers.iter().any(|value| normalize_generic(value) == normalize_generic(&current.submitted_answer)) {
+                    rejected_answers.push(current.submitted_answer.clone());
+                }
+            }
+        }
+        let rejected = adjudication_rejected || !accept;
+        let next_index = adjudication_index + 1;
+        if next_index < adjudications.len() {
+            let next = adjudications[next_index].clone();
+            session.pending = Some(PendingState::Ambiguous {
+                variant: variant.clone(),
+                answer: stored_answer.clone(),
+                recall_latency_ms,
+                typing_duration_ms,
+                interkey_gaps_ms,
+                ime_composition_ms,
+                meaning_typing_duration_ms,
+                meaning_interkey_gaps_ms,
+                meaning_ime_composition_ms,
+                method,
+                score,
+                adjudications,
+                adjudication_index: next_index,
+                adjudication_rejected: rejected,
+                adjudication_rejected_answers: rejected_answers,
+            });
+            state.db.save_session(session)?;
+            return Ok(SubmitResult {
+                status: SubmitStatus::Ambiguous,
+                message: Some("이 답은 직접 판정이 필요해요".into()),
+                failure_type: None,
+                canonical_answer: Some(entry.meanings.join(" / ")),
+                reading: entry.reading,
+                pitch: None,
+                adjudication: Some(next),
+                meaning_grades: None,
+                card: None,
+            });
+        }
+        !rejected
+    };
+
+    let meaning_grades = (!adjudications.is_empty())
+        .then(|| meaning_grades_for_adjudication(&answer, entry.meanings.len(), &rejected_answers))
+        .flatten();
+
     state.db.set_alias(&entry.id, &answer, accept)?;
     start_semantic_precompute(Arc::clone(&state.semantic), vec![answer.clone()]);
     if !accept {
@@ -523,7 +594,10 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
         } else {
             FailureType::GradingRejected
         };
-        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, &method, failure, score);
+        return fail_base(
+            &state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms,
+            &method, failure, score, meaning_grades,
+        );
     }
 
     if is_listening {
@@ -544,12 +618,13 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
         pitch.is_none(), "manual_adjudication_accept", score, recall_latency_ms, attempt_typing_duration_ms, None,
     )?;
     if let Some(question) = pitch {
-        session.pending = Some(PendingState::Pitch { variant, question: question.clone() });
+        session.pending = Some(PendingState::Pitch { variant, question: question.clone(), meaning_grades: meaning_grades.clone() });
         state.db.save_session(session)?;
-        Ok(SubmitResult { status: SubmitStatus::Pitch, message: None, failure_type: None, canonical_answer: Some(entry.term.clone()), reading: entry.reading, pitch: Some(question), card: None })
+        Ok(SubmitResult { status: SubmitStatus::Pitch, message: None, failure_type: None, canonical_answer: Some(entry.term.clone()), reading: entry.reading, pitch: Some(question), adjudication: None, meaning_grades, card: None })
     } else {
         session.resolve_current(&variant, true)?;
-        let result = review_result(&entry, None, "정답으로 기억했어요");
+        let mut result = review_result(&entry, None, "정답으로 기억했어요");
+        result.meaning_grades = meaning_grades;
         session.pending = Some(PendingState::Review { variant, result: result.clone() });
         state.db.save_session(session)?;
         Ok(result)
@@ -570,9 +645,9 @@ fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let pending = session.pending.clone().ok_or("no pitch question is pending")?;
-    let (variant, question, correction_failure) = match pending {
-        PendingState::Pitch { variant, question } => (variant, question, None),
-        PendingState::PitchCorrection { variant, question, failure } => (variant, question, Some(failure)),
+    let (variant, question, correction_failure, meaning_grades) = match pending {
+        PendingState::Pitch { variant, question, meaning_grades } => (variant, question, None, meaning_grades),
+        PendingState::PitchCorrection { variant, question, failure, meaning_grades } => (variant, question, Some(failure), meaning_grades),
         _ => return Err("current state is not pitch grading".into()),
     };
     if variant.id() != variant_id {
@@ -583,11 +658,12 @@ fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8
 
     if let Some(failure) = correction_failure {
         session.resolve_current(&variant, false)?;
-        let result = review_result(
+        let mut result = review_result(
             &entry,
             Some(&failure),
         "오답이에요 방금 피치는 연습용이며 피치 정확도에 포함되지 않아요",
         );
+        result.meaning_grades = meaning_grades;
         session.pending = Some(PendingState::Review { variant, result: result.clone() });
         state.db.save_session(session)?;
         return Ok(result);
@@ -598,11 +674,12 @@ fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8
         &session.deck_id, &entry.id, variant.mode, correct, !failed_gate,
         failed_gate.then_some(FailureType::PitchWrong.as_str()),
     )?;
-    let result = review_result(
+    let mut result = review_result(
         &entry,
         failed_gate.then_some(FailureType::PitchWrong.as_str()),
         if correct { "피치도 맞았어요" } else if question.gate_enabled { "피치가 달라요 이 문제는 다시 나와요" } else { "참고 피치와 달라요 정답 처리는 그대로예요" },
     );
+    result.meaning_grades = meaning_grades;
     session.pending = Some(PendingState::Review { variant, result: result.clone() });
     state.db.save_session(session)?;
     Ok(result)
@@ -637,6 +714,8 @@ fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
             canonical_answer: None,
             reading: None,
             pitch: None,
+            adjudication: None,
+            meaning_grades: None,
             card: Some(card),
         });
     }
@@ -1042,6 +1121,7 @@ fn fail_base(
     grading_method: &str,
     failure: FailureType,
     score: Option<f64>,
+    meaning_grades: Option<Vec<MeaningGrade>>,
 ) -> Result<SubmitResult, String> {
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let stage = session.range().label.clone();
@@ -1055,6 +1135,7 @@ fn fail_base(
             variant,
             question: question.clone(),
             failure: failure.as_str().to_string(),
+            meaning_grades: meaning_grades.clone(),
         });
         db.save_session(session)?;
         return Ok(SubmitResult {
@@ -1064,11 +1145,14 @@ fn fail_base(
             canonical_answer: Some(entry.term.clone()),
             reading: entry.reading.clone(),
             pitch: Some(question),
+            adjudication: None,
+            meaning_grades,
             card: None,
         });
     }
     session.resolve_current(&variant, false)?;
-    let result = review_result(entry, Some(failure.as_str()), "정답을 보고 다음 문제로 넘어가세요");
+    let mut result = review_result(entry, Some(failure.as_str()), "정답을 보고 다음 문제로 넘어가세요");
+    result.meaning_grades = meaning_grades;
     session.pending = Some(PendingState::Review { variant, result: result.clone() });
     db.save_session(session)?;
     Ok(result)
@@ -1080,6 +1164,18 @@ fn listening_response_text(form_answer: &str, meaning_answer: &str) -> String {
 
 fn listening_response_parts(answer: &str) -> Result<(&str, &str), String> {
     answer.split_once('\n').ok_or_else(|| "invalid listening response payload".into())
+}
+
+fn meaning_grades_for_adjudication(answer: &str, expected_count: usize, rejected_answers: &[String]) -> Option<Vec<MeaningGrade>> {
+    let parts = split_reading_answer(answer, expected_count);
+    if parts.len() != expected_count { return None; }
+    Some(parts.into_iter().map(|submitted_answer| {
+        let normalized = normalize_generic(&submitted_answer);
+        MeaningGrade {
+            correct: !rejected_answers.iter().any(|value| normalize_generic(value) == normalized),
+            submitted_answer,
+        }
+    }).collect())
 }
 
 fn combine_listening_outcomes(
@@ -1120,6 +1216,8 @@ fn review_result(entry: &EntryRecord, failure: Option<&str>, message: &str) -> S
         canonical_answer: Some(format!("{}  ·  {}", entry.term, entry.meanings.join(" / "))),
         reading: entry.reading.clone(),
         pitch: None,
+        adjudication: None,
+        meaning_grades: None,
         card: None,
     }
 }
@@ -1131,7 +1229,7 @@ fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Res
     session.pending = None;
     let card = build_card(state, session, &variant)?;
     state.db.save_session(session)?;
-    Ok(SubmitResult { status, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, card: Some(card) })
+    Ok(SubmitResult { status, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, adjudication: None, meaning_grades: None, card: Some(card) })
 }
 
 fn complete_current_stage(state: &AppState, engine: &mut Engine) -> Result<SubmitResult, String> {
@@ -1195,20 +1293,22 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
     }
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     match session.pending.clone() {
-        Some(PendingState::Ambiguous { variant, .. }) => {
+        Some(PendingState::Ambiguous { variant, adjudications, adjudication_index, .. }) => {
             let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
             let card = build_card(state, session, &variant)?;
             Ok(SubmitResult {
                 status: SubmitStatus::Ambiguous,
-            message: Some("이 답은 직접 판정이 필요해요".into()),
+                message: Some("이 답은 직접 판정이 필요해요".into()),
                 failure_type: None,
                 canonical_answer: Some(entry.meanings.join(" / ")),
                 reading: entry.reading,
                 pitch: None,
+                adjudication: adjudications.get(adjudication_index).cloned(),
+                meaning_grades: None,
                 card: Some(card),
             })
         }
-        Some(PendingState::Pitch { variant, question }) => {
+        Some(PendingState::Pitch { variant, question, meaning_grades }) => {
             let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
             let card = build_card(state, session, &variant)?;
             Ok(SubmitResult {
@@ -1218,10 +1318,12 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 canonical_answer: Some(entry.term.clone()),
                 reading: entry.reading,
                 pitch: Some(question),
+                adjudication: None,
+                meaning_grades,
                 card: Some(card),
             })
         }
-        Some(PendingState::PitchCorrection { variant, question, failure }) => {
+        Some(PendingState::PitchCorrection { variant, question, failure, meaning_grades }) => {
             let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
             let card = build_card(state, session, &variant)?;
             Ok(SubmitResult {
@@ -1231,6 +1333,8 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 canonical_answer: Some(entry.term.clone()),
                 reading: entry.reading,
                 pitch: Some(question),
+                adjudication: None,
+                meaning_grades,
                 card: Some(card),
             })
         }
@@ -1244,6 +1348,8 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 canonical_answer: None,
                 reading: None,
                 pitch: None,
+                adjudication: None,
+                meaning_grades: None,
                 card: Some(card),
             })
         }
@@ -1257,7 +1363,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
         None => {
             if let Some(variant) = session.current.clone() {
                 let card = build_card(state, session, &variant)?;
-                Ok(SubmitResult { status: SubmitStatus::Pass, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, card: Some(card) })
+                Ok(SubmitResult { status: SubmitStatus::Pass, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, adjudication: None, meaning_grades: None, card: Some(card) })
             } else {
                 next_card(state, engine, SubmitStatus::Pass)
             }
@@ -1607,6 +1713,10 @@ mod state_tests {
             meaning_ime_composition_ms: 0,
             method: "semantic".into(),
             score: Some(0.5),
+            adjudications: Vec::new(),
+            adjudication_index: 0,
+            adjudication_rejected: false,
+            adjudication_rejected_answers: Vec::new(),
         }
     }
 
@@ -1626,6 +1736,17 @@ mod state_tests {
         let pending = Some(ambiguous("보존할 답"));
         assert_eq!(ambiguous_for_adjudication(&pending, "other:reading").unwrap_err(), "stale adjudication");
         assert!(matches!(pending, Some(PendingState::Ambiguous { ref answer, .. }) if answer == "보존할 답"));
+    }
+
+    #[test]
+    fn adjudicated_multiple_meanings_keep_individual_review_colors() {
+        let rejected = vec!["들어올리다".to_string()];
+        let grades = meaning_grades_for_adjudication("가져오다 들어올리다", 2, &rejected).unwrap();
+        assert_eq!(grades.len(), 2);
+        assert_eq!(grades[0].submitted_answer, "가져오다");
+        assert!(grades[0].correct);
+        assert_eq!(grades[1].submitted_answer, "들어올리다");
+        assert!(!grades[1].correct);
     }
 
     #[test]

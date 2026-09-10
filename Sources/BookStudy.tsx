@@ -1006,6 +1006,8 @@ export function BookStudy({
       ?? null
     : null;
   const submittedAnswerCorrect = !result.failure_type || result.failure_type === "PITCH_WRONG";
+  const meaningGrades = result.meaning_grades ?? [];
+  const hasMeaningGrades = meaningGrades.length > 0;
   const listeningFormCorrect = card?.mode === "listening"
     ? !result.failure_type || result.failure_type === "PITCH_WRONG" || result.failure_type === "LISTENING_MEANING_WRONG"
       ? true
@@ -1024,9 +1026,11 @@ export function BookStudy({
     : null;
   const submittedAnswerLabel = card?.mode === "listening"
     ? ambiguous
-      ? meaningAnswer.trim()
+      ? result.adjudication?.submitted_answer ?? meaningAnswer.trim()
       : [answer.trim(), meaningAnswer.trim()].filter(Boolean).join("  ·  ")
-    : answer.trim();
+    : ambiguous && result.adjudication
+      ? result.adjudication.submitted_answer
+      : answer.trim();
   const reviewAnswer = card ? reviewAnswerForMode(card.mode, result.canonical_answer) : result.canonical_answer ?? "";
   const listeningReviewMeaning = card?.mode === "listening"
     ? reviewAnswerForMode("reading", result.canonical_answer)
@@ -1310,7 +1314,7 @@ export function BookStudy({
           </div>
           <div className={`learning-review-result-stack ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
             <div className={`learning-answer-comparison ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
-              <div className="learning-correct-answer"><span>기준 답</span><strong>{result.canonical_answer}</strong></div>
+              <div className="learning-correct-answer"><span>{result.adjudication ? `기준 답 ${result.adjudication.current}/${result.adjudication.total}` : "기준 답"}</span><strong>{result.adjudication?.canonical_answer ?? result.canonical_answer}</strong></div>
               {submittedAnswerKnown && <div className="learning-user-answer"><span>응답</span><strong>{submittedAnswerLabel}</strong></div>}
             </div>
           </div>
@@ -1334,12 +1338,16 @@ export function BookStudy({
                   <strong lang={deck.source_language}>{listeningReviewMeaning}</strong>
                 </> : <strong lang={card?.mode === "reading" ? deck.source_language : deck.target_language}>{reviewAnswer}</strong>}
               </div>
-              {submittedAnswerKnown && <div className={`learning-user-answer ${card?.mode === "listening" ? "" : submittedAnswerCorrect ? "is-correct" : "is-incorrect"}`}>
+              {submittedAnswerKnown && <div className={`learning-user-answer ${card?.mode === "listening" || hasMeaningGrades ? "" : submittedAnswerCorrect ? "is-correct" : "is-incorrect"}`}>
                 <span>응답</span>
                 {card?.mode === "listening" ? <>
                   <strong className={listeningFormCorrect ? "is-correct" : "is-incorrect"} lang={deck.target_language}>{answer.trim()}</strong>
-                  <strong className={listeningMeaningCorrect == null ? "" : listeningMeaningCorrect ? "is-correct" : "is-incorrect"} lang={deck.source_language}>{meaningAnswer.trim()}</strong>
-                </> : <strong>{submittedAnswerLabel}</strong>}
+                  {hasMeaningGrades
+                    ? <strong className="learning-meaning-grades" lang={deck.source_language}>{meaningGrades.map((item, index) => <span className={item.correct ? "is-correct" : "is-incorrect"} key={`${item.submitted_answer}-${index}`}>{index > 0 && " "}{item.submitted_answer}</span>)}</strong>
+                    : <strong className={listeningMeaningCorrect == null ? "" : listeningMeaningCorrect ? "is-correct" : "is-incorrect"} lang={deck.source_language}>{meaningAnswer.trim()}</strong>}
+                </> : hasMeaningGrades
+                  ? <strong className="learning-meaning-grades">{meaningGrades.map((item, index) => <span className={item.correct ? "is-correct" : "is-incorrect"} key={`${item.submitted_answer}-${index}`}>{index > 0 && " "}{item.submitted_answer}</span>)}</strong>
+                  : <strong>{submittedAnswerLabel}</strong>}
               </div>}
             </div>
             {submittedPitch && submittedPitchQuestion && expectedPitch && <div className="learning-pitch-review">
