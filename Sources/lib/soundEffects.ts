@@ -25,13 +25,14 @@ function playSample(src: string, masterVolume: number, options: SampleOptions) {
     audio.preload = "auto";
     audio.volume = clamp01(masterVolume * options.volume) * 0.5;
     audio.playbackRate = options.playbackRate ?? 1;
-    void audio.play().catch(() => undefined);
-    if (options.stopAfterMs) {
-      window.setTimeout(() => {
-        audio.pause();
-        audio.currentTime = 0;
-      }, options.stopAfterMs);
-    }
+    void audio.play().then(() => {
+      if (options.stopAfterMs) {
+        window.setTimeout(() => {
+          audio.pause();
+          audio.currentTime = 0;
+        }, options.stopAfterMs);
+      }
+    }).catch(() => undefined);
   };
 
   if (options.delayMs) window.setTimeout(play, options.delayMs);
