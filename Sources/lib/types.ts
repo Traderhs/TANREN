@@ -83,6 +83,16 @@ export interface SubmitResult {
   canonical_answer?: string | null;
   reading?: string | null;
   pitch?: PitchQuestion | null;
+  adjudication?: {
+    canonical_answer: string;
+    submitted_answer: string;
+    current: number;
+    total: number;
+  } | null;
+  meaning_grades?: Array<{
+    submitted_answer: string;
+    correct: boolean;
+  }> | null;
   card?: StudyCard | null;
 }
 

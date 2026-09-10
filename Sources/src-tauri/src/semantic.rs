@@ -60,6 +60,12 @@ pub trait SemanticRelationBackend: Send + Sync {
     fn status(&self) -> RelationRuntimeStatus;
 }
 
+#[derive(Debug, Clone)]
+pub struct MeaningAdjudication {
+    pub canonical_answer: String,
+    pub submitted_answer: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SemanticThresholds {
     pub pass: f64,
@@ -171,13 +177,22 @@ impl SemanticGrader {
     }
 
     pub fn grade_reading(&self, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String], answer_language: &str, expression_language: &str) -> GradeOutcome {
+        self.grade_reading_with_adjudications(entry, answer, accepted, rejected, answer_language, expression_language).0
+    }
+
+    pub fn grade_reading_with_adjudications(&self, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String], answer_language: &str, expression_language: &str) -> (GradeOutcome, Vec<MeaningAdjudication>) {
         if let Some(outcome) = grade_reading_deterministic(entry, answer, accepted, rejected) {
-            return outcome;
+            return (outcome, Vec::new());
         }
 
         if entry.meanings.len() > 1 {
-            return self.grade_multiple_meanings(entry, answer);
+            return self.grade_multiple_meanings(entry, answer, answer_language, expression_language);
         }
+
+        (self.grade_single_meaning(entry, answer, accepted, rejected, answer_language, expression_language), Vec::new())
+    }
+
+    fn grade_single_meaning(&self, entry: &EntryRecord, answer: &str, accepted: &[String], rejected: &[String], answer_language: &str, expression_language: &str) -> GradeOutcome {
 
         let normalized_answer = normalize_generic(answer);
         if normalized_answer.chars().count() < 2 {
@@ -337,96 +352,93 @@ impl SemanticGrader {
             .ok_or_else(|| "semantic relation has no positive reference".into())
     }
 
-    fn grade_multiple_meanings(&self, entry: &EntryRecord, answer: &str) -> GradeOutcome {
+    fn grade_multiple_meanings(&self, entry: &EntryRecord, answer: &str, answer_language: &str, expression_language: &str) -> (GradeOutcome, Vec<MeaningAdjudication>) {
         let answers = split_reading_answer(answer, entry.meanings.len());
         if answers.len() != entry.meanings.len() {
-            return GradeOutcome { decision: GradeDecision::Fail, method: "meaning_count_mismatch", score: Some(0.0) };
+            return (GradeOutcome { decision: GradeDecision::Fail, method: "meaning_count_mismatch", score: Some(0.0) }, Vec::new());
         }
 
         let normalized_answers = normalized_unique(answers.iter());
         if normalized_answers.len() != answers.len() {
-            return GradeOutcome { decision: GradeDecision::Fail, method: "duplicate_meaning_answer", score: Some(0.0) };
+            return (GradeOutcome { decision: GradeDecision::Fail, method: "duplicate_meaning_answer", score: Some(0.0) }, Vec::new());
         }
         if normalized_answers.iter().any(|value| value.chars().count() < 2) {
-            return GradeOutcome { decision: GradeDecision::Fail, method: "semantic_degenerate", score: Some(0.0) };
+            return (GradeOutcome { decision: GradeDecision::Fail, method: "semantic_degenerate", score: Some(0.0) }, Vec::new());
         }
 
         let meanings = normalized_unique(entry.meanings.iter());
         if meanings.len() != entry.meanings.len() {
-            return GradeOutcome { decision: GradeDecision::Fail, method: "duplicate_canonical_meaning", score: Some(0.0) };
+            return (GradeOutcome { decision: GradeDecision::Fail, method: "duplicate_canonical_meaning", score: Some(0.0) }, Vec::new());
         }
         if meanings.iter().any(|value| contains_hangul(value)) && normalized_answers.iter().any(|value| !contains_hangul(value)) {
-            return GradeOutcome { decision: GradeDecision::Fail, method: "semantic_wrong_language", score: Some(0.0) };
+            return (GradeOutcome { decision: GradeDecision::Fail, method: "semantic_wrong_language", score: Some(0.0) }, Vec::new());
         }
 
         let answer_requests: Vec<_> = normalized_answers.iter().cloned().map(|value| ("query", value)).collect();
         let answer_embeddings = match self.embeddings(&answer_requests) {
             Ok(values) => values,
-            Err(_) => return GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_unavailable", score: None },
+            Err(_) => return (GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_unavailable", score: None }, Vec::new()),
         };
         let meaning_embeddings = match self.document_embeddings(&meanings) {
             Ok(values) => values,
-            Err(_) => return GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_unavailable", score: None },
+            Err(_) => return (GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_unavailable", score: None }, Vec::new()),
         };
+        let plain_scores: Vec<Vec<f64>> = answer_embeddings.iter().map(|answer_embedding| {
+            meaning_embeddings.iter().map(|meaning_embedding| cosine(answer_embedding, meaning_embedding)).collect()
+        }).collect();
 
-        let matrix: Vec<Vec<f64>> = answer_embeddings
-            .iter()
-            .map(|answer_embedding| meaning_embeddings.iter().map(|meaning_embedding| cosine(answer_embedding, meaning_embedding)).collect())
-            .collect();
+        let mut outcomes = Vec::with_capacity(normalized_answers.len());
+        let mut scores = Vec::with_capacity(normalized_answers.len());
+        let mut passes = Vec::with_capacity(normalized_answers.len());
+        for answer in &normalized_answers {
+            let mut outcome_row = Vec::with_capacity(meanings.len());
+            let mut score_row = Vec::with_capacity(meanings.len());
+            let mut pass_row = Vec::with_capacity(meanings.len());
+            for meaning in &meanings {
+                let mut pair_entry = entry.clone();
+                pair_entry.meanings = vec![meaning.clone()];
+                let outcome = self.grade_reading(&pair_entry, answer, &[], &[], answer_language, expression_language);
+                let score = outcome.score.unwrap_or(match outcome.decision {
+                    GradeDecision::Pass => 1.0,
+                    GradeDecision::Ambiguous => 0.5,
+                    GradeDecision::Fail => 0.0,
+                });
+                let passed = outcome.decision == GradeDecision::Pass;
+                pass_row.push(if passed { 1.0 } else { 0.0 });
+                score_row.push(score);
+                outcome_row.push(outcome);
+            }
+            outcomes.push(outcome_row);
+            scores.push(score_row);
+            passes.push(pass_row);
+        }
 
-        if perfect_matching(&matrix, |score| score >= self.thresholds.pass).is_some() {
-            let source = entry.term.trim();
-            if source.is_empty() {
-                return GradeOutcome {
-                    decision: GradeDecision::Ambiguous,
-                    method: "semantic_verifier_unavailable",
-                    score: Some(best_row_floor(&matrix)),
-                };
-            }
-            let mut pairs = Vec::with_capacity(normalized_answers.len() * meanings.len() * 2);
-            for answer in &normalized_answers {
-                for meaning in &meanings {
-                    let meaning = semantic_relation_text(source, meaning);
-                    let answer = semantic_relation_text(source, answer);
-                    pairs.push((meaning.clone(), answer.clone()));
-                    pairs.push((answer, meaning));
-                }
-            }
-            let evidence = match self.relation_backend.relations(&pairs) {
-                Ok(values) if values.len() == pairs.len() => values,
-                _ => {
-                    return GradeOutcome {
-                        decision: GradeDecision::Ambiguous,
-                        method: "semantic_verifier_unavailable",
-                        score: Some(best_row_floor(&matrix)),
-                    };
-                }
-            };
-            let mut verified = vec![vec![0.0; meanings.len()]; normalized_answers.len()];
-            for (index, directions) in evidence.chunks_exact(2).enumerate() {
-                let row = index / meanings.len();
-                let column = index % meanings.len();
-                let contradiction = directions[0].contradiction.max(directions[1].contradiction);
-                if matrix[row][column] >= self.thresholds.pass && contradiction < self.thresholds.contradiction_block {
-                    verified[row][column] = 1.0;
-                }
-            }
-            if let Some(matching) = perfect_matching(&verified, |score| score > 0.5) {
-                let score = matching_floor(&matrix, &matching);
-                return GradeOutcome { decision: GradeDecision::Pass, method: "semantic_multi_consensus", score: Some(score) };
-            }
-            return GradeOutcome {
+        if let Some(matching) = perfect_matching(&passes, |score| score > 0.5) {
+            return (GradeOutcome {
+                decision: GradeDecision::Pass,
+                method: "semantic_multi_consensus",
+                score: Some(matching_floor(&scores, &matching)),
+            }, Vec::new());
+        }
+        if let Some(matching) = perfect_matching(&plain_scores, |_| true) {
+            let verifier_blocked = matching.iter().enumerate().any(|(row, &column)| {
+                matches!(outcomes[row][column].method, "semantic_contradiction" | "semantic_verifier_unavailable")
+            });
+            let adjudications = matching.iter().enumerate().filter_map(|(row, &column)| {
+                let outcome = &outcomes[row][column];
+                (outcome.decision != GradeDecision::Pass).then(|| MeaningAdjudication {
+                    canonical_answer: meanings[column].clone(),
+                    submitted_answer: normalized_answers[row].clone(),
+                })
+            }).collect();
+            return (GradeOutcome {
                 decision: GradeDecision::Ambiguous,
-                method: "semantic_multi_verifier",
-                score: Some(best_row_floor(&matrix)),
-            };
-        }
-        if let Some(matching) = perfect_matching(&matrix, |score| score > self.thresholds.fail) {
-            let score = matching_floor(&matrix, &matching);
-            return GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_multi_embedding", score: Some(score) };
+                method: if verifier_blocked { "semantic_multi_verifier" } else { "semantic_multi_embedding" },
+                score: Some(matching_floor(&scores, &matching)),
+            }, adjudications);
         }
 
-        GradeOutcome { decision: GradeDecision::Fail, method: "semantic_multi_embedding", score: Some(best_row_floor(&matrix)) }
+        (GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_multi_embedding", score: Some(best_row_floor(&scores)) }, Vec::new())
     }
 
     pub fn precompute_documents(&self, texts: &[String]) -> Result<(), String> {
@@ -546,7 +558,9 @@ fn perfect_matching(matrix: &[Vec<f64>], allowed: impl Fn(f64) -> bool + Copy) -
         column_to_row: &mut [Option<usize>],
         allowed: impl Fn(f64) -> bool + Copy,
     ) -> bool {
-        for column in 0..matrix[row].len() {
+        let mut columns = (0..matrix[row].len()).collect::<Vec<_>>();
+        columns.sort_unstable_by(|&left, &right| matrix[row][right].total_cmp(&matrix[row][left]));
+        for column in columns {
             if seen[column] || !allowed(matrix[row][column]) {
                 continue;
             }
@@ -852,6 +866,38 @@ mod tests {
     }
 
     #[test]
+    fn installed_pipeline_toru_multi_prompts_each_meaning() {
+        let Ok(home) = std::env::var("TANREN_NLI_TEST_HOME") else { return; };
+        let home = PathBuf::from(home);
+        let embedding = LlamaCppEmbeddingBackend::install(home.clone());
+        let relation = OnnxNliRelationBackend::install(home);
+        let started = Instant::now();
+        loop {
+            let embedding_status = embedding.status();
+            let relation_status = relation.status();
+            if embedding_status.phase == "ready" && relation_status.phase == "ready" { break; }
+            if embedding_status.phase == "unavailable" { panic!("embedding failed: {:?}", embedding_status.error); }
+            if relation_status.phase == "unavailable" { panic!("relation failed: {:?}", relation_status.error); }
+            if started.elapsed() > Duration::from_secs(60) { panic!("semantic runtime load timed out"); }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("semantic.db")).unwrap();
+        let grader = SemanticGrader::new(embedding, relation, db, SemanticThresholds::default());
+        let entry = EntryRecord {
+            id: "toru".into(), term: "とる".into(), meanings: vec!["가지다".into(), "들다".into()], reading: Some("とる".into()),
+        };
+        let (outcome, adjudications) = grader.grade_reading_with_adjudications(
+            &entry, "가져오다 들어올리다", &[], &[], "ko-KR", "ja-JP",
+        );
+        assert_eq!(outcome.decision, GradeDecision::Ambiguous);
+        assert_eq!(adjudications.len(), 2);
+        assert!(adjudications.iter().any(|item| item.canonical_answer == "가지다" && item.submitted_answer == "가져오다"));
+        assert!(adjudications.iter().any(|item| item.canonical_answer == "들다" && item.submitted_answer == "들어올리다"));
+    }
+
+    #[test]
     fn unavailable_backend_abstains() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: true });
         let grader = grader(backend);
@@ -884,11 +930,31 @@ mod tests {
     }
 
     #[test]
-    fn multiple_meanings_fail_on_missing_or_wrong_item() {
+    fn multiple_meanings_use_full_single_meaning_semantic_pipeline() {
+        let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
+        let grader = grader(backend);
+        let entry = EntryRecord {
+            id: "weather-multi".into(),
+            term: "今日はいい天気ですね".into(),
+            meanings: vec!["오늘은 좋은 날씨네요".into(), "전화하다".into()],
+            reading: Some("きょーわいいてんきですね".into()),
+        };
+
+        let outcome = grader.grade_reading(&entry, "오늘 날씨 좋네요 / 전화하다", &[], &[], "ko-KR", "ja-JP");
+        assert_eq!(outcome.decision, GradeDecision::Pass);
+        assert_eq!(outcome.method, "semantic_multi_consensus");
+    }
+
+    #[test]
+    fn multiple_meanings_require_count_but_adjudicate_nonpassing_items() {
         let backend = Arc::new(FakeBackend { calls: AtomicUsize::new(0), unavailable: false });
         let grader = grader(backend);
         assert_eq!(grader.grade_reading(&multi_entry(), "매달다 / 전화하다", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
-        assert_eq!(grader.grade_reading(&multi_entry(), "매달다 / 전화하다 / 쳐다보다", &[], &[], "ko-KR", "ja-JP").decision, GradeDecision::Fail);
+        let (outcome, adjudications) = grader.grade_reading_with_adjudications(
+            &multi_entry(), "매달다 / 전화하다 / 쳐다보다", &[], &[], "ko-KR", "ja-JP",
+        );
+        assert_eq!(outcome.decision, GradeDecision::Ambiguous);
+        assert!(!adjudications.is_empty());
     }
 
     #[test]

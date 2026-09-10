@@ -214,7 +214,23 @@ pub struct SubmitResult {
     pub canonical_answer: Option<String>,
     pub reading: Option<String>,
     pub pitch: Option<PitchQuestion>,
+    pub adjudication: Option<AdjudicationPrompt>,
+    pub meaning_grades: Option<Vec<MeaningGrade>>,
     pub card: Option<StudyCard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdjudicationPrompt {
+    pub canonical_answer: String,
+    pub submitted_answer: String,
+    pub current: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeaningGrade {
+    pub submitted_answer: String,
+    pub correct: bool,
 }
 
 impl SubmitResult {
@@ -226,6 +242,8 @@ impl SubmitResult {
             canonical_answer: None,
             reading: None,
             pitch: None,
+            adjudication: None,
+            meaning_grades: None,
             card: None,
         }
     }

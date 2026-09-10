@@ -4,7 +4,7 @@ use rand::{RngCore, SeedableRng, seq::SliceRandom};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{EntryRecord, PitchQuestion, StudyMode, StudyRange, SubmitResult, VariantKey};
+use crate::model::{AdjudicationPrompt, EntryRecord, MeaningGrade, PitchQuestion, StudyMode, StudyRange, SubmitResult, VariantKey};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PendingState {
@@ -25,9 +25,17 @@ pub enum PendingState {
         meaning_ime_composition_ms: u64,
         method: String,
         score: Option<f64>,
+        #[serde(default)]
+        adjudications: Vec<AdjudicationPrompt>,
+        #[serde(default)]
+        adjudication_index: usize,
+        #[serde(default)]
+        adjudication_rejected: bool,
+        #[serde(default)]
+        adjudication_rejected_answers: Vec<String>,
     },
-    Pitch { variant: VariantKey, question: PitchQuestion },
-    PitchCorrection { variant: VariantKey, question: PitchQuestion, failure: String },
+    Pitch { variant: VariantKey, question: PitchQuestion, #[serde(default)] meaning_grades: Option<Vec<MeaningGrade>> },
+    PitchCorrection { variant: VariantKey, question: PitchQuestion, failure: String, #[serde(default)] meaning_grades: Option<Vec<MeaningGrade>> },
 }
 
 pub fn study_ranges(deck_size: usize, increment: usize, checkpoint: usize) -> Vec<StudyRange> {
@@ -610,6 +618,7 @@ mod tests {
             typing_duration_ms: 20, interkey_gaps_ms: vec![5], ime_composition_ms: 0,
             meaning_typing_duration_ms: 0, meaning_interkey_gaps_ms: Vec::new(), meaning_ime_composition_ms: 0,
             method: "semantic".into(), score: Some(0.5),
+            adjudications: Vec::new(), adjudication_index: 0, adjudication_rejected: false, adjudication_rejected_answers: Vec::new(),
         });
         let resumed: StudySession = serde_json::from_str(&serde_json::to_string(&active).unwrap()).unwrap();
         assert!(matches!(resumed.pending, Some(PendingState::Ambiguous { ref answer, .. }) if answer == "pending"));
@@ -622,6 +631,7 @@ mod tests {
                 phrase_count: 1, allowed_patterns: vec![vec![1]], confidence: PitchConfidence::Verified,
                 gate_enabled: true,
             },
+            meaning_grades: None,
         });
         let resumed: StudySession = serde_json::from_str(&serde_json::to_string(&active).unwrap()).unwrap();
         assert!(matches!(resumed.pending, Some(PendingState::Pitch { .. })));
