@@ -676,6 +676,13 @@ fn ambiguous_for_adjudication(pending: &Option<PendingState>, variant_id: &str) 
 fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8>) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
+    finish_pitch(&state.db, session, &variant_id, &patterns)
+}
+
+fn finish_pitch(db: &Database, active_session: &mut StudySession, variant_id: &str, patterns: &[u8]) -> Result<SubmitResult, String> {
+    // Publish the transition only after all writes succeed, so failed saves remain retryable.
+    let mut next_session = active_session.clone();
+    let session = &mut next_session;
     let pending = session.pending.clone().ok_or("no pitch question is pending")?;
     let (variant, question, correction_failure, meaning_grades) = match pending {
         PendingState::Pitch { variant, question, meaning_grades } => (variant, question, None, meaning_grades),
@@ -685,8 +692,8 @@ fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8
     if variant.id() != variant_id {
         return Err("stale pitch submission".into());
     }
-    let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
-    let (correct, failed_gate) = grade_pitch_contour(&question, &patterns);
+    let entry = find_entry(db, &session.deck_id, &variant.entry_id)?;
+    let (correct, failed_gate) = grade_pitch_contour(&question, patterns);
 
     if let Some(failure) = correction_failure {
         session.resolve_current(&variant, false)?;
@@ -697,12 +704,13 @@ fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8
         );
         result.meaning_grades = meaning_grades;
         session.pending = Some(PendingState::Review { variant, result: result.clone() });
-        state.db.save_session(session)?;
+        db.save_session(session)?;
+        *active_session = next_session;
         return Ok(result);
     }
 
     session.resolve_current(&variant, !failed_gate)?;
-    state.db.update_attempt_pitch(
+    db.update_attempt_pitch(
         &session.deck_id, &entry.id, variant.mode, correct, !failed_gate,
         failed_gate.then_some(FailureType::PitchWrong.as_str()),
     )?;
@@ -713,7 +721,8 @@ fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8
     );
     result.meaning_grades = meaning_grades;
     session.pending = Some(PendingState::Review { variant, result: result.clone() });
-    state.db.save_session(session)?;
+    db.save_session(session)?;
+    *active_session = next_session;
     Ok(result)
 }
 
@@ -1770,6 +1779,57 @@ pub fn run() {
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    #[test]
+    fn failed_pitch_writes_preserve_active_card_and_allow_retry() {
+        for (correction, table, operation) in [(false, "attempts", "UPDATE"), (false, "stage_states", "INSERT"), (true, "stage_states", "INSERT")] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("pitch.db");
+            let db = Database::open(&path).unwrap();
+            let deck = db.create_deck("pitch retry", "ko-KR", "ja-JP").unwrap();
+            db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+                term: "取る".into(), meanings: vec!["잡다".into()], reading: Some("とる".into()),
+            }]).unwrap();
+            let entries = db.entries(&deck.id).unwrap();
+            let mut session = StudySession::new(deck.id.clone(), 1, &entries, &[StudyMode::Listening], 50, 500, 1).unwrap();
+            let variant = session.next_variant(10).unwrap();
+            let question = PitchQuestion {
+                kind: "lexical".into(), reading: "とる".into(), morae: vec!["と".into(), "る".into()],
+                phrase_count: 1, allowed_patterns: vec![vec![1, 0]], confidence: model::PitchConfidence::Consensus, gate_enabled: true,
+            };
+            session.pending = Some(if correction {
+                PendingState::PitchCorrection { variant: variant.clone(), question, failure: "MANUAL_UNKNOWN".into(), meaning_grades: None }
+            } else {
+                PendingState::Pitch { variant: variant.clone(), question, meaning_grades: None }
+            });
+            db.insert_attempt(&variant.entry_id, &deck.id, variant.mode, 1, &session.range().label,
+                "取る", !correction, None, false, "fixture", None, 100, 100, None).unwrap();
+            db.save_session(&session).unwrap();
+            let before = serde_json::to_value(&session).unwrap();
+            // Older builds could persist the pitch prompt after prematurely resolving its card.
+            let mut interrupted = session.clone();
+            interrupted.resolve_current(&variant, true).unwrap();
+            interrupted.recover_interrupted_card();
+            assert!(interrupted.pending.is_none());
+            assert_eq!(interrupted.next_variant(10), Some(variant.clone()));
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute_batch(&format!("CREATE TRIGGER fail_pitch_write BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, 'forced pitch save failure'); END;")).unwrap();
+
+            assert!(finish_pitch(&db, &mut session, &variant.id(), &[1, 0]).unwrap_err().contains("forced pitch save failure"));
+            assert_eq!(serde_json::to_value(&session).unwrap(), before);
+            assert_eq!(serde_json::to_value(db.load_session(&deck.id, 1).unwrap().unwrap()).unwrap(), before);
+
+            connection.execute_batch("DROP TRIGGER fail_pitch_write;").unwrap();
+            let result = finish_pitch(&db, &mut session, &variant.id(), &[1, 0]).unwrap();
+            assert!(matches!(result.status, SubmitStatus::Review));
+            assert!(session.current.is_none());
+            assert_eq!(session.queue.remaining_count(), usize::from(correction));
+            assert!(matches!(session.pending, Some(PendingState::Review { .. })));
+            let completed = serde_json::to_value(&session).unwrap();
+            assert!(finish_pitch(&db, &mut session, &variant.id(), &[1, 0]).is_err());
+            assert_eq!(serde_json::to_value(&session).unwrap(), completed);
+        }
+    }
 
     fn ambiguous(answer: &str) -> PendingState {
         PendingState::Ambiguous {

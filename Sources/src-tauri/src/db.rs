@@ -1186,7 +1186,7 @@ impl Database {
 
     pub fn update_attempt_pitch(&self, deck_id:&str, entry_id:&str, variant:StudyMode, correct:bool, joint_correct:bool, failure_type:Option<&str>) -> Result<(),String> {
         let mut conn=self.conn()?;
-        let tx=conn.transaction().map_err(|e|e.to_string())?;
+        let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let id:Option<String>=tx.query_row("SELECT id FROM attempts WHERE deck_id=?1 AND entry_id=?2 AND variant=?3 ORDER BY timestamp DESC LIMIT 1",params![deck_id,entry_id,variant.as_str()],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         if let Some(id)=id {
             tx.execute("UPDATE attempts SET pitch_correct=?1,joint_correct=?2,failure_type=COALESCE(?3,failure_type) WHERE id=?4",params![correct,joint_correct,failure_type,id]).map_err(|e|e.to_string())?;

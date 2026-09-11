@@ -346,7 +346,11 @@ impl StudySession {
         if matches!(self.pending, Some(PendingState::CycleComplete { .. })) {
             return;
         }
-        if let Some(current) = self.current.take() { self.queue.mark_fail(&current); }
+        let current = self.current.take().or_else(|| match &self.pending {
+            Some(PendingState::Pitch { variant, .. }) | Some(PendingState::PitchCorrection { variant, .. }) => Some(variant.clone()),
+            _ => None,
+        });
+        if let Some(current) = current { self.queue.mark_fail(&current); }
         self.pending = None;
     }
 
