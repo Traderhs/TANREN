@@ -1644,6 +1644,48 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let icon = tauri::image::Image::from_bytes(include_bytes!("../../public/tanren.ico"))?;
                 window.set_icon(icon)?;
+                #[cfg(windows)]
+                unsafe {
+                    use windows::{
+                        core::PCWSTR,
+                        Win32::{
+                            Foundation::{HWND, LPARAM, WPARAM},
+                            System::LibraryLoader::GetModuleHandleW,
+                            UI::HiDpi::GetDpiForWindow,
+                            UI::WindowsAndMessaging::{
+                                LoadImageW, SendMessageW, ShowWindow, ICON_BIG, IMAGE_ICON, LR_SHARED,
+                                SW_HIDE, SW_SHOW, WM_SETICON,
+                            },
+                        },
+                    };
+                    // Match the taskbar's 24-DIP icon instead of letting Windows
+                    // blur the 256px image when scaling it down. Keep ICON_SMALL unchanged.
+                    // LR_SHARED keeps the resource handle alive for the process lifetime.
+                    let hwnd = window.hwnd()?;
+                    let taskbar_size = (24 * GetDpiForWindow(hwnd) / 96) as i32;
+                    let taskbar_icon = LoadImageW(
+                        Some(GetModuleHandleW(None)?.into()),
+                        PCWSTR(32512usize as *const u16),
+                        IMAGE_ICON,
+                        taskbar_size,
+                        taskbar_size,
+                        LR_SHARED,
+                    )?;
+                    let hwnd = hwnd.0 as isize;
+                    let taskbar_icon = taskbar_icon.0 as isize;
+                    window.run_on_main_thread(move || {
+                        let hwnd = HWND(hwnd as *mut _);
+                        SendMessageW(
+                            hwnd,
+                            WM_SETICON,
+                            Some(WPARAM(ICON_BIG as usize)),
+                            Some(LPARAM(taskbar_icon)),
+                        );
+                        // Refresh the shell's cached button after Tauri sets ICON_SMALL.
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        let _ = ShowWindow(hwnd, SW_SHOW);
+                    })?;
+                }
             }
             let app_data = std::env::var_os("TANREN_APP_DATA_HOME").map(PathBuf::from)
                 .unwrap_or(app.path().app_data_dir().map_err(|e| e.to_string())?);
