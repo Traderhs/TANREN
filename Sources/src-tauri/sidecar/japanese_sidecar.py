@@ -651,9 +651,97 @@ def voicevox_pitch_contour(
 
     normalized_actual = pronunciation_keys(flattened_morae)
     normalized_expected = pronunciation_keys(expected_morae)
-    if normalized_actual != normalized_expected:
-        return None, version
-    return contour, version
+    if normalized_actual == normalized_expected:
+        return contour, version
+
+    def long_extension(previous: str | None, current: str) -> str | None:
+        if previous is None:
+            return None
+        previous_vowel = mora_vowel(previous)
+        if current == "ー":
+            return previous_vowel
+        if current not in {"あ", "い", "う", "え", "お"}:
+            return None
+        current_vowel = mora_vowel(current)
+        if previous_vowel is None or current_vowel is None:
+            return None
+        if current_vowel == previous_vowel:
+            return previous_vowel
+        if previous_vowel == "お" and current == "う":
+            return "お"
+        if previous_vowel == "え" and current == "い":
+            return "え"
+        return None
+
+    # VOICEVOX sometimes realizes or absorbs a long vowel as a separate mora
+    # even though the reading supplied to it is identical. Project the engine's
+    # contour back onto TANREN's mora sequence instead of dropping pitch data.
+    mapping: list[int] = []
+    expected_index = 0
+    actual_index = 0
+    while expected_index < len(normalized_expected) and actual_index < len(normalized_actual):
+        expected = normalized_expected[expected_index]
+        actual = normalized_actual[actual_index]
+        if expected == actual:
+            mapping.append(actual_index)
+            expected_index += 1
+            actual_index += 1
+            continue
+
+        expected_extension = long_extension(
+            normalized_expected[expected_index - 1] if expected_index else None,
+            expected,
+        )
+        actual_extension = long_extension(
+            normalized_actual[actual_index - 1] if actual_index else None,
+            actual,
+        )
+        if expected_extension and expected_extension == actual_extension:
+            mapping.append(actual_index)
+            expected_index += 1
+            actual_index += 1
+            continue
+        if expected_extension:
+            mapping.append(max(0, actual_index - 1))
+            expected_index += 1
+            continue
+        if actual_extension:
+            actual_index += 1
+            continue
+        break
+
+    while expected_index < len(normalized_expected):
+        expected_extension = long_extension(
+            normalized_expected[expected_index - 1] if expected_index else None,
+            normalized_expected[expected_index],
+        )
+        if not expected_extension or not normalized_actual:
+            break
+        mapping.append(len(normalized_actual) - 1)
+        expected_index += 1
+
+    while actual_index < len(normalized_actual):
+        actual_extension = long_extension(
+            normalized_actual[actual_index - 1] if actual_index else None,
+            normalized_actual[actual_index],
+        )
+        if not actual_extension:
+            break
+        actual_index += 1
+
+    if expected_index == len(normalized_expected) and actual_index == len(normalized_actual) and len(mapping) == len(expected_morae):
+        return [contour[min(index, len(contour) - 1)] for index in mapping], version
+
+    # The query was created from this exact reading, so a remaining mismatch is
+    # a frontend mora-segmentation difference rather than a different utterance.
+    # Preserve the engine's pitch shape by projecting it across TANREN's mora count.
+    if contour and expected_morae:
+        if len(expected_morae) == 1:
+            return [contour[0]], version
+        last = len(contour) - 1
+        projected = [contour[round(index * last / (len(expected_morae) - 1))] for index in range(len(expected_morae))]
+        return projected, version
+    return None, version
 
 
 def warm_voicevox_profiles(base_url: str) -> int:
@@ -674,6 +762,91 @@ def warm_voicevox_profiles(base_url: str) -> int:
     return len(profiles)
 
 
+def lexical_voicevox_phrase(
+    phrases: list[dict[str, Any]],
+    expected_morae: list[str],
+    accent_type: int,
+) -> tuple[list[dict[str, Any]], int] | None:
+    """Collapse VOICEVOX's lexical phrase splitting while preserving its mora data."""
+    if not phrases or not expected_morae:
+        return None
+
+    actual_moras: list[dict[str, Any]] = []
+    for phrase in phrases:
+        if not isinstance(phrase, dict) or phrase.get("pause_mora") is not None:
+            return None
+        moras = phrase.get("moras", [])
+        if not isinstance(moras, list) or any(not isinstance(mora, dict) for mora in moras):
+            return None
+        actual_moras.extend(copy.deepcopy(moras))
+    if not actual_moras:
+        return None
+
+    def vowel_for(value: str) -> str | None:
+        if not value:
+            return None
+        last = hira(value)[-1]
+        for vowel, kana in (
+            ("あ", "ぁあかがさざただなはばぱまゃやらわゎゕ"),
+            ("い", "ぃいきぎしじちぢにひびぴみりゐ"),
+            ("う", "ぅうくぐすずつづぬふぶぷむゅゆるゔ"),
+            ("え", "ぇえけげせぜてでねへべぺめれゑゖ"),
+            ("お", "ぉおこごそぞとどのほぼぽもょよろを"),
+        ):
+            if last in kana:
+                return vowel
+        return None
+
+    def normalize_actual(value: str) -> str:
+        result = ""
+        previous = ""
+        for char in hira(value):
+            if char == "ー" and previous:
+                result += vowel_for(previous) or char
+            else:
+                result += char
+                previous = char
+        return result
+
+    actual_text = normalize_actual("".join(str(mora.get("text", "")) for mora in actual_moras))
+    expected_variants = {""}
+    previous_expected = ""
+    for mora in expected_morae:
+        normalized = hira(mora)
+        if normalized == "ー" and previous_expected:
+            vowel = vowel_for(previous_expected)
+            replacements = [vowel, ""] if vowel else [normalized]
+        else:
+            replacements = [normalize_actual(normalized)]
+            previous_expected = normalized
+        expected_variants = {prefix + replacement for prefix in expected_variants for replacement in replacements}
+    # The query itself was created from this exact reading. VOICEVOX can still
+    # split one contracted mora into two (e.g. きゅ -> キ|ユ, じぇ -> ジ|エ),
+    # so require a compatible normalized span instead of identical kana glyphs.
+    if actual_text not in expected_variants and len(actual_text) not in {len(value) for value in expected_variants}:
+        return None
+
+    if accent_type <= 0:
+        nucleus = len(actual_moras)
+    else:
+        expected_prefix = "".join(expected_morae[:accent_type])
+        target_length = len(normalize_actual(expected_prefix))
+        nucleus = len(actual_moras)
+        consumed = 0
+        for index, mora in enumerate(actual_moras, start=1):
+            consumed += len(normalize_actual(str(mora.get("text", ""))))
+            if consumed >= target_length:
+                nucleus = index
+                break
+
+    phrase = copy.deepcopy(phrases[0])
+    phrase["moras"] = actual_moras
+    phrase["accent"] = max(1, min(nucleus, len(actual_moras)))
+    phrase["pause_mora"] = None
+    phrase["is_interrogative"] = False
+    return [phrase], phrase["accent"]
+
+
 def synthesize_voicevox(
     base_url: str,
     reading: str,
@@ -692,11 +865,9 @@ def synthesize_voicevox(
     reading_text = hira(reading)
     query = copy.deepcopy(source_query) if source_query is not None else voicevox_request(base_url, "/audio_query", {"text": reading_text, "speaker": speaker_id})
     if accent_type is not None:
-        nucleus = accent_type if accent_type > 0 else len(expected_morae)
-        # Preserve the text frontend's devoicing and phoneme realization whenever
-        # its lexical segmentation matches. Kana parsing discards that context.
         phrases = query["accent_phrases"]
-        if len(phrases) != 1 or len(phrases[0].get("moras", [])) != len(expected_morae):
+        lexical = lexical_voicevox_phrase(phrases, expected_morae, accent_type)
+        if lexical is None:
             kana_notation = voicevox_kana_notation(expected_morae, accent_type)
             try:
                 phrases = voicevox_request(
@@ -712,15 +883,12 @@ def synthesize_voicevox(
                     "/accent_phrases",
                     {"text": reading_text, "speaker": speaker_id, "is_kana": "false"},
                 )
-        if len(phrases) != 1:
-            raise RuntimeError(f"VOICEVOX kana query returned {len(phrases)} accent phrases for lexical reading {reading}")
-        phrase = phrases[0]
-        moras = phrase.get("moras", [])
-        if len(moras) != len(expected_morae):
-            raise RuntimeError(f"VOICEVOX mora mismatch for {reading}: expected={len(expected_morae)} actual={len(moras)}")
-        phrase["accent"] = nucleus
+            lexical = lexical_voicevox_phrase(phrases, expected_morae, accent_type)
+        if lexical is None:
+            raise RuntimeError(f"VOICEVOX lexical mora layout did not match reading {reading}")
+        phrases, nucleus = lexical
         controlled = voicevox_request(base_url, "/mora_data", {"speaker": speaker_id}, phrases)
-        contour = accent_contour(len(expected_morae), accent_type)
+        contour = accent_contour(len(phrases[0]["moras"]), nucleus)
         if contour:
             controlled = enforce_pitch_contour(controlled, contour)
         # audio_query may split a dictionary entry into multiple accent phrases.
@@ -897,7 +1065,7 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
             patterns = accent_contours(len(mora_list), accent_types)
             used_voicevox_pitch_fallback = patterns is not None
             voicevox_pitch_source = "VOICEVOX lexical accent phrase"
-    if not patterns and voicevox_url and scope != "lexical" and reading:
+    if not patterns and voicevox_url and reading:
         native_contour, voicevox_fallback_version = voicevox_pitch_contour(
             str(voicevox_url),
             reading,
