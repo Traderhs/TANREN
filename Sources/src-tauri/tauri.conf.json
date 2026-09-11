@@ -38,6 +38,11 @@
     ],
     "icon": [
       "../public/tanren.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "../public/tanren.ico"
+      }
+    }
   }
 }

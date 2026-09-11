@@ -108,16 +108,21 @@ impl VoicevoxRuntime {
         fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
         let stdout = File::create(logs.join("updater.stdout.log")).map_err(|e| e.to_string())?;
         let stderr = File::create(logs.join("updater.stderr.log")).map_err(|e| e.to_string())?;
-        let status = Command::new("powershell.exe")
+        let mut command = Command::new("powershell.exe");
+        command
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&installer)
             .arg("-HomePath")
             .arg(&self.home)
             .stdin(Stdio::null())
             .stdout(stdout)
-            .stderr(stderr)
-            .status()
-            .map_err(|e| format!("VOICEVOX updater could not start: {e}"))?;
+            .stderr(stderr);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let status = command.status().map_err(|e| format!("VOICEVOX updater could not start: {e}"))?;
         if !status.success() {
             return Err(format!("VOICEVOX updater failed with {status}; inspect voicevox/logs"));
         }
@@ -132,16 +137,21 @@ impl VoicevoxRuntime {
             fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
             let stdout = File::create(logs.join("installer.stdout.log")).map_err(|e| e.to_string())?;
             let stderr = File::create(logs.join("installer.stderr.log")).map_err(|e| e.to_string())?;
-            let status = Command::new("powershell.exe")
+            let mut command = Command::new("powershell.exe");
+            command
                 .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
                 .arg(&installer)
                 .arg("-HomePath")
                 .arg(&self.home)
                 .stdin(Stdio::null())
                 .stdout(stdout)
-                .stderr(stderr)
-                .status()
-                .map_err(|e| format!("VOICEVOX installer could not start: {e}"))?;
+                .stderr(stderr);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            let status = command.status().map_err(|e| format!("VOICEVOX installer could not start: {e}"))?;
             if !status.success() {
                 return Err(format!("VOICEVOX installer failed with {status}; inspect voicevox/logs"));
             }
