@@ -2138,7 +2138,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
               <span className="initial-loading-spinner" aria-hidden="true" />
               <h2 id="entry-processing-title">피치·음성을 생성하고 있어요</h2>
               <div className="initial-loading-status" aria-live="polite">
-                <p><span>진행</span><strong>{entryProcessing.completed + entryProcessing.failed} / {entryProcessing.total}</strong></p>
+                <p><span>진행</span><strong>{(entryProcessing.completed + entryProcessing.failed).toLocaleString("ko-KR")} / {entryProcessing.total.toLocaleString("ko-KR")}</strong></p>
                 <p><span>완료</span><strong>{entryProcessing.total === 0 ? "0%" : `${Math.round(((entryProcessing.completed + entryProcessing.failed) / entryProcessing.total) * 100)}%`}</strong></p>
               </div>
             </div>
