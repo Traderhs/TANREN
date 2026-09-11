@@ -1512,16 +1512,35 @@ impl Database {
     }
 
     pub fn queued_enrichment(&self, limit:usize)->Result<Vec<EntryRecord>,String>{
-        let conn=self.conn()?; let mut stmt=conn.prepare("SELECT e.id,e.term,e.meanings,e.reading FROM enrichment_jobs j JOIN entries e ON e.id=j.entry_id WHERE e.deleted_at IS NULL AND j.status IN ('queued','failed') AND j.attempts<3 ORDER BY e.position LIMIT ?1").map_err(|e|e.to_string())?;
+        let conn=self.conn()?; let mut stmt=conn.prepare("SELECT e.id,e.term,e.meanings,e.reading FROM enrichment_jobs j JOIN entries e ON e.id=j.entry_id JOIN decks d ON d.id=e.deck_id WHERE d.deleted_at IS NULL AND e.deleted_at IS NULL AND j.status IN ('queued','failed') AND j.attempts<3 ORDER BY e.position LIMIT ?1").map_err(|e|e.to_string())?;
         let rows=stmt.query_map([limit as i64],|r|{let m:String=r.get(2)?;Ok(EntryRecord{id:r.get(0)?,term:r.get(1)?,meanings:parse_json_column(&m,2)?,reading:r.get(3)?})}).map_err(|e|e.to_string())?;
         rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+    }
+
+    pub fn pending_enrichment_entry_ids(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT e.id FROM enrichment_jobs j \
+             JOIN entries e ON e.id=j.entry_id \
+             JOIN decks d ON d.id=e.deck_id \
+             WHERE d.deleted_at IS NULL AND e.deleted_at IS NULL \
+               AND j.status IN ('queued','failed') AND j.attempts<3 \
+             ORDER BY e.position",
+        ).map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn requeue_failed_enrichment(&self) -> Result<usize, String> {
         let conn = self.conn()?;
         conn.execute(
             "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 \
-             WHERE status='failed' AND entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
+             WHERE status='failed' AND entry_id IN ( \
+               SELECT e.id FROM entries e JOIN decks d ON d.id=e.deck_id \
+               WHERE d.deleted_at IS NULL AND e.deleted_at IS NULL \
+             )",
             [now()],
         ).map_err(|e| e.to_string())
     }
@@ -1533,6 +1552,7 @@ impl Database {
              WHERE status='done' \
                AND entry_id IN ( \
                  SELECT e.id FROM entries e \
+                 JOIN decks d ON d.id=e.deck_id AND d.deleted_at IS NULL \
                  JOIN japanese_analyses a ON a.entry_id=e.id AND a.deleted_at IS NULL \
                  WHERE e.deleted_at IS NULL \
                    AND e.language='ja-JP' \
@@ -1554,6 +1574,7 @@ impl Database {
             "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 \
              WHERE entry_id IN ( \
                SELECT e.id FROM entries e \
+               JOIN decks d ON d.id=e.deck_id AND d.deleted_at IS NULL \
                WHERE e.deleted_at IS NULL AND e.language='ja-JP' \
                  AND EXISTS( \
                    SELECT 1 FROM japanese_analyses a \
@@ -2288,6 +2309,23 @@ mod tests{
         assert_eq!(db.queued_enrichment(1).unwrap().len(), 1);
         let (_, completed, failed, error) = db.enrichment_progress(&[entry.id]).unwrap();
         assert_eq!((completed, failed, error), (0, 0, None));
+    }
+
+    #[test]
+    fn deleted_decks_are_excluded_from_enrichment_queue() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("deleted queue", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "見据える".into(), meanings: vec!["내다보다".into()], reading: Some("みすえる".into()),
+        }]).unwrap();
+        assert_eq!(db.queued_enrichment(1).unwrap().len(), 1);
+        assert_eq!(db.pending_enrichment_entry_ids().unwrap().len(), 1);
+
+        db.delete_deck(&deck.id).unwrap();
+
+        assert!(db.queued_enrichment(1).unwrap().is_empty());
+        assert!(db.pending_enrichment_entry_ids().unwrap().is_empty());
     }
 
     #[test]

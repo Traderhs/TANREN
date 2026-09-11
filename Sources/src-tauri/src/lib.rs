@@ -52,6 +52,7 @@ struct AppState {
     engine: Mutex<Engine>,
     input: Mutex<WindowsInputAdapter>,
     enrichment_running: Arc<AtomicBool>,
+    enrichment_generation_active: Arc<AtomicBool>,
     startup_preflight_started: Arc<AtomicBool>,
     startup_preflight_done: Arc<AtomicBool>,
     startup_language_download_progress: Arc<AtomicU8>,
@@ -168,11 +169,6 @@ fn create_deck(
 async fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Vec<EntryDraft>) -> Result<ImportEntriesResult, String> {
     let deck = state.db.deck(&deck_id)?;
     let (result, entry_ids) = state.db.import_entries_tracked(&deck_id, &deck.target_language, &entries)?;
-    start_enrichment_worker(
-        state.db.clone(),
-        state.analyzer.clone(),
-        Arc::clone(&state.enrichment_running),
-    );
     let candidates = state.db.entries(&deck_id)?.into_iter().flat_map(|entry| entry.meanings).collect();
     start_semantic_precompute(Arc::clone(&state.semantic), candidates);
     Ok(ImportEntriesResult { inserted: result.inserted, duplicates: result.duplicates, entry_ids })
@@ -180,11 +176,6 @@ async fn import_entries(state: State<'_, AppState>, deck_id: String, entries: Ve
 
 #[tauri::command]
 async fn enrichment_progress(state: State<'_, AppState>, entry_ids: Vec<String>) -> Result<EnrichmentProgress, String> {
-    start_enrichment_worker(
-        state.db.clone(),
-        state.analyzer.clone(),
-        Arc::clone(&state.enrichment_running),
-    );
     let (total, completed, failed, last_error) = state.db.enrichment_progress(&entry_ids)?;
     Ok(EnrichmentProgress {
         total,
@@ -197,15 +188,39 @@ async fn enrichment_progress(state: State<'_, AppState>, entry_ids: Vec<String>)
 }
 
 #[tauri::command]
+fn pending_enrichment_entry_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    state.db.pending_enrichment_entry_ids()
+}
+
+#[tauri::command]
+async fn set_enrichment_generation_active(state: State<'_, AppState>, active: bool) -> Result<(), String> {
+    let running = Arc::clone(&state.enrichment_running);
+    let generation_active = Arc::clone(&state.enrichment_generation_active);
+    generation_active.store(active, Ordering::Release);
+    if active {
+        start_enrichment_worker(
+            state.db.clone(),
+            state.analyzer.clone(),
+            running,
+            generation_active,
+        );
+        return Ok(());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        while running.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    })
+    .await
+    .map_err(|error| format!("enrichment worker stop wait failed: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
 fn update_entry(state: State<'_, AppState>, deck_id: String, entry_id: String, entry: EntryDraft) -> Result<bool, String> {
     let pronunciation_changed = state.db.update_entry(&deck_id, &entry_id, &entry)?;
     if pronunciation_changed {
         state.analyzer.invalidate_audio(&entry_id)?;
-        start_enrichment_worker(
-            state.db.clone(),
-            state.analyzer.clone(),
-            Arc::clone(&state.enrichment_running),
-        );
     }
     start_semantic_precompute(Arc::clone(&state.semantic), entry.meanings.clone());
     Ok(pronunciation_changed)
@@ -245,7 +260,6 @@ fn export_deck(state: State<'_, AppState>, deck_id: String) -> Result<String, St
 #[tauri::command]
 fn import_deck_export(state: State<'_, AppState>, payload: String) -> Result<DeckSummary, String> {
     let deck_id = state.db.import_deck_export(&payload)?;
-    start_enrichment_worker(state.db.clone(), state.analyzer.clone(), Arc::clone(&state.enrichment_running));
     deck_summary(&state.db, &deck_id)
 }
 
@@ -944,8 +958,6 @@ fn run_dev_dependency_sync(script_name: &str, script_args: &[&str], progress: &A
 #[tauri::command]
 async fn startup_dependency_preflight(state: State<'_, AppState>) -> Result<(), String> {
     let analyzer = state.analyzer.clone();
-    let db = state.db.clone();
-    let enrichment_running = Arc::clone(&state.enrichment_running);
     let started = Arc::clone(&state.startup_preflight_started);
     let done = Arc::clone(&state.startup_preflight_done);
     let language_download_progress = Arc::clone(&state.startup_language_download_progress);
@@ -1006,7 +1018,6 @@ async fn startup_dependency_preflight(state: State<'_, AppState>) -> Result<(), 
         language_load_monitor.store(true, Ordering::Release);
         let _ = language_load_thread.join();
         language_load_progress.store(100, Ordering::Release);
-        start_enrichment_worker(db, analyzer, enrichment_running);
         done.store(true, Ordering::Release);
     })
     .await
@@ -1441,74 +1452,87 @@ fn validate_timeout_variant(current: &VariantKey, variant_id: &str) -> Result<()
     if current.id() == variant_id { Ok(()) } else { Err("stale study card timeout".into()) }
 }
 
-fn start_enrichment_worker(db: Database, analyzer: JapaneseAnalyzer, running: Arc<AtomicBool>) {
+fn start_enrichment_worker(
+    db: Database,
+    analyzer: JapaneseAnalyzer,
+    running: Arc<AtomicBool>,
+    generation_active: Arc<AtomicBool>,
+) {
+    if !generation_active.load(Ordering::Acquire) { return; }
     if running.swap(true, Ordering::AcqRel) { return; }
     tauri::async_runtime::spawn_blocking(move || {
-        let mut audio_warm_attempted = false;
-        let mut drained = false;
-        loop {
-            match analyzer.audio_runtime_phase().as_str() {
-                "ready" => {
-                    if !audio_warm_attempted {
-                        audio_warm_attempted = true;
-                        if let Err(error) = analyzer.warm_audio() {
-                            eprintln!("TANREN VOICEVOX warm-up failed: {error}");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut audio_warm_attempted = false;
+            loop {
+                if !generation_active.load(Ordering::Acquire) { return; }
+                match analyzer.audio_runtime_phase().as_str() {
+                    "ready" => {
+                        if !audio_warm_attempted {
+                            audio_warm_attempted = true;
+                            if let Err(error) = analyzer.warm_audio() {
+                                eprintln!("TANREN VOICEVOX warm-up failed: {error}");
+                            }
                         }
                     }
+                    "unavailable" => return,
+                    _ => {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    }
                 }
-                "unavailable" => break,
-                _ => {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    continue;
-                }
-            }
-            let jobs = match db.queued_enrichment(24) {
-                Ok(jobs) => jobs,
-                Err(error) => { eprintln!("TANREN enrichment queue error: {error}"); break; }
-            };
-            if jobs.is_empty() {
-                drained = true;
-                break;
-            }
-            for entry in jobs {
-                match analyzer.analyze(&entry) {
-                    Ok((analysis, audio)) => {
-                        match db.set_entry_analysis_if_pronunciation_current(
-                            &entry,
-                            analysis.reading.as_deref(),
-                            &analysis.analysis_json(),
-                            &analysis.provider,
-                            &analysis.source,
-                            &analysis.confidence,
-                            analysis.model_version.as_deref(),
-                            analysis.pitch_patterns.as_deref(),
-                            &analysis.scope,
-                            &audio,
-                        ) {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                if let Err(error) = analyzer.invalidate_audio(&entry.id) {
+                let jobs = match db.queued_enrichment(24) {
+                    Ok(jobs) => jobs,
+                    Err(error) => {
+                        eprintln!("TANREN enrichment queue error: {error}; retrying");
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                if jobs.is_empty() { return; }
+                for entry in jobs {
+                    if !generation_active.load(Ordering::Acquire) { return; }
+                    match analyzer.analyze(&entry) {
+                        Ok((analysis, audio)) => {
+                            match db.set_entry_analysis_if_pronunciation_current(
+                                &entry,
+                                analysis.reading.as_deref(),
+                                &analysis.analysis_json(),
+                                &analysis.provider,
+                                &analysis.source,
+                                &analysis.confidence,
+                                analysis.model_version.as_deref(),
+                                analysis.pitch_patterns.as_deref(),
+                                &analysis.scope,
+                                &audio,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    if let Err(error) = analyzer.invalidate_audio(&entry.id) {
+                                        let _ = db.fail_enrichment(&entry.id, &error);
+                                    }
+                                }
+                                Err(error) => {
                                     let _ = db.fail_enrichment(&entry.id, &error);
                                 }
                             }
-                            Err(error) => {
-                                let _ = db.fail_enrichment(&entry.id, &error);
-                            }
                         }
+                        Err(error) => { let _ = db.fail_enrichment(&entry.id, &error); }
                     }
-                    Err(error) => { let _ = db.fail_enrichment(&entry.id, &error); }
                 }
             }
-        }
+        }));
         running.store(false, Ordering::Release);
-        if drained {
-            match db.queued_enrichment(1) {
-                Ok(jobs) if !jobs.is_empty() => {
-                    start_enrichment_worker(db, analyzer, running);
-                }
-                Ok(_) => {}
-                Err(error) => eprintln!("TANREN enrichment queue handoff error: {error}"),
+        if result.is_err() {
+            eprintln!("TANREN enrichment worker panicked; restarting if work remains");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        if !generation_active.load(Ordering::Acquire) { return; }
+        match db.queued_enrichment(1) {
+            Ok(jobs) if !jobs.is_empty() && analyzer.audio_runtime_phase() != "unavailable" => {
+                start_enrichment_worker(db, analyzer, running, generation_active);
             }
+            Ok(_) => {}
+            Err(error) => eprintln!("TANREN enrichment queue handoff error: {error}"),
         }
     });
 }
@@ -1630,6 +1654,7 @@ pub fn run() {
             let semantic_relation = OnnxNliRelationBackend::install(semantic_home.clone());
             let semantic = Arc::new(SemanticGrader::new(semantic_backend, semantic_relation, db.clone(), SemanticThresholds::configured()));
             let enrichment_running = Arc::new(AtomicBool::new(false));
+            let enrichment_generation_active = Arc::new(AtomicBool::new(false));
             let startup_preflight_started = Arc::new(AtomicBool::new(false));
             let startup_preflight_done = Arc::new(AtomicBool::new(false));
             let startup_language_download_progress = Arc::new(AtomicU8::new(0));
@@ -1657,6 +1682,7 @@ pub fn run() {
                 engine: Mutex::new(Engine::default()),
                 input: Mutex::new(WindowsInputAdapter::default()),
                 enrichment_running: Arc::clone(&enrichment_running),
+                enrichment_generation_active,
                 startup_preflight_started,
                 startup_preflight_done,
                 startup_language_download_progress,
@@ -1704,6 +1730,8 @@ pub fn run() {
             create_deck,
             import_entries,
             enrichment_progress,
+            pending_enrichment_entry_ids,
+            set_enrichment_generation_active,
             update_entry,
             delete_entry,
             update_deck,

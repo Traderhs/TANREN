@@ -798,6 +798,7 @@ function App() {
               onOpenedDeckChange={setStatsDeckId}
               onRequestHomeSection={scrollHomeSection}
               audioSettings={audioSettings}
+              generationReady={initialRuntimeReady}
             />
           </section>
           <section className="home-snap-section home-stats-section">
@@ -1112,13 +1113,14 @@ const BookDeleteButton = memo(function BookDeleteButton({ deck, onDeleted }: {
   </button>;
 }, (previous, next) => previous.deck.id === next.deck.id && previous.deck.name === next.deck.name);
 
-function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeSection, audioSettings }: {
+function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeSection, audioSettings, generationReady }: {
   decks: DeckSummary[];
   onRefresh: () => Promise<void>;
   onEdit: (d: DeckSummary) => void;
   onOpenedDeckChange: (deckId: string | null) => void;
   onRequestHomeSection: (index: number) => void;
   audioSettings: AudioSettings;
+  generationReady: boolean;
 }) {
   const [name, setName] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
@@ -1147,11 +1149,11 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const [singleMeaning, setSingleMeaning] = useState("");
   const [singleReading, setSingleReading] = useState("");
   const [originalEntry, setOriginalEntry] = useState<EntryRecord | null>(null);
-  const [bulkText, setBulkText] = useState("");
-  const [bulkFileName, setBulkFileName] = useState("");
   const [editedStudyEntry, setEditedStudyEntry] = useState<EntryDetails | null>(null);
   const [studyAudioRevision, setStudyAudioRevision] = useState(0);
   const [studyEntryLoading, setStudyEntryLoading] = useState(false);
+  const [bulkText, setBulkText] = useState("");
+  const [bulkFileName, setBulkFileName] = useState("");
   const [entryMessage, setEntryMessage] = useState("");
   const [entrySaving, setEntrySaving] = useState(false);
   const [entryProcessing, setEntryProcessing] = useState<{
@@ -1160,6 +1162,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     failed: number;
     runtimePhase: string;
   } | null>(null);
+  const pendingEnrichmentResumeStartedRef = useRef(false);
   const reduceMotion = useReducedMotion();
   const flipBookRef = useRef<any>(null);
   const bookFoldRef = useRef<HTMLDivElement>(null);
@@ -1231,6 +1234,8 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     if (entryIds.length === 0) return { total: 0, completed: 0, failed: 0, pending: 0, last_error: null, runtime_phase: "ready" };
     setEntryProcessing({ total: entryIds.length, completed: 0, failed: 0, runtimePhase: "ready" });
     try {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())));
+      await api.setEnrichmentGenerationActive(true);
       for (;;) {
         const progress = await api.enrichmentProgress(entryIds);
         setEntryProcessing({
@@ -1243,9 +1248,18 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
         await new Promise((resolve) => window.setTimeout(resolve, 250));
       }
     } finally {
+      await api.setEnrichmentGenerationActive(false).catch(() => undefined);
       setEntryProcessing(null);
     }
   };
+
+  useEffect(() => {
+    if (!generationReady || pendingEnrichmentResumeStartedRef.current) return;
+    pendingEnrichmentResumeStartedRef.current = true;
+    void api.pendingEnrichmentEntryIds()
+      .then((entryIds) => entryIds.length ? waitForEntryProcessing(entryIds) : null)
+      .catch((cause) => setEntryMessage(String(cause)));
+  }, [generationReady]);
 
   useEffect(() => {
     if (!entryProcessing) return;
@@ -1393,6 +1407,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   };
 
   const showBookStudy = () => {
+    setEditedStudyEntry(null);
     clearStudyFlutterTimer();
     setBookStudyExiting(false);
     setBookStudyTransitioning(false);
@@ -1407,7 +1422,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       if (!pageFlip) {
         scheduleStudyFlutter(sessionKey, 16);
         return;
-    setEditedStudyEntry(null);
       }
       const pageIndex = Number(pageFlip.getCurrentPageIndex?.() ?? BOOK_CONTENT_PAGE);
       if (pageFlip.getState?.() !== "read") {
@@ -1606,6 +1620,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   };
 
   const closeEntryDialog = () => {
+    if (entrySaving) return;
     if (entryDialog === "bulk") {
       setBulkText("");
       setBulkFileName("");
@@ -1613,7 +1628,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setEntryDialog(null);
     setEditingEntryId(null);
     setOriginalEntry(null);
-    if (entrySaving) return;
   };
 
   const activateEntryInputProfile = (language: string) => {
@@ -1707,6 +1721,10 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
           ? await waitForEntryProcessing([editingEntryId])
           : null;
       const processingPrefix = editingEntryId ? "저장했지만" : "추가했지만";
+      if (bookStudyActive && editingEntryId && textChanged) {
+        setEditedStudyEntry(await api.entryDetails(openedDeck.id, editingEntryId));
+        if (pronunciationChanged) setStudyAudioRevision((revision) => revision + 1);
+      }
 
       setSingleTerm("");
       setSingleMeaning("");
@@ -1714,16 +1732,14 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       setOriginalEntry(null);
       setEntryDialog(null);
       setEditingEntryId(null);
-      if (bookStudyActive && editingEntryId && textChanged) {
-        setEditedStudyEntry(await api.entryDetails(openedDeck.id, editingEntryId));
-        if (pronunciationChanged) setStudyAudioRevision((revision) => revision + 1);
-      }
       setEntryMessage(processing?.failed
           ? `${processingPrefix} ${processing.failed.toLocaleString("ko-KR")}개 표현의 피치·음성 생성에 실패했어요${processing.last_error ? ` ${processing.last_error}` : ""}`
         : processing?.runtime_phase === "unavailable"
             ? `${processingPrefix} 음성 엔진을 사용할 수 없어 피치·음성 생성을 완료하지 못했어요`
           : "");
       await refreshBookEntries(openedDeck.id, Boolean(result?.inserted));
+    } catch (cause) {
+      setEntryMessage(String(cause));
     } finally {
       setEntrySaving(false);
     }
@@ -1731,8 +1747,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
 
   const addBulkEntries = async () => {
     if (!openedDeck || parsedBulkEntries.entries.length === 0 || entrySaving) return;
-    } catch (cause) {
-      setEntryMessage(String(cause));
     setEntrySaving(true);
     try {
       const result = await api.importEntries(openedDeck.id, parsedBulkEntries.entries);
@@ -1987,13 +2001,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             initialResult={studyResult}
             audioSettings={audioSettings}
             exiting={bookStudyExiting}
-            onExitFadeComplete={() => {
-              setBookStudyActive(false);
-              setBookStudyExiting(false);
-              setBookStudyTransitioning(false);
-              setStudyResult(null);
-              setBookStudyNavigationLocked(false);
-            }}
             entryEditing={Boolean(entryDialog) || entrySaving || studyEntryLoading}
             editedEntry={editedStudyEntry}
             entryMessage={entryMessage}
@@ -2005,6 +2012,13 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
               } finally {
                 setStudyEntryLoading(false);
               }
+            }}
+            onExitFadeComplete={() => {
+              setBookStudyActive(false);
+              setBookStudyExiting(false);
+              setBookStudyTransitioning(false);
+              setStudyResult(null);
+              setBookStudyNavigationLocked(false);
             }}
             onExit={async () => {
             await api.exitStudy();
@@ -2073,6 +2087,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
 
             {entryDialog && <div className="book-entry-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !entrySaving) closeEntryDialog(); }}>
               {entryDialog === "single" ? <form className="book-entry-dialog" onSubmit={(event) => void addSingleEntry(event)}>
+                {entryMessage && <p className="book-entry-message" role="alert">{entryMessage}</p>}
                 <div className="book-entry-dialog-head"><div><span>{editingEntryId ? "EDIT EXPRESSION" : "ADD EXPRESSION"}</span><h3 className="book-entry-dialog-title">{editingEntryId ? "표현 편집" : "표현 추가"}</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
                 <label><span>표현</span><input className="home-create-input" autoFocus value={singleTerm} onFocus={() => { if (!editingEntryId && openedDeck) activateEntryInputProfile(openedDeck.target_language); }} onChange={(event) => setSingleTerm(event.target.value)} placeholder="표현을 입력해주세요" /></label>
                 <label><span>발음 <small>선택</small></span><input className="home-create-input" value={singleReading} onChange={(event) => setSingleReading(event.target.value)} placeholder="발음을 입력해주세요" /></label>
@@ -2080,7 +2095,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                 <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim() || japaneseReadingInvalid}>{editingEntryId ? "저장" : "추가"}</button></div>
               </form> : <div className="book-entry-dialog book-entry-import-dialog">
                 <div className="book-entry-dialog-head"><div><span>IMPORT EXPRESSIONS</span><h3 className="book-entry-dialog-title">파일로 표현 추가</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
-                {entryMessage && <p className="book-entry-message" role="alert">{entryMessage}</p>}
                 <div className="book-entry-import-meta">
                   <strong title={bulkFileName}>{bulkFileName || "선택한 파일"}</strong>
                   <span>총 {parsedBulkEntries.entries.length.toLocaleString("ko-KR")}개{bulkPreviewHiddenCount > 0 ? ` (${IMPORT_PREVIEW_LIMIT.toLocaleString("ko-KR")}개 미리보기)` : ""}</span>
@@ -2106,6 +2120,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
 
         {bookPanel === "study" && entryDialog && <div className="book-entry-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !entrySaving) closeEntryDialog(); }}>
           {entryDialog === "single" ? <form className="book-entry-dialog" onSubmit={(event) => void addSingleEntry(event)}>
+            {entryMessage && <p className="book-entry-message" role="alert">{entryMessage}</p>}
             <div className="book-entry-dialog-head"><div><span>{editingEntryId ? "EDIT EXPRESSION" : "ADD EXPRESSION"}</span><h3 className="book-entry-dialog-title">{editingEntryId ? "표현 편집" : "표현 추가"}</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
             <label><span>표현</span><input className="home-create-input" autoFocus value={singleTerm} onFocus={() => { if (!editingEntryId && openedDeck) activateEntryInputProfile(openedDeck.target_language); }} onChange={(event) => setSingleTerm(event.target.value)} placeholder="표현을 입력해주세요" /></label>
             <label><span>발음 <small>선택</small></span><input className="home-create-input" value={singleReading} onChange={(event) => setSingleReading(event.target.value)} placeholder="발음을 입력해주세요" /></label>
@@ -2113,7 +2128,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim() || japaneseReadingInvalid}>{editingEntryId ? "저장" : "추가"}</button></div>
           </form> : <div className="book-entry-dialog book-entry-import-dialog">
             <div className="book-entry-dialog-head"><div><span>IMPORT EXPRESSIONS</span><h3 className="book-entry-dialog-title">파일로 표현 추가</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
-            {entryMessage && <p className="book-entry-message" role="alert">{entryMessage}</p>}
             <div className="book-entry-import-meta">
               <strong title={bulkFileName}>{bulkFileName || "선택한 파일"}</strong>
               <span>총 {parsedBulkEntries.entries.length.toLocaleString("ko-KR")}개{bulkPreviewHiddenCount > 0 ? ` (${IMPORT_PREVIEW_LIMIT.toLocaleString("ko-KR")}개 미리보기)` : ""}</span>
@@ -2157,19 +2171,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             </div>
           </div>
         </div>}
-        {entryProcessing && createPortal(
-          <div className="entry-processing-overlay" role="dialog" aria-modal="true" aria-labelledby="entry-processing-title">
-            <div className="initial-loading-content">
-              <span className="initial-loading-spinner" aria-hidden="true" />
-              <h2 id="entry-processing-title">피치·음성을 생성하고 있어요</h2>
-              <div className="initial-loading-status" aria-live="polite">
-                <p><span>진행</span><strong>{(entryProcessing.completed + entryProcessing.failed).toLocaleString("ko-KR")} / {entryProcessing.total.toLocaleString("ko-KR")}</strong></p>
-                <p><span>완료</span><strong>{entryProcessing.total === 0 ? "0%" : `${Math.round(((entryProcessing.completed + entryProcessing.failed) / entryProcessing.total) * 100)}%`}</strong></p>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
       </motion.section> : <motion.div key="shelf" className="book-shelf" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: .18 }}>
         <form className="home-create" onSubmit={create}>
           <input
@@ -2252,12 +2253,26 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             {decks.length === 0 && <div className="empty"><strong>아직 책이 없어요</strong></div>}
       </motion.div>}
     </AnimatePresence>
+    {entryProcessing && createPortal(
+      <div className="entry-processing-overlay" role="dialog" aria-modal="true" aria-labelledby="entry-processing-title">
+        <div className="initial-loading-content">
+          <span className="initial-loading-spinner" aria-hidden="true" />
+          <h2 id="entry-processing-title">피치·음성을 생성하고 있어요</h2>
+          <div className="initial-loading-status" aria-live="polite">
+            <p><span>진행</span><strong>{(entryProcessing.completed + entryProcessing.failed).toLocaleString("ko-KR")} / {entryProcessing.total.toLocaleString("ko-KR")}</strong></p>
+            <p><span>완료</span><strong>{entryProcessing.total === 0 ? "0%" : `${Math.round(((entryProcessing.completed + entryProcessing.failed) / entryProcessing.total) * 100)}%`}</strong></p>
+          </div>
+        </div>
+      </div>,
+      document.body,
+    )}
   </section>;
 }
 
 const MemoDeckList = memo(DeckList, (previous, next) => (
   previous.decks === next.decks
   && previous.audioSettings === next.audioSettings
+  && previous.generationReady === next.generationReady
 ));
 
 function DeckEditor({ deck, onDone }: { deck: DeckSummary; onDone: () => Promise<void> }) {
