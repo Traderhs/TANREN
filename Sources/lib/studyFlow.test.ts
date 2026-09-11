@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { StudyCard, SubmitResult } from "./types";
-import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, reviewAnswerForMode, setPitchLevel } from "./studyFlow";
+import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, refreshReviewEntry, reviewAnswerForMode, setPitchLevel } from "./studyFlow";
 
 const card = (id = "entry:reading"): StudyCard => ({
   entry_id: "entry", variant_id: id, stage: 1, active_duration_ms: 0, mode: "reading", question: "問",
@@ -9,6 +9,36 @@ const card = (id = "entry:reading"): StudyCard => ({
 });
 
 const result = (status: SubmitResult["status"], extra: Partial<SubmitResult> = {}): SubmitResult => ({ status, ...extra });
+
+describe("editing the revealed entry", () => {
+  const details = { entry: { id: "entry", term: "月見", meanings: ["달맞이", "달 구경"], reading: "つきみ" }, audio_path: "regenerated.wav" };
+
+  for (const mode of ["reading", "listening", "writing"] as const) {
+    it(`refreshes ${mode} in the current and other stages without changing progress or grading`, () => {
+      for (const stage of [1, 2, 10]) {
+        const current = { ...card(), stage, mode, audio_path: "old.wav" };
+        const previous = result("review", { canonical_answer: "月  ·  달", failure_type: "UNKNOWN", card: current });
+        const refreshed = refreshReviewEntry(current, previous, details)!;
+        expect(refreshed.card).toEqual({ ...current, question: mode === "writing" ? "달맞이 / 달 구경" : "月見", audio_path: "regenerated.wav" });
+        expect(refreshed.result.failure_type).toBe(previous.failure_type);
+        expect(refreshed.result.reading).toBe("つきみ");
+        expect(reviewAnswerForMode(mode, refreshed.result.canonical_answer)).toBe(mode === "reading" ? "달맞이 / 달 구경" : "月見");
+        expect(activeCardTimerRuns(refreshed.card, refreshed.result)).toBe(false);
+      }
+    });
+  }
+
+  it("preserves a resolved review with no result card and removes invalidated audio", () => {
+    const refreshed = refreshReviewEntry(card(), result("review"), { ...details, audio_path: null })!;
+    expect(refreshed.result.card).toBeUndefined();
+    expect(refreshed.card.audio_path).toBeNull();
+  });
+
+  it("ignores a different entry and an unresolved question", () => {
+    expect(refreshReviewEntry({ ...card(), entry_id: "other" }, result("review"), details)).toBeNull();
+    expect(refreshReviewEntry(card(), result("pass"), details)).toBeNull();
+  });
+});
 
 describe("writing study user actions", () => {
   it("keeps the submitted card through ambiguous accept and reject actions", () => {

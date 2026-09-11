@@ -1,4 +1,15 @@
-import type { StudyCard, StudyMode, SubmitResult } from "./types";
+import type { EntryDetails, StudyCard, StudyMode, SubmitResult } from "./types";
+
+export function refreshReviewEntry(card: StudyCard, result: SubmitResult, details: EntryDetails) {
+  if (card.entry_id !== details.entry.id || !["review", "fail"].includes(result.status)) return null;
+  const { entry } = details;
+  const updatedCard = { ...card, question: card.mode === "writing" ? entry.meanings.join(" / ") : entry.term, audio_path: details.audio_path };
+  return {
+    card: updatedCard,
+    result: { ...result, canonical_answer: `${entry.term}  ·  ${entry.meanings.join(" / ")}`, reading: entry.reading,
+      card: result.card ? updatedCard : result.card },
+  };
+}
 
 export type StudyEnterAction = "submit" | "pitch" | "review" | "none";
 export type PitchLevel = 0 | 1;

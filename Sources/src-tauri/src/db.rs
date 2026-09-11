@@ -906,14 +906,29 @@ impl Database {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let reading = draft.reading.as_deref().map(str::trim).filter(|value| !value.is_empty());
         validate_reading_for_language(&target_language, reading)?;
-        let (revision, previous_term, previous_reading): (i64, String, Option<String>) = tx.query_row(
-            "SELECT revision+1,term,reading FROM entries WHERE id=?1 AND deck_id=?2 AND deleted_at IS NULL",
+        let (revision, previous_term, previous_reading, previous_meanings): (i64, String, Option<String>, String) = tx.query_row(
+            "SELECT revision+1,term,reading,meanings FROM entries WHERE id=?1 AND deck_id=?2 AND deleted_at IS NULL",
             params![entry_id, deck_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).map_err(|e| e.to_string())?;
         let pronunciation_changed = previous_term != term || previous_reading.as_deref().unwrap_or("") != reading.unwrap_or("");
         let meanings_json = serde_json::to_string(&meanings).map_err(|e| e.to_string())?;
         let timestamp = now();
+        let mut old_meanings: Vec<String> = serde_json::from_str(&previous_meanings).map_err(|e| e.to_string())?;
+        let mut new_meanings = meanings.clone();
+        old_meanings.sort();
+        new_meanings.sort();
+        if previous_term != term || old_meanings != new_meanings {
+            let aliases = {
+                let mut stmt = tx.prepare("SELECT id,revision FROM entry_aliases WHERE entry_id=?1 AND deleted_at IS NULL").map_err(|e| e.to_string())?;
+                stmt.query_map([entry_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                    .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            };
+            for (id, alias_revision) in aliases {
+                tx.execute("UPDATE entry_aliases SET deleted_at=?1,updated_at=?1,revision=revision+1,device_id=?2 WHERE id=?3", params![timestamp, self.device_id, id]).map_err(|e| e.to_string())?;
+                journal(&tx, &id, "entry_alias", &self.device_id, alias_revision + 1, "delete", &serde_json::json!({"entry_id":entry_id}))?;
+            }
+        }
         tx.execute(
             "UPDATE entries SET term=?1,meanings=?2,reading=?3,updated_at=?4,revision=?5,device_id=?6 WHERE id=?7 AND deck_id=?8 AND deleted_at IS NULL",
             params![term, meanings_json, reading, timestamp, revision, self.device_id, entry_id, deck_id],
@@ -947,6 +962,15 @@ impl Database {
             ).map_err(|e| e.to_string())?;
             for (id, pitch_revision) in pitch_rows {
                 journal(&tx, &id, "pitch_pattern", &self.device_id, pitch_revision + 1, "delete", &serde_json::json!({"entry_id":entry_id}))?;
+            }
+            let analyses = {
+                let mut stmt = tx.prepare("SELECT id,revision FROM japanese_analyses WHERE entry_id=?1").map_err(|e| e.to_string())?;
+                stmt.query_map([entry_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                    .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            };
+            tx.execute("DELETE FROM japanese_analyses WHERE entry_id=?1", [entry_id]).map_err(|e| e.to_string())?;
+            for (id, analysis_revision) in analyses {
+                journal(&tx, &id, "japanese_analysis", &self.device_id, analysis_revision + 1, "delete", &serde_json::json!({"entry_id":entry_id}))?;
             }
 
             tx.execute(

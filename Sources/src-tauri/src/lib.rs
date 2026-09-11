@@ -9,6 +9,8 @@ mod study;
 mod timers;
 mod voicevox;
 mod windows_input;
+#[cfg(test)]
+mod edit_matrix_tests;
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},

@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { api } from "./lib/api";
+import { EntryEditButton } from "./EntryEditButton";
 import type { EntryListRecord } from "./lib/types";
 
 type BookEntrySortKey = "position" | "term" | "reading" | "meaning" | "attempts";
@@ -285,12 +286,7 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
             <span className="book-inline-entry-reading" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, entry.reading || "—")}>{entry.reading || "—"}</span>
             <span className="book-inline-entry-meaning" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, entry.meanings.join(" / "))}>{entry.meanings.join(" / ")}</span>
             <span className="book-inline-entry-attempts" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, `${entry.attempts.toLocaleString("ko-KR")}회`)}>{entry.attempts.toLocaleString("ko-KR")}회</span>
-            <button type="button" className="book-inline-entry-settings" onClick={() => onEdit(entry)} aria-label={`${entry.term} 편집`} title="표현 편집">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 20h4.2L19 9.2a2 2 0 0 0 0-2.8l-1.4-1.4a2 2 0 0 0-2.8 0L4 15.8V20Z" />
-                <path d="m13.8 6 4.2 4.2" />
-              </svg>
-            </button>
+            <EntryEditButton onClick={() => onEdit(entry)} label={`${entry.term} 편집`} />
             <button type="button" className="book-inline-entry-delete" onClick={() => onDelete(entry)} aria-label={`${entry.term} 삭제`} title="표현 삭제">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M4.5 6.5h15" />

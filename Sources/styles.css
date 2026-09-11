@@ -6558,6 +6558,8 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
 .learning-answer-review .learning-meaning-grades>.is-correct { color: #84c79b; }
 .learning-answer-review .learning-meaning-grades>.is-incorrect { color: #d98787; }
 .learning-answer-review .learning-correct-answer>strong { max-width: 100%; font-size: 26px; overflow-wrap: anywhere; }
+.learning-correct-answer-label { display: flex; align-items: center; gap: 6px; }
+.learning-correct-answer-label .book-inline-entry-settings { width: 30px; }
 .learning-adjudication .learning-feedback-actions {
   width: auto;
   display: flex;
