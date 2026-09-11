@@ -83,16 +83,21 @@ impl LlamaCppEmbeddingBackend {
             if fs::read_to_string(&installer_path).ok().as_deref() != Some(INSTALLER) {
                 fs::write(&installer_path, INSTALLER).map_err(|e| e.to_string())?;
             }
-            let status = Command::new("powershell.exe")
+            let mut command = Command::new("powershell.exe");
+            command
                 .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
                 .arg(&installer_path)
                 .arg("-HomePath")
                 .arg(&self.home)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map_err(|e| format!("semantic installer could not start: {e}"))?;
+                .stderr(Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            let status = command.status().map_err(|e| format!("semantic installer could not start: {e}"))?;
             if !status.success() { return Err(format!("semantic installer failed with {status}")); }
         }
 

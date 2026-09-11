@@ -162,7 +162,6 @@ if (-not [string]::IsNullOrWhiteSpace($UniDicSource)) {
         if ($LASTEXITCODE -ne 0) { throw "temporary UniDic dictionary junction removal failed with exit code $LASTEXITCODE" }
     }
     if (-not $DevOnly) { Set-UniDicFrozenDictionaryLocation $EnvPython }
-    Remove-Item -LiteralPath $BundledDictionary -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $BundledDictionary | Out-Null
     Get-ChildItem -LiteralPath $UniDicSource -Recurse -Force | ForEach-Object {
         $relative = $_.FullName.Substring($UniDicSource.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
@@ -170,12 +169,24 @@ if (-not [string]::IsNullOrWhiteSpace($UniDicSource)) {
         if ($_.PSIsContainer) {
             New-Item -ItemType Directory -Force -Path $destination | Out-Null
         } else {
+            $sourcePath = $_.FullName
             $parent = Split-Path -Parent $destination
             New-Item -ItemType Directory -Force -Path $parent | Out-Null
-            try {
-                New-Item -ItemType HardLink -Path $destination -Target $_.FullName -ErrorAction Stop | Out-Null
-            } catch {
-                Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
+            $reuseExisting = $false
+            if (Test-Path -LiteralPath $destination) {
+                $existing = Get-Item -LiteralPath $destination -Force
+                if (($existing.LinkType -eq "HardLink") -and (@($existing.Target) -contains $sourcePath)) {
+                    $reuseExisting = $true
+                } else {
+                    Remove-Item -LiteralPath $destination -Force
+                }
+            }
+            if (-not $reuseExisting) {
+                try {
+                    New-Item -ItemType HardLink -Path $destination -Target $sourcePath -ErrorAction Stop | Out-Null
+                } catch {
+                    Copy-Item -LiteralPath $sourcePath -Destination $destination -Force
+                }
             }
         }
     }
