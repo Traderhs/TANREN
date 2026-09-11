@@ -15,7 +15,7 @@ import { BookStudy } from "./BookStudy";
 import { loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import { playEffectSound, preloadBookEffectSounds } from "./lib/soundEffects";
 import type { SubmitResult } from "./lib/types";
-import type { AudioSettings, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
+import type { AudioSettings, DeckSummary, EntryDetails, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
 
 type View = "decks" | "editor" | "settings";
 
@@ -1149,6 +1149,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const [originalEntry, setOriginalEntry] = useState<EntryRecord | null>(null);
   const [bulkText, setBulkText] = useState("");
   const [bulkFileName, setBulkFileName] = useState("");
+  const [editedStudyEntry, setEditedStudyEntry] = useState<EntryDetails | null>(null);
+  const [studyAudioRevision, setStudyAudioRevision] = useState(0);
+  const [studyEntryLoading, setStudyEntryLoading] = useState(false);
   const [entryMessage, setEntryMessage] = useState("");
   const [entrySaving, setEntrySaving] = useState(false);
   const [entryProcessing, setEntryProcessing] = useState<{
@@ -1404,6 +1407,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       if (!pageFlip) {
         scheduleStudyFlutter(sessionKey, 16);
         return;
+    setEditedStudyEntry(null);
       }
       const pageIndex = Number(pageFlip.getCurrentPageIndex?.() ?? BOOK_CONTENT_PAGE);
       if (pageFlip.getState?.() !== "read") {
@@ -1573,7 +1577,15 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setEntryDialog("single");
   };
 
-  const openEditEntryDialog = (entry: EntryListRecord) => {
+  const openEditEntryDialog = async (requested: Pick<EntryRecord, "id">) => {
+    if (!openedDeck) return;
+    let entry: EntryRecord;
+    try {
+      entry = (await api.entryDetails(openedDeck.id, requested.id)).entry;
+    } catch (cause) {
+      setEntryMessage(String(cause));
+      return;
+    }
     setEditingEntryId(entry.id);
     setSingleTerm(entry.term);
     setSingleMeaning(entry.meanings.join(" / "));
@@ -1581,14 +1593,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setOriginalEntry(entry);
     setEntryMessage("");
     setEntryDialog("single");
-    if (!openedDeck) return;
-    void api.entryDetails(openedDeck.id, entry.id).then((details) => {
-      if (details.entry.id !== entry.id) return;
-      setOriginalEntry(details.entry);
-      setSingleTerm(details.entry.term);
-      setSingleMeaning(details.entry.meanings.join(" / "));
-      setSingleReading(details.entry.reading ?? "");
-    }).catch((cause) => setEntryMessage(String(cause)));
   };
 
   const chooseImportEntryFile = async () => {
@@ -1609,6 +1613,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setEntryDialog(null);
     setEditingEntryId(null);
     setOriginalEntry(null);
+    if (entrySaving) return;
   };
 
   const activateEntryInputProfile = (language: string) => {
@@ -1709,6 +1714,10 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       setOriginalEntry(null);
       setEntryDialog(null);
       setEditingEntryId(null);
+      if (bookStudyActive && editingEntryId && textChanged) {
+        setEditedStudyEntry(await api.entryDetails(openedDeck.id, editingEntryId));
+        if (pronunciationChanged) setStudyAudioRevision((revision) => revision + 1);
+      }
       setEntryMessage(processing?.failed
           ? `${processingPrefix} ${processing.failed.toLocaleString("ko-KR")}개 표현의 피치·음성 생성에 실패했어요${processing.last_error ? ` ${processing.last_error}` : ""}`
         : processing?.runtime_phase === "unavailable"
@@ -1722,6 +1731,8 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
 
   const addBulkEntries = async () => {
     if (!openedDeck || parsedBulkEntries.entries.length === 0 || entrySaving) return;
+    } catch (cause) {
+      setEntryMessage(String(cause));
     setEntrySaving(true);
     try {
       const result = await api.importEntries(openedDeck.id, parsedBulkEntries.entries);
@@ -1983,6 +1994,18 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
               setStudyResult(null);
               setBookStudyNavigationLocked(false);
             }}
+            entryEditing={Boolean(entryDialog) || entrySaving || studyEntryLoading}
+            editedEntry={editedStudyEntry}
+            entryMessage={entryMessage}
+            audioRevision={studyAudioRevision}
+            onEditEntry={async (entryId) => {
+              setStudyEntryLoading(true);
+              try {
+                await openEditEntryDialog({ id: entryId });
+              } finally {
+                setStudyEntryLoading(false);
+              }
+            }}
             onExit={async () => {
             await api.exitStudy();
             if (reduceMotion) {
@@ -2057,6 +2080,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                 <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim() || japaneseReadingInvalid}>{editingEntryId ? "저장" : "추가"}</button></div>
               </form> : <div className="book-entry-dialog book-entry-import-dialog">
                 <div className="book-entry-dialog-head"><div><span>IMPORT EXPRESSIONS</span><h3 className="book-entry-dialog-title">파일로 표현 추가</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
+                {entryMessage && <p className="book-entry-message" role="alert">{entryMessage}</p>}
                 <div className="book-entry-import-meta">
                   <strong title={bulkFileName}>{bulkFileName || "선택한 파일"}</strong>
                   <span>총 {parsedBulkEntries.entries.length.toLocaleString("ko-KR")}개{bulkPreviewHiddenCount > 0 ? ` (${IMPORT_PREVIEW_LIMIT.toLocaleString("ko-KR")}개 미리보기)` : ""}</span>
@@ -2089,6 +2113,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             <div className="book-entry-dialog-actions"><button type="button" className="settings-action-button" onClick={closeEntryDialog}>취소</button><button className="settings-action-button" disabled={entrySaving || !singleTerm.trim() || !singleMeaning.trim() || japaneseReadingInvalid}>{editingEntryId ? "저장" : "추가"}</button></div>
           </form> : <div className="book-entry-dialog book-entry-import-dialog">
             <div className="book-entry-dialog-head"><div><span>IMPORT EXPRESSIONS</span><h3 className="book-entry-dialog-title">파일로 표현 추가</h3></div><button type="button" className="book-entry-dialog-close ghost" onClick={closeEntryDialog}>×</button></div>
+            {entryMessage && <p className="book-entry-message" role="alert">{entryMessage}</p>}
             <div className="book-entry-import-meta">
               <strong title={bulkFileName}>{bulkFileName || "선택한 파일"}</strong>
               <span>총 {parsedBulkEntries.entries.length.toLocaleString("ko-KR")}개{bulkPreviewHiddenCount > 0 ? ` (${IMPORT_PREVIEW_LIMIT.toLocaleString("ko-KR")}개 미리보기)` : ""}</span>

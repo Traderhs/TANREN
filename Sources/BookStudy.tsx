@@ -2,12 +2,14 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, 
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { flushSync } from "react-dom";
 import { api } from "./lib/api";
+import { EntryEditButton } from "./EntryEditButton";
 import {
   activeCardTimerRuns,
   cardAfterResult,
   emptyPitchSelection,
   pitchSubmission,
   reviewAnswerForMode,
+  refreshReviewEntry,
   setPitchLevel,
   type PitchLevel,
   type PitchSelection,
@@ -16,7 +18,7 @@ import { completionDelayMs, firstMeaningfulInputAt, isMeaningfulInput } from "./
 import { japaneseImeEnterCommitsYomi, japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { JapaneseImeSegment, JapaneseImeSession } from "./lib/japaneseIme";
 import { playEffectSound } from "./lib/soundEffects";
-import type { AudioSettings, DeckSummary, PitchQuestion, StudyCard, SubmitResult } from "./lib/types";
+import type { AudioSettings, DeckSummary, EntryDetails, PitchQuestion, StudyCard, SubmitResult } from "./lib/types";
 
 function answerPlaceholder(card: StudyCard | null) {
   if (!card) return "답을 입력해주세요";
@@ -101,6 +103,11 @@ export function BookStudy({
   onExit,
   exiting = false,
   onExitFadeComplete,
+  onEditEntry,
+  entryEditing = false,
+  editedEntry,
+  entryMessage,
+  audioRevision = 0,
 }: {
   deck: DeckSummary;
   initialResult: SubmitResult;
@@ -108,6 +115,11 @@ export function BookStudy({
   onExit: () => Promise<void>;
   exiting?: boolean;
   onExitFadeComplete?: () => void;
+  onEditEntry: (entryId: string) => Promise<void>;
+  entryEditing?: boolean;
+  editedEntry?: EntryDetails | null;
+  entryMessage?: string;
+  audioRevision?: number;
 }) {
   const [result, setResult] = useState(initialResult);
   const [card, setCard] = useState(initialResult.card ?? null);
@@ -196,6 +208,20 @@ export function BookStudy({
   const preedit = imeSegments.map((segment) => segment.text).join("");
   const candidates = imeSegments.find((segment) => segment.kind === "focus" && segment.candidates?.length);
   const total = card?.total ?? lastTotal.current;
+
+  useEffect(() => {
+    if (!editedEntry || !cardRef.current) return;
+    const refreshed = refreshReviewEntry(cardRef.current, result, editedEntry);
+    if (!refreshed) return;
+    audio.current?.pause();
+    cardRef.current = refreshed.card;
+    setCard(refreshed.card);
+    setResult(refreshed.result);
+    if (result.reading !== editedEntry.entry.reading || reviewAnswerForMode("writing", result.canonical_answer) !== editedEntry.entry.term) {
+      setSubmittedPitch(null);
+      setSubmittedPitchQuestion(null);
+    }
+  }, [editedEntry]);
 
   const syncReviewPitchScroll = (target: HTMLDivElement | null, scrollLeft: number) => {
     if (!target || syncingReviewPitchScroll.current || target.scrollLeft === scrollLeft) return;
@@ -663,15 +689,16 @@ export function BookStudy({
   }, [active, busy, card?.variant_id, listeningPhase]);
 
   useEffect(() => {
+    if (entryEditing) return;
     const blockStudyTabNavigation = (event: KeyboardEvent) => {
       if (event.key === "Tab") event.preventDefault();
     };
     window.addEventListener("keydown", blockStudyTabNavigation, true);
     return () => window.removeEventListener("keydown", blockStudyTabNavigation, true);
-  }, []);
+  }, [entryEditing]);
 
   useEffect(() => {
-    if (!review || pitchQuestion || busy) return;
+    if (!review || pitchQuestion || busy || entryEditing) return;
     const nextOnEnter = (event: KeyboardEvent) => {
       if (event.key !== "Enter" || event.repeat || event.isComposing) return;
       event.preventDefault();
@@ -679,7 +706,7 @@ export function BookStudy({
     };
     window.addEventListener("keydown", nextOnEnter, true);
     return () => window.removeEventListener("keydown", nextOnEnter, true);
-  }, [review, pitchQuestion, busy, card?.variant_id]);
+  }, [review, pitchQuestion, busy, entryEditing, card?.variant_id]);
 
   useEffect(() => {
     if (!cycleComplete || busy) return;
@@ -1344,7 +1371,11 @@ export function BookStudy({
           <div className={`learning-review-result-stack ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
             <div className={`learning-answer-comparison ${submittedAnswerKnown ? "has-user-answer" : ""}`}>
               <div className="learning-correct-answer">
-                <span>정답</span>
+                <span className="learning-correct-answer-label">정답 <EntryEditButton disabled={busy || entryEditing || !card} onClick={() => {
+                  if (!card) return;
+                  audio.current?.pause();
+                  void onEditEntry(card.entry_id).catch((cause) => setError(String(cause)));
+                }} /></span>
                 {card?.mode === "listening" ? <>
                   <strong lang={deck.target_language}>{reviewAnswer}</strong>
                   <strong lang={deck.source_language}>{listeningReviewMeaning}</strong>
@@ -1383,8 +1414,9 @@ export function BookStudy({
       </>}
 
       {card?.audio_path && <audio
+        key={audioRevision}
         ref={audio}
-        src={convertFileSrc(card.audio_path)}
+        src={`${convertFileSrc(card.audio_path)}${audioRevision ? `?edit=${audioRevision}` : ""}`}
         preload="auto"
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}
@@ -1397,6 +1429,7 @@ export function BookStudy({
       />}
       {(card?.input_warning || inputWarning) && <p className="learning-warning">{card?.input_warning || inputWarning}</p>}
       {error && <p className="learning-error" role="alert">{error}</p>}
+      {entryMessage && <p className="learning-error" role="alert">{entryMessage}</p>}
     </main>
   </section>;
 }
