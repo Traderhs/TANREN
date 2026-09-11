@@ -199,17 +199,13 @@ class ScopeAndCacheFixtures(unittest.TestCase):
             self.assertTrue(jp.valid_wav(path))
         self.assertEqual([call[0] for call in calls], ["/audio_query", "/synthesis"])
 
-    def test_long_vowel_heiban_falls_back_from_voicevox_kana_parser_and_keeps_unidic_accent(self):
+    def test_long_vowel_heiban_collapses_split_voicevox_phrases_and_keeps_unidic_accent(self):
         calls = []
 
         def fake_request(base_url, path, params=None, body=None, binary=False):
             calls.append((path, params, body))
             if path == "/audio_query":
                 return {"accent_phrases": [{"moras": [{"text": "オ"}, {"text": "ハ"}], "accent": 2}, {"moras": [{"text": "ヨ"}, {"text": "ー"}], "accent": 1}], "speedScale": 1.0, "pitchScale": 0.0, "postPhonemeLength": 0.1}
-            if path == "/accent_phrases" and params.get("is_kana") == "true":
-                raise urllib.error.HTTPError("http://voicevox", 400, "Bad Request", None, None)
-            if path == "/accent_phrases":
-                return [{"moras": [{"text": "オ"}, {"text": "ハ"}, {"text": "ヨ"}, {"text": "ー"}], "accent": 2}]
             if path == "/mora_data":
                 return body
             if path == "/synthesis":
@@ -220,10 +216,57 @@ class ScopeAndCacheFixtures(unittest.TestCase):
             path = os.path.join(directory, "ohayo.wav")
             jp.synthesize_voicevox("http://voicevox", "おはよー", ["お", "は", "よ", "ー"], 0, 7, path)
             self.assertTrue(jp.valid_wav(path))
-        fallback_call = next(call for call in calls if call[0] == "/accent_phrases" and call[1].get("is_kana") == "false")
         mora_call = next(call for call in calls if call[0] == "/mora_data")
-        self.assertEqual(fallback_call[1]["text"], "おはよー")
+        self.assertNotIn("/accent_phrases", [call[0] for call in calls])
+        self.assertEqual(len(mora_call[2]), 1)
+        self.assertEqual([mora["text"] for mora in mora_call[2][0]["moras"]], ["オ", "ハ", "ヨ", "ー"])
         self.assertEqual(mora_call[2][0]["accent"], 4)
+
+    def test_lexical_voicevox_phrase_accepts_split_loanword_and_absorbed_final_long_vowel(self):
+        report = jp.lexical_voicevox_phrase(
+            [
+                {"moras": [{"text": "レ"}], "accent": 1, "pause_mora": None},
+                {"moras": [{"text": "ポ"}, {"text": "オ"}], "accent": 1, "pause_mora": None},
+                {"moras": [{"text": "ト"}], "accent": 1, "pause_mora": None},
+            ],
+            ["れ", "ぽ", "ー", "と"],
+            3,
+        )
+        self.assertIsNotNone(report)
+        report_phrases, report_nucleus = report
+        self.assertEqual(len(report_phrases), 1)
+        self.assertEqual([mora["text"] for mora in report_phrases[0]["moras"]], ["レ", "ポ", "オ", "ト"])
+        self.assertEqual(report_nucleus, 3)
+
+        member = jp.lexical_voicevox_phrase(
+            [{"moras": [{"text": "メ"}, {"text": "ン"}, {"text": "バ"}], "accent": 1, "pause_mora": None}],
+            ["め", "ん", "ば", "ー"],
+            0,
+        )
+        self.assertIsNotNone(member)
+        member_phrases, member_nucleus = member
+        self.assertEqual([mora["text"] for mora in member_phrases[0]["moras"]], ["メ", "ン", "バ"])
+        self.assertEqual(member_nucleus, 3)
+
+        barbecue = jp.lexical_voicevox_phrase(
+            [
+                {"moras": [{"text": "バ"}, {"text": "ア"}, {"text": "ベ"}, {"text": "キ"}], "accent": 4, "pause_mora": None},
+                {"moras": [{"text": "ユ"}, {"text": "ウ"}], "accent": 1, "pause_mora": None},
+            ],
+            ["ば", "ー", "べ", "きゅ", "ー"],
+            3,
+        )
+        self.assertIsNotNone(barbecue)
+
+        projector = jp.lexical_voicevox_phrase(
+            [
+                {"moras": [{"text": "プ"}, {"text": "ロ"}, {"text": "ジ"}, {"text": "エ"}], "accent": 1, "pause_mora": None},
+                {"moras": [{"text": "ク"}, {"text": "タ"}, {"text": "ア"}], "accent": 2, "pause_mora": None},
+            ],
+            ["ぷ", "ろ", "じぇ", "く", "た", "ー"],
+            3,
+        )
+        self.assertIsNotNone(projector)
 
     def test_compound_inflected_phrase_and_sentence_scope(self):
         self.assertEqual(jp.scope_for("国際連合", 1), "lexical")  # dictionary compound when source has one lexical token
@@ -314,6 +357,42 @@ class ScopeAndCacheFixtures(unittest.TestCase):
             )
         self.assertEqual(contour, [1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0])
         self.assertEqual(version, "test-version")
+
+    def test_voicevox_pitch_contour_projects_absorbed_long_vowel(self):
+        with patch.object(jp, "voicevox_metadata", return_value=([{"speaker_id": 7}], "test-version")), \
+             patch.object(jp, "voicevox_request", return_value={
+                 "accent_phrases": [{
+                     "moras": [
+                         {"text": "ア"}, {"text": "リ"}, {"text": "ガ"}, {"text": "ト"},
+                         {"text": "ゴ"}, {"text": "ザ"}, {"text": "イ"}, {"text": "マ"}, {"text": "ス"},
+                     ],
+                     "accent": 4,
+                 }],
+             }):
+            contour, version = jp.voicevox_pitch_contour(
+                "http://voicevox",
+                "ありがとーございます",
+                ["あ", "り", "が", "と", "ー", "ご", "ざ", "い", "ま", "す"],
+            )
+        self.assertEqual(len(contour), 10)
+        self.assertEqual(contour[4], contour[3])
+        self.assertEqual(version, "test-version")
+
+    def test_lexical_pitch_falls_back_to_voicevox_contour_when_accent_alignment_fails(self):
+        tokens = [{"reading": "メンバー", "pronunciation": "メンバー"}]
+        contour = [0, 1, 1, 1]
+        with patch.object(jp, "token_data", return_value=(tokens, None, "unidic-test")), \
+             patch.object(jp, "voicevox_native_accent_type", return_value=(None, "test-version")), \
+             patch.object(jp, "voicevox_pitch_contour", return_value=(contour, "test-version")):
+            result = jp.analyze_request({
+                "text": "メンバー",
+                "reading_hint": "めんばー",
+                "voicevox_url": "http://voicevox",
+            })
+        self.assertEqual(result["pitch_patterns"], [contour])
+        self.assertEqual(result["provider"], "voicevox-test-version")
+        self.assertEqual(result["source"], "VOICEVOX accent phrases")
+        self.assertEqual(result["confidence"], "PREDICTED")
 
     def test_existing_persistent_voicevox_audio_is_reused_without_network(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -411,11 +490,9 @@ class ScopeAndCacheFixtures(unittest.TestCase):
             jp.synthesize_voicevox("http://voicevox", "みすえる", ["み", "す", "え", "る"], 3, 7, path)
             self.assertTrue(jp.valid_wav(path))
         mora_call = next(call for call in calls if call[0] == "/mora_data")
-        accent_call = next(call for call in calls if call[0] == "/accent_phrases")
         query_call = next(call for call in calls if call[0] == "/audio_query")
         synthesis_call = next(call for call in calls if call[0] == "/synthesis")
-        self.assertEqual(accent_call[1]["text"], "ミスエ'ル")
-        self.assertEqual(accent_call[1]["is_kana"], "true")
+        self.assertNotIn("/accent_phrases", [call[0] for call in calls])
         self.assertEqual(query_call[1]["text"], "みすえる")
         self.assertEqual(mora_call[2][0]["accent"], 3)
         self.assertEqual(len(synthesis_call[2]["accent_phrases"]), 1)
@@ -536,7 +613,9 @@ class SharedQueryFixtures(unittest.TestCase):
         calls = []
         def request(base, path, params=None, body=None, binary=False):
             calls.append(path)
-            if path == "/audio_query": return {"accent_phrases": [{"accent": 1, "moras": [{"text": "ア", "pitch": 5.0}]}]}
+            if path == "/audio_query":
+                text = str(params.get("text", "あ"))
+                return {"accent_phrases": [{"accent": 1, "moras": [{"text": jp.kata(text), "pitch": 5.0}]}]}
             if path == "/mora_data": return body
             if path == "/synthesis": return b"RIFF" + b"\0" * 4 + b"WAVE" + b"\0" * 40
             raise AssertionError(path)
