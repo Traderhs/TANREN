@@ -17,6 +17,8 @@ export const api = {
     invoke<ImportResult>("import_entries", { deckId, entries }),
   enrichmentProgress: (entryIds: string[]) =>
     invoke<EnrichmentProgress>("enrichment_progress", { entryIds }),
+  pendingEnrichmentEntryIds: () => invoke<string[]>("pending_enrichment_entry_ids"),
+  setEnrichmentGenerationActive: (active: boolean) => invoke<void>("set_enrichment_generation_active", { active }),
   updateEntry: (deckId: string, entryId: string, entry: EntryDraft) =>
     invoke<boolean>("update_entry", { deckId, entryId, entry }),
   deleteEntry: (deckId: string, entryId: string) =>
