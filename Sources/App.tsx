@@ -1,4 +1,4 @@
-import { FormEvent, forwardRef, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, forwardRef, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createPortal } from "react-dom";
@@ -13,7 +13,7 @@ import { parseEntryText } from "./lib/importParser";
 import { BookInlineEntryManager } from "./BookInlineEntryManager";
 import { BookStudy } from "./BookStudy";
 import { loadJapaneseImeRuntime } from "./lib/japaneseIme";
-import { playEffectSound } from "./lib/soundEffects";
+import { playEffectSound, preloadBookEffectSounds } from "./lib/soundEffects";
 import type { SubmitResult } from "./lib/types";
 import type { AudioSettings, DeckSummary, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
 
@@ -158,11 +158,11 @@ function formatStudyRangeLabel(label?: string | null, separator = " - ") {
   if (!match) return core;
   const start = Number(match[1]) + 1;
   const end = Number(match[2]) + 1;
-  return `${start.toLocaleString("ko-KR")}${separator}${end.toLocaleString("ko-KR")}`;
+  return `${numberFormat.format(start)}${separator}${numberFormat.format(end)}`;
 }
 
 function OpenBookCamera() {
-  const { camera, gl, scene, setSize, invalidate } = useThree();
+  const { camera, gl, setSize, invalidate } = useThree();
   useLayoutEffect(() => {
     const stack = gl.domElement.closest(".open-book-stage")?.querySelector<HTMLElement>(".book-flip-stack");
     if (!stack) return;
@@ -177,8 +177,6 @@ function OpenBookCamera() {
       setSize(surface.clientWidth, surface.clientHeight, bounds.top, bounds.left);
       camera.zoom = 156 * OPEN_BOOK_SCALE * scale;
       camera.updateProjectionMatrix();
-      // ResizeObserver runs before paint; update the bitmap with the DOM in this frame.
-      gl.render(scene, camera);
       invalidate();
     };
     const observer = new ResizeObserver(fit);
@@ -186,7 +184,7 @@ function OpenBookCamera() {
     observer.observe(surface);
     fit();
     return () => observer.disconnect();
-  }, [camera, gl, scene, setSize, invalidate]);
+  }, [camera, gl, setSize, invalidate]);
   return null;
 }
 
@@ -374,6 +372,7 @@ function App() {
     };
   }, []);
   useEffect(() => { void api.audioSettings().then(setAudioSettings); }, []);
+  useEffect(() => { preloadBookEffectSounds(); }, []);
   useEffect(() => {
     if (view !== "decks") return;
     let active = true;
@@ -1200,11 +1199,30 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const japaneseReadingInvalid = Boolean(openedDeck?.target_language === "ja-JP" && /\p{Script=Han}/u.test(singleReading));
   const bookSessionKey = openedDeck ? `${openedDeck.id}:${bookOpenCycle}` : "";
   const bookVisualReady = Boolean(openedDeck && (reduceMotion || (book3DReady && bookFlipReady)));
+  const bookPageContentSignature = useMemo(() => openedDeck ? JSON.stringify({
+    deck: openedDeck,
+    volume: decks.findIndex((deck) => deck.id === openedDeck.id),
+    stageSchedules,
+    entryMessage,
+  }) : "", [openedDeck, decks, stageSchedules, entryMessage]);
+  const lastCommittedBookPageContentRef = useRef({ sessionKey: "", signature: "" });
+  const bookPageContentChanged = Boolean(
+    bookSessionKey
+      && lastCommittedBookPageContentRef.current.sessionKey === bookSessionKey
+      && lastCommittedBookPageContentRef.current.signature !== bookPageContentSignature
+  );
   const bookProgressRatio = (deck: DeckSummary) => deck.total_stage_count === 0
     ? 0
     : Math.min(1, deck.completed_stage_count / deck.total_stage_count);
   const bookProgressPercent = (deck: DeckSummary) => bookProgressRatio(deck) * 100;
   activeBookSessionRef.current = bookSessionKey;
+
+  useLayoutEffect(() => {
+    lastCommittedBookPageContentRef.current = {
+      sessionKey: bookSessionKey,
+      signature: bookPageContentSignature,
+    };
+  }, [bookSessionKey, bookPageContentSignature]);
 
   const waitForEntryProcessing = async (entryIds: string[]) => {
     if (entryIds.length === 0) return { total: 0, completed: 0, failed: 0, pending: 0, last_error: null, runtime_phase: "ready" };
@@ -1402,7 +1420,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     }, delayMs);
   };
 
-  const startBookStudy = async (stage: number) => {
+  const startBookStudy = useCallback(async (stage: number) => {
     if (!openedDeck || bookStudyTransitioning || bookStudyActive || bookClosingRef.current) return;
     setBookStudyExiting(false);
     setBookStudyNavigationLocked(true);
@@ -1422,7 +1440,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       setBookStudyTransitioning(false);
       setEntryMessage(String(error));
     }
-  };
+  }, [openedDeck, bookStudyTransitioning, bookStudyActive, onRequestHomeSection, reduceMotion, bookSessionKey, audioSettings.effect_volume]);
 
   const scheduleBookFlutter = (sessionKey: string, delayMs: number) => {
     clearFlutterTimer();
@@ -1755,6 +1773,49 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     scheduleBookFlutter(sessionKey, 4);
   };
 
+  const bookStageCards = useMemo(() => openedDeck ? Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1).map((stage) => {
+    const fallbackRange = openedDeck.study_ranges[stage - 1];
+    const schedule = stageSchedules[stage];
+    const current = Boolean(schedule?.active);
+    const range = schedule?.study_range ?? fallbackRange;
+    const entryCount = range ? Math.max(0, range.end - range.start) : 0;
+    const questionCount = entryCount * openedDeck.enabled_modes.length;
+    const completed = Boolean(schedule?.completed);
+    return <div className={`book-stage-group ${current ? "is-current-stage" : ""} ${completed ? "is-completed-stage" : ""}`} key={stage}>
+      <button
+        type="button"
+        className="ghost book-stage-card"
+        onClick={() => void startBookStudy(stage)}
+      >
+        <strong className={`book-stage-title ${range?.cumulative ? "is-cumulative" : ""}`}>
+          {range?.cumulative && <small>총복습</small>}
+          <span>{numberFormat.format(stage)}단계</span>
+        </strong>
+
+        <span className={`book-stage-middle ${schedule?.clear_times_ms.length ? "has-clear-times" : ""}`}>
+          <span className="book-stage-range" aria-label={`${stage}단계 학습 단계`}>
+            {range && <>
+              <span
+                className={`book-stage-range-link ${schedule?.active ? "is-current" : ""}`}
+              >{formatStudyRangeLabel(range.label)}</span>
+              <span className="book-stage-range-meta">
+                <span>{numberFormat.format(entryCount)}개</span>
+                <span>{numberFormat.format(questionCount)}문항</span>
+              </span>
+            </>}
+          </span>
+          {schedule?.clear_times_ms.length ? <span className="book-stage-clear-times" aria-label={`${stage}단계 클리어 기록`}>
+            {schedule.clear_times_ms.map((durationMs, clearIndex) => <span className="book-stage-clear-time" key={`${stage}-${clearIndex}-${durationMs}`}>
+              {clearIndex + 1}회독 {schedule.clear_cycles[clearIndex]}바퀴 {formatStudyTime(durationMs)}
+            </span>)}
+          </span> : null}
+        </span>
+        {completed && <span className="book-stage-complete" aria-label="클리어 완료">✓</span>}
+      </button>
+    </div>;
+  }) : null,
+    [openedDeck, stageSchedules, startBookStudy]);
+
   return <section className={`content home-content ${bookLayoutOpen ? "is-book-open" : ""}`}>
     <AnimatePresence
       initial={false}
@@ -1812,7 +1873,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             swipeDistance={30}
             showPageCorners={false}
             disableFlipByClick={true}
-            renderOnlyPageLengthChange={false}
+            renderOnlyPageLengthChange={reduceMotion ? false : !bookPageContentChanged}
             onInit={() => setBookFlipReady(true)}
             onFlip={(event) => continueBookFlutter(Number(event.data), bookSessionKey)}
           >
@@ -1891,47 +1952,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                 {entryMessage && <p className="book-entry-message" role="alert">{entryMessage}</p>}
                 <div className="book-range-scroll" aria-label={`${openedDeck.name} study ranges`}>
                   <div className="book-stage-list">
-                    {Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1).map((stage) => {
-                      const fallbackRange = openedDeck.study_ranges[stage - 1];
-                      const schedule = stageSchedules[stage];
-                      const current = Boolean(schedule?.active);
-                      const range = schedule?.study_range ?? fallbackRange;
-                      const entryCount = range ? Math.max(0, range.end - range.start) : 0;
-                      const questionCount = entryCount * openedDeck.enabled_modes.length;
-                      const completed = Boolean(schedule?.completed);
-                      return <div className={`book-stage-group ${current ? "is-current-stage" : ""} ${completed ? "is-completed-stage" : ""}`} key={stage}>
-                        <button
-                          type="button"
-                          className="ghost book-stage-card"
-                          onClick={() => void startBookStudy(stage)}
-                        >
-                          <strong className={`book-stage-title ${range?.cumulative ? "is-cumulative" : ""}`}>
-                            {range?.cumulative && <small>총복습</small>}
-                            <span>{stage.toLocaleString("ko-KR")}단계</span>
-                          </strong>
-
-                          <span className={`book-stage-middle ${schedule?.clear_times_ms.length ? "has-clear-times" : ""}`}>
-                            <span className="book-stage-range" aria-label={`${stage}단계 학습 단계`}>
-                              {range && <>
-                                <span
-                                  className={`book-stage-range-link ${schedule?.active ? "is-current" : ""}`}
-                                >{formatStudyRangeLabel(range.label)}</span>
-                                <span className="book-stage-range-meta">
-                                  <span>{entryCount.toLocaleString("ko-KR")}개</span>
-                                  <span>{questionCount.toLocaleString("ko-KR")}문항</span>
-                                </span>
-                              </>}
-                            </span>
-                            {schedule?.clear_times_ms.length ? <span className="book-stage-clear-times" aria-label={`${stage}단계 클리어 기록`}>
-                              {schedule.clear_times_ms.map((durationMs, clearIndex) => <span className="book-stage-clear-time" key={`${stage}-${clearIndex}-${durationMs}`}>
-                                {clearIndex + 1}회독 {schedule.clear_cycles[clearIndex]}바퀴 {formatStudyTime(durationMs)}
-                              </span>)}
-                            </span> : null}
-                          </span>
-                          {completed && <span className="book-stage-complete" aria-label="클리어 완료">✓</span>}
-                        </button>
-                      </div>;
-                    })}
+                    {bookStageCards}
                   </div>
                 </div>
             </div>
