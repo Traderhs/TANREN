@@ -178,7 +178,9 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
       || entry.meanings.some((meaning) => meaning.toLocaleLowerCase().includes(query)))
     : entries, [entries, query]);
   const textCollator = useMemo(() => new Intl.Collator(undefined, { numeric: true, sensitivity: "base" }), []);
-  const sortedEntries = useMemo(() => [...filteredEntries].sort((left, right) => {
+  const sortedEntries = useMemo(() => {
+    if (sort.key === "position" && sort.direction === "asc") return filteredEntries;
+    return [...filteredEntries].sort((left, right) => {
     let result = 0;
     if (sort.key === "position") result = left.position - right.position;
     else if (sort.key === "attempts") result = left.attempts - right.attempts;
@@ -187,7 +189,8 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
     else result = textCollator.compare(left.meanings.join(" / "), right.meanings.join(" / "));
     if (result === 0) result = left.position - right.position;
     return sort.direction === "asc" ? result : -result;
-  }), [filteredEntries, sort, textCollator]);
+    });
+  }, [filteredEntries, sort, textCollator]);
   const start = Math.max(0, Math.min(sortedEntries.length, Math.floor(viewport.top / rowHeight) - 8));
   const end = Math.min(sortedEntries.length, Math.ceil((viewport.top + viewport.height) / rowHeight) + 8);
   const focusedIndex = focusedId === null ? -1 : sortedEntries.findIndex((entry) => entry.id === focusedId);

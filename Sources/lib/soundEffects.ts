@@ -15,13 +15,33 @@ const samples = {
   complete: "/sfx/complete.mp3",
 } as const;
 
+const preloadedSamples = new Map<string, HTMLAudioElement>();
+
+function preloadSample(src: string) {
+  if (preloadedSamples.has(src)) return;
+  const audio = new Audio();
+  audio.preload = "auto";
+  audio.src = src;
+  audio.addEventListener("error", () => {
+    if (preloadedSamples.get(src) === audio) preloadedSamples.delete(src);
+  }, { once: true });
+  audio.load();
+  preloadedSamples.set(src, audio);
+}
+
+export function preloadBookEffectSounds() {
+  preloadSample(samples.pageTurn);
+  preloadSample(samples.bookClose);
+}
+
 function clamp01(value: number) {
   return Math.max(0, Math.min(1, value));
 }
 
 function playSample(src: string, masterVolume: number, options: SampleOptions) {
   const play = () => {
-    const audio = new Audio(src);
+    const audio = preloadedSamples.get(src) ?? new Audio(src);
+    preloadedSamples.delete(src);
     audio.preload = "auto";
     audio.volume = clamp01(masterVolume * options.volume) * 0.5;
     audio.playbackRate = options.playbackRate ?? 1;
