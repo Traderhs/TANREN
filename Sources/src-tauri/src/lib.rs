@@ -1653,13 +1653,13 @@ pub fn run() {
                             System::LibraryLoader::GetModuleHandleW,
                             UI::HiDpi::GetDpiForWindow,
                             UI::WindowsAndMessaging::{
-                                LoadImageW, SendMessageW, ShowWindow, ICON_BIG, IMAGE_ICON, LR_SHARED,
+                                LoadImageW, SendMessageW, ShowWindow, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED,
                                 SW_HIDE, SW_SHOW, WM_SETICON,
                             },
                         },
                     };
                     // Match the taskbar's 24-DIP icon instead of letting Windows
-                    // blur the 256px image when scaling it down. Keep ICON_SMALL unchanged.
+                    // blur the 256px image when scaling it down.
                     // LR_SHARED keeps the resource handle alive for the process lifetime.
                     let hwnd = window.hwnd()?;
                     let taskbar_size = (24 * GetDpiForWindow(hwnd) / 96) as i32;
@@ -1671,10 +1671,27 @@ pub fn run() {
                         taskbar_size,
                         LR_SHARED,
                     )?;
+                    // The taskbar preview header uses the separate 16-DIP small icon.
+                    let preview_size = (16 * GetDpiForWindow(hwnd) / 96) as i32;
+                    let preview_icon = LoadImageW(
+                        Some(GetModuleHandleW(None)?.into()),
+                        PCWSTR(32512usize as *const u16),
+                        IMAGE_ICON,
+                        preview_size,
+                        preview_size,
+                        LR_SHARED,
+                    )?;
                     let hwnd = hwnd.0 as isize;
                     let taskbar_icon = taskbar_icon.0 as isize;
+                    let preview_icon = preview_icon.0 as isize;
                     window.run_on_main_thread(move || {
                         let hwnd = HWND(hwnd as *mut _);
+                        SendMessageW(
+                            hwnd,
+                            WM_SETICON,
+                            Some(WPARAM(ICON_SMALL as usize)),
+                            Some(LPARAM(preview_icon)),
+                        );
                         SendMessageW(
                             hwnd,
                             WM_SETICON,
