@@ -83,8 +83,31 @@ fn reading_matches(expected: &str, answer: &str) -> bool {
         return true;
     }
 
+    // Accept canonical long-vowel spelling for stored readings that use `ー`
+    // (e.g. じゅーいち -> じゅういち), but do not expand a user's `ー`
+    // backwards into an arbitrary kana sequence. Otherwise distinct words such
+    // as シール normalize into the reading しいる and are falsely accepted.
     expand_prolonged_sound_marks(&expected).iter().any(|variant| variant == &answer)
-        || expand_prolonged_sound_marks(&answer).iter().any(|variant| variant == &expected)
+}
+
+fn unvoiced_kana(character: char) -> char {
+    match character {
+        'が' => 'か', 'ぎ' => 'き', 'ぐ' => 'く', 'げ' => 'け', 'ご' => 'こ',
+        'ざ' => 'さ', 'じ' => 'し', 'ず' => 'す', 'ぜ' => 'せ', 'ぞ' => 'そ',
+        'だ' => 'た', 'ぢ' => 'ち', 'づ' => 'つ', 'で' => 'て', 'ど' => 'と',
+        'ば' | 'ぱ' => 'は', 'び' | 'ぴ' => 'ひ', 'ぶ' | 'ぷ' => 'ふ', 'べ' | 'ぺ' => 'へ', 'ぼ' | 'ぽ' => 'ほ',
+        'ゔ' => 'う',
+        _ => character,
+    }
+}
+
+fn has_kana_voicing_conflict(canonical: &str, alternative: &str) -> bool {
+    let canonical = normalize_japanese(canonical);
+    let alternative = normalize_japanese(alternative);
+    canonical.chars().count() == alternative.chars().count()
+        && canonical.chars().zip(alternative.chars()).any(|(left, right)| {
+            left != right && unvoiced_kana(left) == unvoiced_kana(right)
+        })
 }
 
 #[cfg(test)]
@@ -108,8 +131,13 @@ pub fn grade_form_with_reading(
                 return GradeOutcome { decision: GradeDecision::Pass, method: "accepted_reading", score: None };
             }
         }
-        if orthographic_reading.is_some_and(|reading| reading_matches(reading, &answer)) {
-            return GradeOutcome { decision: GradeDecision::Pass, method: "accepted_orthographic_reading", score: None };
+        if let Some(orthographic_reading) = orthographic_reading {
+            let conflicts_with_canonical = entry.reading.as_deref().is_some_and(|canonical| {
+                has_kana_voicing_conflict(canonical, orthographic_reading)
+            });
+            if !conflicts_with_canonical && reading_matches(orthographic_reading, &answer) {
+                return GradeOutcome { decision: GradeDecision::Pass, method: "accepted_orthographic_reading", score: None };
+            }
         }
     }
     GradeOutcome { decision: GradeDecision::Fail, method: "form_mismatch", score: None }
@@ -223,6 +251,16 @@ mod tests {
     }
 
     #[test]
+    fn answer_long_mark_does_not_collapse_distinct_reading() {
+        let mut value = entry();
+        value.term = "強いる".into();
+        value.reading = Some("しいる".into());
+        assert_eq!(grade_form(&value, "シール", false).decision, GradeDecision::Fail);
+        assert_eq!(grade_form(&value, "しいる", false).decision, GradeDecision::Pass);
+        assert_eq!(grade_form(&value, "シイル", false).decision, GradeDecision::Pass);
+    }
+
+    #[test]
     fn orthographic_reading_accepts_written_particle_spelling() {
         let mut value = entry();
         value.term = "今日はいい天気ですね".into();
@@ -232,5 +270,31 @@ mod tests {
             GradeDecision::Pass,
         );
         assert_eq!(grade_form(&value, "きょうはいいてんきですね", false).decision, GradeDecision::Fail);
+    }
+
+    #[test]
+    fn orthographic_reading_does_not_override_canonical_voicing() {
+        let mut value = entry();
+        value.term = "精算所".into();
+        value.reading = Some("せいさんじょ".into());
+        assert_eq!(
+            grade_form_with_reading(&value, "せいさんしょ", false, Some("セイサンショ")).decision,
+            GradeDecision::Fail,
+        );
+        assert_eq!(
+            grade_form_with_reading(&value, "せいさんじょ", false, Some("セイサンショ")).decision,
+            GradeDecision::Pass,
+        );
+    }
+
+    #[test]
+    fn orthographic_reading_still_allows_non_voicing_fallback() {
+        let mut value = entry();
+        value.term = "月".into();
+        value.reading = Some("つきみ".into());
+        assert_eq!(
+            grade_form_with_reading(&value, "つき", false, Some("ツキ")).decision,
+            GradeDecision::Pass,
+        );
     }
 }
