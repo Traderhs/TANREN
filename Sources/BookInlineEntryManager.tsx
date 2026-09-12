@@ -6,12 +6,13 @@ import type { EntryListRecord } from "./lib/types";
 
 type BookEntrySortKey = "position" | "term" | "reading" | "meaning" | "attempts";
 
-export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDelete }: {
+export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDelete, onReady }: {
   deckId: string;
   onAdd: () => void;
   onImport: () => void;
   onEdit: (entry: EntryListRecord) => void;
   onDelete: (entry: EntryListRecord) => void;
+  onReady?: () => void;
 }) {
   const [entries, setEntries] = useState<EntryListRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -28,8 +29,9 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
     const list = listRef.current;
     if (!list) return;
     const measure = () => setViewport((current) => {
-      const top = Math.floor(list.scrollTop / rowHeight) * rowHeight;
       const height = list.clientHeight;
+      if (height === 0) return current;
+      const top = Math.floor(list.scrollTop / rowHeight) * rowHeight;
       return current.top === top && current.height === height ? current : { top, height };
     });
     const observer = new ResizeObserver(measure);
@@ -84,6 +86,26 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
       window.removeEventListener("tanren:deck-entries-changed", handleEntriesChanged);
     };
   }, [deckId]);
+
+  useEffect(() => {
+    if (loading) return;
+    // PageFlip hides this spread until the last turn; load its visible-row fonts
+    // now so their first appearance does not trigger a font swap and relayout.
+    const firstPageText = entries.slice(0, Math.ceil(window.innerHeight / rowHeight) + 8)
+      .map((entry) => entry.term + (entry.reading ?? "") + entry.meanings.join("")).join("");
+    const textsByFont = new Map<string, string>();
+    listRef.current?.querySelectorAll<HTMLElement>(".book-inline-entry-row > *").forEach((element) => {
+      const text = element.textContent ?? "";
+      if (!text) return;
+      const style = getComputedStyle(element);
+      const font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+      textsByFont.set(font, (textsByFont.get(font) ?? "") + text);
+    });
+    let disposed = false;
+    void Promise.all([...textsByFont].map(([font, text]) => document.fonts.load(font, text + firstPageText).catch(() => undefined)))
+      .then(() => { if (!disposed) onReady?.(); });
+    return () => { disposed = true; };
+  }, [entries, loading, onReady]);
 
   useEffect(() => {
     const list = listRef.current;
@@ -235,7 +257,7 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
         </svg>
       </button>
     </div>
-    <div className={`book-inline-entry-list ${loading || filteredEntries.length === 0 ? "is-empty" : ""}`} ref={listRef}
+    <div className={`book-inline-entry-list ${filteredEntries.length === 0 ? "is-empty" : ""}`} ref={listRef} aria-busy={loading}
       onFocusCapture={(event) => {
         setFocusedId(event.target.closest<HTMLElement>("[data-entry-id]")?.dataset.entryId ?? null);
         if (tabDirection.current === -1 && event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)
@@ -272,8 +294,7 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
         <span className="book-inline-entry-settings-head">편집</span>
         <span className="book-inline-entry-delete-head">삭제</span>
       </div>
-      {loading ? <div className="book-inline-entry-empty">불러오는 중</div>
-        : filteredEntries.length === 0 ? <div className="book-inline-entry-empty">{entries.length === 0 ? "아직 표현이 없어요" : "검색 결과가 없어요"}</div>
+      {filteredEntries.length === 0 ? (loading ? null : <div className="book-inline-entry-empty">{entries.length === 0 ? "아직 표현이 없어요" : "검색 결과가 없어요"}</div>)
           : <>
           {visibleIndices.map((index, offset) => {
             const entry = sortedEntries[index];
