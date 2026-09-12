@@ -25,7 +25,7 @@ use grading::{grade_form_with_reading, normalize_generic, split_reading_answer};
 use japanese::{JapaneseAnalyzer, VOICE_AUDIO_REVISION};
 use model::{
     AdjudicationPrompt, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
-    MeaningGrade, PitchQuestion, StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
+    ListeningFeedback, MeaningGrade, PitchQuestion, StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
 };
 use rand::random;
 use study::{PendingState, StudySession};
@@ -264,7 +264,12 @@ fn import_deck_export(state: State<'_, AppState>, payload: String) -> Result<Dec
 }
 
 #[tauri::command]
-fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) -> Result<SubmitResult, String> {
+async fn start_study(app: tauri::AppHandle, deck_id: String, stage: Option<u32>) -> Result<SubmitResult, String> {
+    tauri::async_runtime::spawn_blocking(move || start_study_session(&app.state::<AppState>(), deck_id, stage))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn start_study_session(state: &AppState, deck_id: String, stage: Option<u32>) -> Result<SubmitResult, String> {
     let deck = state.db.deck(&deck_id)?;
     let entries = state.db.entries(&deck_id)?;
     if entries.is_empty() { return Err("먼저 표현을 추가해주세요".into()); }
@@ -311,7 +316,7 @@ fn start_study(state: State<'_, AppState>, deck_id: String, stage: Option<u32>) 
 }
 
 #[tauri::command]
-fn record_study_activity(state: State<'_, AppState>, deck_id: String, mode: Option<StudyMode>, duration_ms: u64) -> Result<(), String> {
+async fn record_study_activity(state: State<'_, AppState>, deck_id: String, mode: Option<StudyMode>, duration_ms: u64) -> Result<(), String> {
     state.db.record_study_activity(&deck_id, mode, duration_ms)?;
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     if let Some(session) = engine.session.as_mut().filter(|session| session.deck_id == deck_id) {
@@ -323,7 +328,7 @@ fn record_study_activity(state: State<'_, AppState>, deck_id: String, mode: Opti
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-fn submit_answer(
+async fn submit_answer(
     state: State<'_, AppState>,
     variant_id: String,
     answer: String,
@@ -360,10 +365,12 @@ fn submit_answer(
     let answer_trimmed = answer.trim_matches(|c: char| c.is_whitespace() || c == '\u{3000}');
     let meaning_trimmed = meaning_answer.trim_matches(|c: char| c.is_whitespace() || c == '\u{3000}');
     if answer_trimmed.is_empty() || (is_listening && meaning_trimmed.is_empty()) {
-        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "manual_unknown", FailureType::ManualUnknown, None, None);
+        let feedback = is_listening.then(|| listening_feedback_for_answers(&state, &deck, &entry, &answer, &meaning_answer)).transpose()?;
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "manual_unknown", FailureType::ManualUnknown, None, None, feedback);
     }
     if recall_latency_ms > deck.recall_timeout_by_mode.for_mode(variant.mode) {
-        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "recall_timeout", FailureType::RecallTimeout, None, None);
+        let feedback = is_listening.then(|| listening_feedback_for_answers(&state, &deck, &entry, &answer, &meaning_answer)).transpose()?;
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "recall_timeout", FailureType::RecallTimeout, None, None, feedback);
     }
 
     let input_language = variant.mode.answer_language(&deck.source_language, &deck.target_language).to_string();
@@ -371,18 +378,21 @@ fn submit_answer(
     let max_gap = interkey_gaps_ms.iter().copied().max().unwrap_or(0);
     let expected_input_chars = expected_answer_chars(&entry, variant.mode);
     if profile.completion_timed_out(max_gap, typing_duration_ms, expected_input_chars) {
-        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None);
+        let feedback = is_listening.then(|| listening_feedback_for_answers(&state, &deck, &entry, &answer, &meaning_answer)).transpose()?;
+        return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None, feedback);
     }
     if is_listening {
         let meaning_profile = state.db.typing_profile(&deck.id, &deck.source_language, variant.mode)?;
         let meaning_max_gap = meaning_interkey_gaps_ms.iter().copied().max().unwrap_or(0);
         if meaning_profile.completion_timed_out(meaning_max_gap, meaning_typing_duration_ms, expected_meaning_chars(&entry)) {
-            return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None);
+            let feedback = Some(listening_feedback_for_answers(&state, &deck, &entry, &answer, &meaning_answer)?);
+            return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None, feedback);
         }
     }
 
     let (accepted, rejected) = state.db.aliases(&entry.id)?;
     let mut answer_failure = FailureType::WrongAnswer;
+    let mut listening_feedback = None;
     let (outcome, meaning_adjudications) = match variant.mode {
         StudyMode::Reading => state.semantic.grade_reading_with_adjudications(&entry, &answer, &accepted, &rejected, &deck.source_language, &deck.target_language),
         StudyMode::Writing => {
@@ -400,6 +410,14 @@ fn submit_answer(
                 &deck.source_language,
                 &deck.target_language,
             );
+            listening_feedback = Some(ListeningFeedback {
+                form_correct: Some(form.decision == GradeDecision::Pass),
+                meaning_correct: match meaning.decision {
+                    GradeDecision::Pass => Some(true),
+                    GradeDecision::Fail => Some(false),
+                    GradeDecision::Ambiguous => None,
+                },
+            });
             let (combined, failure) = combine_listening_outcomes(form, meaning);
             answer_failure = failure;
             (combined, adjudications)
@@ -417,7 +435,7 @@ fn submit_answer(
     match outcome.decision {
         GradeDecision::Fail => fail_base(
             &state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms,
-            outcome.method, answer_failure, outcome.score, overfilled_meaning_grades,
+            outcome.method, answer_failure, outcome.score, overfilled_meaning_grades, listening_feedback,
         ),
         GradeDecision::Ambiguous => {
             let pending_answer = if is_listening { stored_answer.clone() } else { answer.clone() };
@@ -456,6 +474,7 @@ fn submit_answer(
                 pitch: None,
                 adjudication: current_adjudication,
                 meaning_grades: None,
+                listening_feedback,
                 card: None,
             })
         }
@@ -483,11 +502,12 @@ fn submit_answer(
                 Ok(SubmitResult {
                     status: SubmitStatus::Pitch, message: None, failure_type: None,
                     canonical_answer: Some(entry.term.clone()), reading: entry.reading,
-                    pitch: Some(question), adjudication: None, meaning_grades: None, card: None,
+                    pitch: Some(question), adjudication: None, meaning_grades: None, listening_feedback, card: None,
                 })
             } else {
                 session.resolve_current(&variant, true)?;
-        let result = review_result(&entry, None, "맞았어요");
+                let mut result = review_result(&entry, None, "맞았어요");
+                result.listening_feedback = listening_feedback;
                 session.pending = Some(PendingState::Review { variant, result: result.clone() });
                 state.db.save_session(session)?;
                 Ok(result)
@@ -497,7 +517,7 @@ fn submit_answer(
 }
 
 #[tauri::command]
-fn timeout_current(
+async fn timeout_current(
     state: State<'_, AppState>,
     variant_id: String,
     kind: String,
@@ -512,22 +532,30 @@ fn timeout_current(
     let variant = session.current.clone().ok_or("no active card")?;
     validate_timeout_variant(&variant, &variant_id)?;
     let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
+    let deck = state.db.deck(&session.deck_id)?;
     let failure = match kind.as_str() {
         "recall" => FailureType::RecallTimeout,
         "completion" => FailureType::CompletionTimeout,
         _ => return Err("unknown timeout type".into()),
     };
     let method = if matches!(failure, FailureType::RecallTimeout) { "recall_timeout" } else { "completion_timeout" };
-    let stored_answer = if matches!(variant.mode, StudyMode::Listening) {
-        listening_response_text(&answer, meaning_answer.as_deref().unwrap_or_default())
+    let meaning_answer = meaning_answer.unwrap_or_default();
+    let is_listening = matches!(variant.mode, StudyMode::Listening);
+    let listening_feedback = if is_listening {
+        Some(listening_feedback_for_answers(&state, &deck, &entry, &answer, &meaning_answer)?)
+    } else {
+        None
+    };
+    let stored_answer = if is_listening {
+        listening_response_text(&answer, &meaning_answer)
     } else {
         answer
     };
-    fail_base(&state.db, &mut engine, variant, &entry, stored_answer, elapsed_ms, typing_duration_ms, method, failure, None, None)
+    fail_base(&state.db, &mut engine, variant, &entry, stored_answer, elapsed_ms, typing_duration_ms, method, failure, None, None, listening_feedback)
 }
 
 #[tauri::command]
-fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: bool) -> Result<SubmitResult, String> {
+async fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: bool) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let pending = ambiguous_for_adjudication(&session.pending, &variant_id)?;
@@ -608,6 +636,7 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
                 pitch: None,
                 adjudication: Some(next),
                 meaning_grades: None,
+                listening_feedback: is_listening.then_some(ListeningFeedback { form_correct: Some(true), meaning_correct: None }),
                 card: None,
             });
         }
@@ -629,6 +658,7 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
         return fail_base(
             &state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms,
             &method, failure, score, meaning_grades,
+            is_listening.then_some(ListeningFeedback { form_correct: Some(true), meaning_correct: Some(false) }),
         );
     }
 
@@ -652,11 +682,12 @@ fn adjudicate_answer(state: State<'_, AppState>, variant_id: String, accept: boo
     if let Some(question) = pitch {
         session.pending = Some(PendingState::Pitch { variant, question: question.clone(), meaning_grades: meaning_grades.clone() });
         state.db.save_session(session)?;
-        Ok(SubmitResult { status: SubmitStatus::Pitch, message: None, failure_type: None, canonical_answer: Some(entry.term.clone()), reading: entry.reading, pitch: Some(question), adjudication: None, meaning_grades, card: None })
+        Ok(SubmitResult { status: SubmitStatus::Pitch, message: None, failure_type: None, canonical_answer: Some(entry.term.clone()), reading: entry.reading, pitch: Some(question), adjudication: None, meaning_grades, listening_feedback: is_listening.then_some(ListeningFeedback { form_correct: Some(true), meaning_correct: Some(true) }), card: None })
     } else {
         session.resolve_current(&variant, true)?;
         let mut result = review_result(&entry, None, "정답으로 기억했어요");
         result.meaning_grades = meaning_grades;
+        result.listening_feedback = is_listening.then_some(ListeningFeedback { form_correct: Some(true), meaning_correct: Some(true) });
         session.pending = Some(PendingState::Review { variant, result: result.clone() });
         state.db.save_session(session)?;
         Ok(result)
@@ -673,7 +704,7 @@ fn ambiguous_for_adjudication(pending: &Option<PendingState>, variant_id: &str) 
 }
 
 #[tauri::command]
-fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8>) -> Result<SubmitResult, String> {
+async fn submit_pitch(state: State<'_, AppState>, variant_id: String, patterns: Vec<u8>) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     finish_pitch(&state.db, session, &variant_id, &patterns)
@@ -684,9 +715,9 @@ fn finish_pitch(db: &Database, active_session: &mut StudySession, variant_id: &s
     let mut next_session = active_session.clone();
     let session = &mut next_session;
     let pending = session.pending.clone().ok_or("no pitch question is pending")?;
-    let (variant, question, correction_failure, meaning_grades) = match pending {
-        PendingState::Pitch { variant, question, meaning_grades } => (variant, question, None, meaning_grades),
-        PendingState::PitchCorrection { variant, question, failure, meaning_grades } => (variant, question, Some(failure), meaning_grades),
+    let (variant, question, correction_failure, meaning_grades, listening_feedback) = match pending {
+        PendingState::Pitch { variant, question, meaning_grades } => (variant, question, None, meaning_grades, None),
+        PendingState::PitchCorrection { variant, question, failure, meaning_grades, listening_feedback } => (variant, question, Some(failure), meaning_grades, listening_feedback),
         _ => return Err("current state is not pitch grading".into()),
     };
     if variant.id() != variant_id {
@@ -703,6 +734,7 @@ fn finish_pitch(db: &Database, active_session: &mut StudySession, variant_id: &s
         "오답이에요 방금 피치는 연습용이며 피치 정확도에 포함되지 않아요",
         );
         result.meaning_grades = meaning_grades;
+        result.listening_feedback = listening_feedback;
         session.pending = Some(PendingState::Review { variant, result: result.clone() });
         db.save_session(session)?;
         *active_session = next_session;
@@ -732,7 +764,7 @@ fn grade_pitch_contour(question: &model::PitchQuestion, contour: &[u8]) -> (bool
 }
 
 #[tauri::command]
-fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
+async fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let reviewed_variant = match session.pending.take() {
@@ -757,6 +789,7 @@ fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
             pitch: None,
             adjudication: None,
             meaning_grades: None,
+            listening_feedback: None,
             card: Some(card),
         });
     }
@@ -764,7 +797,7 @@ fn continue_review(state: State<'_, AppState>) -> Result<SubmitResult, String> {
 }
 
 #[tauri::command]
-fn continue_cycle(state: State<'_, AppState>) -> Result<SubmitResult, String> {
+async fn continue_cycle(state: State<'_, AppState>) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     match session.pending.take() {
@@ -1160,6 +1193,7 @@ fn fail_base(
     failure: FailureType,
     score: Option<f64>,
     meaning_grades: Option<Vec<MeaningGrade>>,
+    listening_feedback: Option<ListeningFeedback>,
 ) -> Result<SubmitResult, String> {
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     let stage = session.range().label.clone();
@@ -1174,6 +1208,7 @@ fn fail_base(
             question: question.clone(),
             failure: failure.as_str().to_string(),
             meaning_grades: meaning_grades.clone(),
+            listening_feedback: listening_feedback.clone(),
         });
         db.save_session(session)?;
         return Ok(SubmitResult {
@@ -1185,12 +1220,14 @@ fn fail_base(
             pitch: Some(question),
             adjudication: None,
             meaning_grades,
+            listening_feedback,
             card: None,
         });
     }
     session.resolve_current(&variant, false)?;
     let mut result = review_result(entry, Some(failure.as_str()), "정답을 보고 다음 문제로 넘어가세요");
     result.meaning_grades = meaning_grades;
+    result.listening_feedback = listening_feedback;
     session.pending = Some(PendingState::Review { variant, result: result.clone() });
     db.save_session(session)?;
     Ok(result)
@@ -1202,6 +1239,38 @@ fn listening_response_text(form_answer: &str, meaning_answer: &str) -> String {
 
 fn listening_response_parts(answer: &str) -> Result<(&str, &str), String> {
     answer.split_once('\n').ok_or_else(|| "invalid listening response payload".into())
+}
+
+fn listening_feedback_for_answers(
+    state: &AppState,
+    deck: &model::DeckRecord,
+    entry: &EntryRecord,
+    form_answer: &str,
+    meaning_answer: &str,
+) -> Result<ListeningFeedback, String> {
+    let orthographic_reading = state.db.japanese_orthographic_reading(&entry.id)?;
+    let form = grade_form_with_reading(entry, form_answer, deck.strict_orthography, orthographic_reading.as_deref());
+    let (accepted, rejected) = state.db.aliases(&entry.id)?;
+    let meaning = if meaning_answer.trim().is_empty() {
+        GradeDecision::Fail
+    } else {
+        state.semantic.grade_reading_with_adjudications(
+            entry,
+            meaning_answer,
+            &accepted,
+            &rejected,
+            &deck.source_language,
+            &deck.target_language,
+        ).0.decision
+    };
+    Ok(ListeningFeedback {
+        form_correct: Some(form.decision == GradeDecision::Pass),
+        meaning_correct: match meaning {
+            GradeDecision::Pass => Some(true),
+            GradeDecision::Fail => Some(false),
+            GradeDecision::Ambiguous => None,
+        },
+    })
 }
 
 fn meaning_grades_for_adjudication(answer: &str, expected_count: usize, rejected_answers: &[String]) -> Option<Vec<MeaningGrade>> {
@@ -1256,6 +1325,7 @@ fn review_result(entry: &EntryRecord, failure: Option<&str>, message: &str) -> S
         pitch: None,
         adjudication: None,
         meaning_grades: None,
+        listening_feedback: None,
         card: None,
     }
 }
@@ -1267,7 +1337,7 @@ fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Res
     session.pending = None;
     let card = build_card(state, session, &variant)?;
     state.db.save_session(session)?;
-    Ok(SubmitResult { status, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, adjudication: None, meaning_grades: None, card: Some(card) })
+    Ok(SubmitResult { status, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, adjudication: None, meaning_grades: None, listening_feedback: None, card: Some(card) })
 }
 
 fn complete_current_stage(state: &AppState, engine: &mut Engine) -> Result<SubmitResult, String> {
@@ -1284,8 +1354,7 @@ fn complete_current_stage(state: &AppState, engine: &mut Engine) -> Result<Submi
 
 fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) -> Result<StudyCard, String> {
     let deck = state.db.deck(&session.deck_id)?;
-    let entries = state.db.entries(&session.deck_id)?;
-    let entry = entries.iter().find(|e| e.id == variant.entry_id).ok_or("표현을 찾지 못했어요")?;
+    let entry = &state.db.entry(&session.deck_id, &variant.entry_id)?;
     let question = match variant.mode {
         StudyMode::Reading => entry.term.clone(),
         StudyMode::Listening => entry.term.clone(),
@@ -1352,6 +1421,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 pitch: None,
                 adjudication: adjudications.get(adjudication_index).cloned(),
                 meaning_grades: None,
+                listening_feedback: matches!(variant.mode, StudyMode::Listening).then_some(ListeningFeedback { form_correct: Some(true), meaning_correct: None }),
                 card: Some(card),
             })
         }
@@ -1367,10 +1437,11 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 pitch: Some(question),
                 adjudication: None,
                 meaning_grades,
+                listening_feedback: None,
                 card: Some(card),
             })
         }
-        Some(PendingState::PitchCorrection { variant, question, failure, meaning_grades }) => {
+        Some(PendingState::PitchCorrection { variant, question, failure, meaning_grades, listening_feedback }) => {
             let entry = find_entry(&state.db, &session.deck_id, &variant.entry_id)?;
             let card = build_card(state, session, &variant)?;
             Ok(SubmitResult {
@@ -1382,6 +1453,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 pitch: Some(question),
                 adjudication: None,
                 meaning_grades,
+                listening_feedback,
                 card: Some(card),
             })
         }
@@ -1397,6 +1469,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
                 pitch: None,
                 adjudication: None,
                 meaning_grades: None,
+                listening_feedback: None,
                 card: Some(card),
             })
         }
@@ -1410,7 +1483,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
         None => {
             if let Some(variant) = session.current.clone() {
                 let card = build_card(state, session, &variant)?;
-                Ok(SubmitResult { status: SubmitStatus::Pass, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, adjudication: None, meaning_grades: None, card: Some(card) })
+                Ok(SubmitResult { status: SubmitStatus::Pass, message: None, failure_type: None, canonical_answer: None, reading: None, pitch: None, adjudication: None, meaning_grades: None, listening_feedback: None, card: Some(card) })
             } else {
                 next_card(state, engine, SubmitStatus::Pass)
             }
@@ -1419,7 +1492,7 @@ fn resume_session(state: &AppState, engine: &mut Engine) -> Result<SubmitResult,
 }
 
 fn find_entry(db: &Database, deck_id: &str, entry_id: &str) -> Result<EntryRecord, String> {
-    db.entries(deck_id)?.into_iter().find(|e| e.id == entry_id).ok_or_else(|| "표현을 찾지 못했어요".into())
+    db.entry(deck_id, entry_id)
 }
 
 fn non_whitespace_chars(value: &str) -> usize {
@@ -1857,7 +1930,7 @@ mod state_tests {
                 phrase_count: 1, allowed_patterns: vec![vec![1, 0]], confidence: model::PitchConfidence::Consensus, gate_enabled: true,
             };
             session.pending = Some(if correction {
-                PendingState::PitchCorrection { variant: variant.clone(), question, failure: "MANUAL_UNKNOWN".into(), meaning_grades: None }
+                PendingState::PitchCorrection { variant: variant.clone(), question, failure: "MANUAL_UNKNOWN".into(), meaning_grades: None, listening_feedback: None }
             } else {
                 PendingState::Pitch { variant: variant.clone(), question, meaning_grades: None }
             });

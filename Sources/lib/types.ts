@@ -95,6 +95,10 @@ export interface SubmitResult {
     submitted_answer: string;
     correct: boolean;
   }> | null;
+  listening_feedback?: {
+    form_correct: boolean | null;
+    meaning_correct: boolean | null;
+  } | null;
   card?: StudyCard | null;
 }
 
