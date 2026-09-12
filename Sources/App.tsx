@@ -188,7 +188,7 @@ function OpenBookCamera() {
   return null;
 }
 
-function OpenBook3D({ openingStarted, onReady }: { openingStarted: boolean; onReady: () => void }) {
+const OpenBook3D = memo(function OpenBook3D({ openingStarted, onReady }: { openingStarted: boolean; onReady: () => void }) {
   return <div className="book-3d book-3d-open" aria-hidden="true">
     <Canvas
       orthographic
@@ -228,7 +228,7 @@ function OpenBook3D({ openingStarted, onReady }: { openingStarted: boolean; onRe
       </group>
     </Canvas>
   </div>;
-}
+});
 
 const FlipPage = forwardRef<HTMLDivElement, { className?: string; children: React.ReactNode; hard?: boolean }>(({ className = "", children, hard = false }, ref) => (
   <div ref={ref} className={`book-flip-page ${className}`} data-density={hard ? "hard" : "soft"}>
@@ -1131,6 +1131,8 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const [bookOpeningStarted, setBookOpeningStarted] = useState(false);
   const [book3DReady, setBook3DReady] = useState(false);
   const [bookFlipReady, setBookFlipReady] = useState(false);
+  const [bookEntriesReady, setBookEntriesReady] = useState(false);
+  const markBookEntriesReady = useCallback(() => setBookEntriesReady(true), []);
   const [bookClosing, setBookClosing] = useState(false);
   const [bookPanel, setBookPanel] = useState<"study" | "entries">("study");
   const [bookEntries, setBookEntries] = useState<EntryRecord[]>([]);
@@ -1176,6 +1178,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const flutterRetryRef = useRef(0);
   const flutterStartedSessionRef = useRef("");
   const bookOpeningStartedRef = useRef(false);
+  const bookPageWarmupRef = useRef(false);
   const bookClosingRef = useRef(false);
   const create = async (e: FormEvent) => {
     e.preventDefault();
@@ -1222,6 +1225,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     : Math.min(1, deck.completed_stage_count / deck.total_stage_count);
   const bookProgressPercent = (deck: DeckSummary) => bookProgressRatio(deck) * 100;
   activeBookSessionRef.current = bookSessionKey;
+  const markBook3DReady = useCallback(() => {
+    if (activeBookSessionRef.current === bookSessionKey) setBook3DReady(true);
+  }, [bookSessionKey]);
 
   useLayoutEffect(() => {
     lastCommittedBookPageContentRef.current = {
@@ -1528,6 +1534,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setBookOpeningStarted(false);
     setBook3DReady(false);
     setBookFlipReady(false);
+    setBookEntriesReady(false);
     setBookSettled(false);
     setBookStudyActive(false);
     setBookStudyExiting(false);
@@ -1788,7 +1795,24 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     beginBookFlutter(bookSessionKey);
   }, [openedDeckId, bookOpenCycle, book3DReady, bookFlipReady]);
 
+  useEffect(() => {
+    if (!bookEntriesReady || bookFlipReady || !openedDeckId || reduceMotion) return;
+    const pageFlip = flipBookRef.current?.pageFlip?.();
+    if (!pageFlip) return;
+    bookPageWarmupRef.current = true;
+    pageFlip.turnToPage(BOOK_CONTENT_PAGE);
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        pageFlip.turnToPage(0);
+        bookPageWarmupRef.current = false;
+        setBookFlipReady(true);
+      });
+    });
+    return () => { cancelAnimationFrame(frame); bookPageWarmupRef.current = false; };
+  }, [bookEntriesReady, bookFlipReady, openedDeckId, reduceMotion]);
+
   const continueBookFlutter = (pageIndex: number, sessionKey: string) => {
+    if (bookPageWarmupRef.current) return;
     if (activeBookSessionRef.current !== sessionKey || bookClosingRef.current) return;
     if (reduceMotion || !flutteringRef.current || pageIndex >= BOOK_CONTENT_PAGE) {
       flutteringRef.current = false;
@@ -1859,9 +1883,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       >
         <OpenBook3D
           openingStarted={bookOpeningStarted || bookSettled}
-          onReady={() => {
-            if (activeBookSessionRef.current === bookSessionKey) setBook3DReady(true);
-          }}
+          onReady={markBook3DReady}
         />
         <div className="book-flip-stack" style={{ maxWidth: OPEN_BOOK_TARGET_WIDTH }}>
           <div ref={bookFoldRef} className="book-fold" aria-hidden="true"
@@ -1899,7 +1921,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             showPageCorners={false}
             disableFlipByClick={true}
             renderOnlyPageLengthChange={reduceMotion ? false : !bookPageContentChanged}
-            onInit={() => setBookFlipReady(true)}
+            onInit={() => {
+              if (reduceMotion) { setBookFlipReady(true); return; }
+            }}
             onFlip={(event) => continueBookFlutter(Number(event.data), bookSessionKey)}
           >
             <FlipPage className="book-cover-page book-shelf-cover-page" hard>
@@ -1961,6 +1985,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                 </div>
                 <BookInlineEntryManager
                   deckId={openedDeck.id}
+                  onReady={markBookEntriesReady}
                   onAdd={openAddEntryDialog}
                   onImport={chooseImportEntryFile}
                   onEdit={openEditEntryDialog}

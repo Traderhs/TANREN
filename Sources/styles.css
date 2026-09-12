@@ -5162,6 +5162,13 @@ textarea:focus {
   background: rgba(255, 255, 255, .022);
 }
 
+/* Uncleared stages have a 68px card plus borders; preserve their scroll space
+   while skipping offscreen layout during the final page turn. */
+.book-stage-group:not(.is-completed-stage) {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 68px;
+}
+
 .book-stage-group.is-current-stage {
   border-color: rgba(216, 173, 92, .24);
   background: rgba(216, 173, 92, .035);
