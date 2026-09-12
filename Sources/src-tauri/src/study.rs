@@ -4,7 +4,7 @@ use rand::{RngCore, SeedableRng, seq::SliceRandom};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AdjudicationPrompt, EntryRecord, MeaningGrade, PitchQuestion, StudyMode, StudyRange, SubmitResult, VariantKey};
+use crate::model::{AdjudicationPrompt, EntryRecord, ListeningFeedback, MeaningGrade, PitchQuestion, StudyMode, StudyRange, SubmitResult, VariantKey};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PendingState {
@@ -35,7 +35,15 @@ pub enum PendingState {
         adjudication_rejected_answers: Vec<String>,
     },
     Pitch { variant: VariantKey, question: PitchQuestion, #[serde(default)] meaning_grades: Option<Vec<MeaningGrade>> },
-    PitchCorrection { variant: VariantKey, question: PitchQuestion, failure: String, #[serde(default)] meaning_grades: Option<Vec<MeaningGrade>> },
+    PitchCorrection {
+        variant: VariantKey,
+        question: PitchQuestion,
+        failure: String,
+        #[serde(default)]
+        meaning_grades: Option<Vec<MeaningGrade>>,
+        #[serde(default)]
+        listening_feedback: Option<ListeningFeedback>,
+    },
 }
 
 pub fn study_ranges(deck_size: usize, increment: usize, checkpoint: usize) -> Vec<StudyRange> {

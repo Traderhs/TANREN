@@ -218,6 +218,8 @@ pub struct SubmitResult {
     pub pitch: Option<PitchQuestion>,
     pub adjudication: Option<AdjudicationPrompt>,
     pub meaning_grades: Option<Vec<MeaningGrade>>,
+    #[serde(default)]
+    pub listening_feedback: Option<ListeningFeedback>,
     pub card: Option<StudyCard>,
 }
 
@@ -235,6 +237,12 @@ pub struct MeaningGrade {
     pub correct: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListeningFeedback {
+    pub form_correct: Option<bool>,
+    pub meaning_correct: Option<bool>,
+}
+
 impl SubmitResult {
     pub fn simple(status: SubmitStatus) -> Self {
         Self {
@@ -246,6 +254,7 @@ impl SubmitResult {
             pitch: None,
             adjudication: None,
             meaning_grades: None,
+            listening_feedback: None,
             card: None,
         }
     }

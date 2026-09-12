@@ -714,6 +714,18 @@ impl Database {
         ).map_err(|e| e.to_string())
     }
 
+    pub fn entry(&self, deck_id: &str, entry_id: &str) -> Result<EntryRecord, String> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT id,term,meanings,reading FROM entries WHERE id=?1 AND deck_id=?2 AND deleted_at IS NULL",
+            params![entry_id, deck_id],
+            |row| {
+                let meanings: String = row.get(2)?;
+                Ok(EntryRecord { id: row.get(0)?, term: row.get(1)?, meanings: parse_json_column(&meanings, 2)?, reading: row.get(3)? })
+            },
+        ).optional().map_err(|e| e.to_string())?.ok_or_else(|| "표현을 찾지 못했어요".into())
+    }
+
     pub fn entries(&self, deck_id: &str) -> Result<Vec<EntryRecord>, String> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT id,term,meanings,reading FROM entries WHERE deck_id=?1 AND deleted_at IS NULL ORDER BY position").map_err(|e| e.to_string())?;
@@ -1272,7 +1284,18 @@ impl Database {
         let paths=stmt.query_map([entry_id],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
         drop(stmt);
         if paths.is_empty(){tx.commit().map_err(|e|e.to_string())?;return Ok(None)}
-        let next:i64=tx.query_row("SELECT next_index FROM audio_playback_state WHERE entry_id=?1",[entry_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?.unwrap_or(0);
+        let stored:Option<i64>=tx.query_row("SELECT next_index FROM audio_playback_state WHERE entry_id=?1",[entry_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        let next = if let Some(next) = stored {
+            next
+        } else {
+            // Spread first encounters across voices instead of starting every word at the same voice.
+            let next:i64=tx.query_row("SELECT CAST(value AS INTEGER) FROM app_settings WHERE key='audio_initial_voice_index'",[],|r|r.get(0)).optional().map_err(|e|e.to_string())?.unwrap_or(0);
+            tx.execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES('audio_initial_voice_index',?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![(next+1).to_string(),now()],
+            ).map_err(|e|e.to_string())?;
+            next
+        };
         let path=paths[next.rem_euclid(paths.len() as i64) as usize].clone();
         tx.execute(
             "INSERT INTO audio_playback_state(entry_id,next_index,updated_at) VALUES(?1,?2,?3) ON CONFLICT(entry_id) DO UPDATE SET next_index=excluded.next_index,updated_at=excluded.updated_at",
@@ -1973,6 +1996,23 @@ mod tests{
         assert_eq!(db.enrichment_progress(&ids).unwrap(), (9000, 0, 0, None));
         let entries = db.entries(&deck.id).unwrap();
         assert_eq!(entries.iter().map(|entry| &entry.term).collect::<Vec<_>>(), drafts.iter().map(|draft| &draft.term).collect::<Vec<_>>());
+        let target = entries.last().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..30 {
+            let found = db.entries(&deck.id).unwrap().into_iter().find(|entry| entry.id == target.id).unwrap();
+            assert_eq!(found.term, target.term);
+        }
+        let scan_time = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..30 {
+            let found = db.entry(&deck.id, &target.id).unwrap();
+            assert_eq!(found.term, target.term);
+            assert_eq!(found.meanings, target.meanings);
+            assert_eq!(found.reading, target.reading);
+        }
+        eprintln!("9000 entry / 30 card lookups: full scan {:?}, direct {:?}", scan_time, started.elapsed());
+        assert!(db.entry("other-deck", &target.id).is_err());
+        assert!(db.entry(&deck.id, "missing-entry").is_err());
         assert_eq!(db.import_entries(&deck.id, "ja-JP", &drafts).unwrap(), ImportResult { inserted: 0, duplicates: 9000 });
         let conn = db.conn().unwrap();
         let plan: String = conn.query_row(
@@ -2754,6 +2794,17 @@ mod tests{
         db.set_entry_analysis(&entry.id, Some("しゃかい"), &analysis, "fixture", "fixture", "CONSENSUS", None, Some(&[vec![1,0,0]]), "lexical", &assets).unwrap();
         let sequence = (0..6).map(|_| db.next_audio_path(&entry.id).unwrap().unwrap()).collect::<Vec<_>>();
         assert_eq!(sequence, vec!["child.wav", "adolescent.wav", "young-adult.wav", "middle-aged.wav", "senior.wav", "child.wav"]);
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "会社".into(), meanings: vec!["회사".into()], reading: Some("かいしゃ".into()),
+        }]).unwrap();
+        let second = db.entries(&deck.id).unwrap().pop().unwrap();
+        db.set_entry_analysis(&second.id, Some("かいしゃ"), &analysis, "fixture", "fixture", "CONSENSUS", None, Some(&[vec![1,0,0]]), "lexical", &assets).unwrap();
+        assert_eq!(db.next_audio_path(&second.id).unwrap().as_deref(), Some("adolescent.wav"));
+        let reopened = Database::open(dir.path().join("tanren.db")).unwrap();
+        assert_eq!(reopened.next_audio_path(&second.id).unwrap().as_deref(), Some("young-adult.wav"));
+        assert_eq!(reopened.next_audio_path(&entry.id).unwrap().as_deref(), Some("adolescent.wav"));
+        db.delete_entry(&deck.id, &second.id).unwrap();
+        assert!(db.entry(&deck.id, &second.id).is_err());
     }
 
     #[test]

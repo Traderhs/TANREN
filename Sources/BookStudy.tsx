@@ -1047,21 +1047,23 @@ export function BookStudy({
   const submittedAnswerCorrect = !result.failure_type || result.failure_type === "PITCH_WRONG";
   const meaningGrades = result.meaning_grades ?? [];
   const hasMeaningGrades = meaningGrades.length > 0;
+  const inferredListeningFormCorrect = !result.failure_type || result.failure_type === "PITCH_WRONG" || result.failure_type === "LISTENING_MEANING_WRONG"
+    ? true
+    : ["LISTENING_FORM_WRONG", "LISTENING_BOTH_WRONG", "LISTENING_FORM_WRONG_MEANING_UNCERTAIN"].includes(result.failure_type)
+      ? false
+      : false;
+  const inferredListeningMeaningCorrect = !result.failure_type || result.failure_type === "PITCH_WRONG" || result.failure_type === "LISTENING_FORM_WRONG"
+    ? true
+    : ["LISTENING_MEANING_WRONG", "LISTENING_BOTH_WRONG"].includes(result.failure_type)
+      ? false
+      : result.failure_type === "LISTENING_FORM_WRONG_MEANING_UNCERTAIN"
+        ? null
+        : false;
   const listeningFormCorrect = card?.mode === "listening"
-    ? !result.failure_type || result.failure_type === "PITCH_WRONG" || result.failure_type === "LISTENING_MEANING_WRONG"
-      ? true
-      : ["LISTENING_FORM_WRONG", "LISTENING_BOTH_WRONG", "LISTENING_FORM_WRONG_MEANING_UNCERTAIN"].includes(result.failure_type)
-        ? false
-        : false
+    ? result.listening_feedback?.form_correct ?? inferredListeningFormCorrect
     : null;
   const listeningMeaningCorrect = card?.mode === "listening"
-    ? !result.failure_type || result.failure_type === "PITCH_WRONG" || result.failure_type === "LISTENING_FORM_WRONG"
-      ? true
-      : ["LISTENING_MEANING_WRONG", "LISTENING_BOTH_WRONG"].includes(result.failure_type)
-        ? false
-        : result.failure_type === "LISTENING_FORM_WRONG_MEANING_UNCERTAIN"
-          ? null
-          : false
+    ? result.listening_feedback?.meaning_correct ?? inferredListeningMeaningCorrect
     : null;
   const submittedAnswerLabel = card?.mode === "listening"
     ? ambiguous
