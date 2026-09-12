@@ -812,8 +812,9 @@ async fn continue_cycle(state: State<'_, AppState>) -> Result<SubmitResult, Stri
 }
 
 #[tauri::command]
-fn library_stats(state: State<'_, AppState>, deck_id: Option<String>) -> Result<LibraryStats, String> {
-    state.db.library_stats(deck_id.as_deref())
+async fn library_stats(state: State<'_, AppState>, deck_id: Option<String>) -> Result<LibraryStats, String> {
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || db.library_stats(deck_id.as_deref())).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
