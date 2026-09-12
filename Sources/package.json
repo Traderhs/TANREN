@@ -1,7 +1,7 @@
 {
   "name": "tanren",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "scripts": {
     "ensure:tauri": "powershell -ExecutionPolicy Bypass -File tools/ensure_tauri.ps1",
