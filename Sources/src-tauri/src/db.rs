@@ -437,6 +437,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_attempts_deck_entry ON attempts(deck_id,entry_id);
             CREATE INDEX IF NOT EXISTS idx_audio_assets_entry_live ON audio_assets(entry_id) WHERE deleted_at IS NULL;
             CREATE INDEX IF NOT EXISTS idx_pitch_patterns_analysis_live ON pitch_patterns(analysis_id) WHERE deleted_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_sync_journal_stage_revision ON sync_journal(entity_id,revision) WHERE entity_type='stage_state';
 
             CREATE TABLE IF NOT EXISTS app_settings (
               key TEXT PRIMARY KEY,
@@ -1856,6 +1857,28 @@ mod tests{
         db.import_entries(&deck.id,"ja-JP",&[EntryDraft{term:"見据える".into(),meanings:vec!["내다보다".into()],reading:Some("みすえる".into())}]).unwrap();
         drop(db);
         let reopened=Database::open(&path).unwrap(); assert_eq!(reopened.entries(&deck.id).unwrap().len(),1); assert_eq!(reopened.list_decks().unwrap()[0].entry_count,1);
+    }
+
+    #[test]
+    fn stage_revision_lookup_is_indexed_after_reopening_existing_database() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tanren.db");
+        let db = Database::open(&path).unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute("DROP INDEX idx_sync_journal_stage_revision", []).unwrap();
+        for (entity, kind, revision) in [("book:1", "stage_state", 2), ("book:1", "stage_state", 7), ("book:1", "entry", 99), ("other:1", "stage_state", 88)] {
+            conn.execute("INSERT INTO sync_journal(op_id,entity_id,entity_type,device_id,revision,operation,payload,timestamp) VALUES(?1,?2,?3,'test',?4,'upsert','{}',?5)",
+                params![Uuid::new_v4().to_string(), entity, kind, revision, now()]).unwrap();
+        }
+        drop(conn);
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        let conn = reopened.conn().unwrap();
+        let sql = "SELECT COALESCE(MAX(revision),0)+1 FROM sync_journal WHERE entity_id=?1 AND entity_type='stage_state'";
+        assert_eq!(conn.query_row(sql, ["book:1"], |row| row.get::<_, i64>(0)).unwrap(), 8);
+        assert_eq!(conn.query_row(sql, ["missing:1"], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let plan: String = conn.query_row(&format!("EXPLAIN QUERY PLAN {sql}"), ["book:1"], |row| row.get(3)).unwrap();
+        assert!(plan.contains("idx_sync_journal_stage_revision"), "{plan}");
     }
 
     #[test]
