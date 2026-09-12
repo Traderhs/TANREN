@@ -59,7 +59,16 @@ function Get-InstalledVersion {
     if (-not $Run) { return $null }
     $manifest = Join-Path $Run.Directory.FullName "engine_manifest.json"
     if (-not (Test-Path -LiteralPath $manifest)) { return $null }
-    try { [string]((Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).version) } catch { $null }
+    try {
+        # VOICEVOX ships engine_manifest.json as UTF-8 without a BOM. Windows
+        # PowerShell 5.1 otherwise decodes BOM-less text with the machine's
+        # legacy ANSI code page, which can make a valid runtime fail version
+        # validation on some locales.
+        $json = [System.IO.File]::ReadAllText($manifest, [System.Text.Encoding]::UTF8)
+        ([string](($json | ConvertFrom-Json).version)).Trim()
+    } catch {
+        $null
+    }
 }
 
 function Test-ModelsPresent {
@@ -137,7 +146,12 @@ try {
         & $sevenZip x (Join-Path $Downloads $parts[0]) "-o$Stage" -y | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "VOICEVOX archive extraction failed" }
         $StageRun = Get-Run $Stage
-        if (-not $StageRun -or (Get-InstalledVersion $StageRun) -ne $EngineVersion) { throw "VOICEVOX engine validation failed" }
+        if (-not $StageRun) { throw "VOICEVOX engine validation failed: run.exe is missing" }
+        $StageVersion = Get-InstalledVersion $StageRun
+        if ($StageVersion -ne $EngineVersion) {
+            $actual = if ($StageVersion) { $StageVersion } else { "unreadable" }
+            throw "VOICEVOX engine validation failed: expected=$EngineVersion actual=$actual manifest=$($StageRun.Directory.FullName)\engine_manifest.json"
+        }
 
         $stageModelDir = Join-Path $StageRun.Directory.FullName "model"
         New-Item -ItemType Directory -Force -Path $stageModelDir | Out-Null
