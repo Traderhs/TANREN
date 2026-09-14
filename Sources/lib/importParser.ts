@@ -47,7 +47,7 @@ export function parseEntryText(input: string): ParsedImport {
       issues.push({ row: index + 1, message: !term ? "표현이 비어 있어요" : "뜻이 비어 있어요", raw });
       return;
     }
-    const meanings = meaningCell.split("/").map((value) => value.trim()).filter(Boolean);
+    const meanings = meaningCell.split(/[\/／,，;；]/).map((value) => value.trim()).filter(Boolean);
     const key = `${term}\u0000${meanings.join("\u0000")}\u0000${reading ?? ""}`;
     if (seen.has(key)) {
       issues.push({ row: index + 1, message: "입력 안의 중복 행이에요", raw });

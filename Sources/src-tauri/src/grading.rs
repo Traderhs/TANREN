@@ -225,6 +225,18 @@ mod tests {
     }
 
     #[test]
+    fn multiple_meanings_accept_comma_separated_answers() {
+        let mut value = entry();
+        value.term = "後".into();
+        value.meanings = vec!["뒤".into(), "나중".into(), "나머지".into()];
+        value.reading = Some("あと".into());
+        assert_eq!(
+            grade_reading_deterministic(&value, "뒤, 나중, 나머지", &[], &[]).unwrap().decision,
+            GradeDecision::Pass,
+        );
+    }
+
+    #[test]
     fn reading_answer_separator_supports_safe_space_fallback() {
         assert_eq!(split_reading_answer("걸다, 전화하다", 2), vec!["걸다", "전화하다"]);
         assert_eq!(split_reading_answer("걸다　전화하다", 2), vec!["걸다", "전화하다"]);

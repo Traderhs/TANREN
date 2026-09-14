@@ -8,10 +8,16 @@ describe("parseEntryText", () => {
     expect(parsed.issues).toEqual([{ row: 3, message: "뜻이 비어 있어요", raw: "잘못됨\t" }]);
   });
 
+  it("treats comma-separated TSV glosses as separate meanings", () => {
+    const parsed = parseEntryText("後\t뒤, 나중, 나머지\tあと");
+    expect(parsed.issues).toEqual([]);
+    expect(parsed.entries[0]).toEqual({ term: "後", meanings: ["뒤", "나중", "나머지"], reading: "あと" });
+  });
+
   it("supports quoted CSV commas, quotes, LF, and optional reading", () => {
     const parsed = parseEntryText('"term","meaning","reading"\n"目安","기준, 표준","めやす"\n"言う","""말하다"" / 이르다"');
     expect(parsed.issues).toEqual([]);
-    expect(parsed.entries[0]).toEqual({ term: "目安", meanings: ["기준, 표준"], reading: "めやす" });
+    expect(parsed.entries[0]).toEqual({ term: "目安", meanings: ["기준", "표준"], reading: "めやす" });
     expect(parsed.entries[1].meanings).toEqual(['"말하다"', "이르다"]);
   });
 

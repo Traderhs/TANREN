@@ -12,7 +12,37 @@ use crate::{
     timers::TypingProfileState,
 };
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
+
+fn normalize_meanings(values: &[String]) -> Vec<String> {
+    values.iter()
+        .flat_map(|value| value.split(|character| matches!(character, '/' | '／' | ',' | '，' | ';' | '；')))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_stored_meanings(tx: &Transaction<'_>) -> Result<(), String> {
+    let rows = {
+        let mut stmt = tx.prepare("SELECT id,meanings FROM entries").map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    for (id, raw) in rows {
+        let meanings: Vec<String> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let normalized = normalize_meanings(&meanings);
+        if normalized != meanings && !normalized.is_empty() {
+            tx.execute(
+                "UPDATE entries SET meanings=?1 WHERE id=?2",
+                params![serde_json::to_string(&normalized).map_err(|e| e.to_string())?, id],
+            ).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
 
 fn contains_han(value: &str) -> bool {
     value.chars().any(|character| matches!(character as u32,
@@ -170,13 +200,20 @@ impl Database {
             }
             if version == 14 {
                 let tx = conn.transaction().map_err(|e| e.to_string())?;
-                tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [SCHEMA_VERSION]).map_err(|e| e.to_string())?;
+                tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [16]).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
-                version = SCHEMA_VERSION;
+                version = 16;
             }
             if version == 15 {
                 let tx = conn.transaction().map_err(|e| e.to_string())?;
                 purge_retired_mode(&tx, "speaking")?;
+                tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [16]).map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                version = 16;
+            }
+            if version == 16 {
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                normalize_stored_meanings(&tx)?;
                 tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [SCHEMA_VERSION]).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 version = SCHEMA_VERSION;
@@ -1765,7 +1802,7 @@ impl Database {
             [],
             |row| row.get(0),
         ).map_err(|e| format!("백업 버전을 확인하지 못했어요: {e}"))?;
-        if !matches!(version, 13 | 14 | 15 | SCHEMA_VERSION) {
+        if !matches!(version, 13 | 14 | 15 | 16 | SCHEMA_VERSION) {
             return Err("현재 버전과 맞지 않는 TANREN 백업이에요".into());
         }
         let integrity: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(|e| e.to_string())?;
@@ -1857,6 +1894,29 @@ mod tests{
         db.import_entries(&deck.id,"ja-JP",&[EntryDraft{term:"見据える".into(),meanings:vec!["내다보다".into()],reading:Some("みすえる".into())}]).unwrap();
         drop(db);
         let reopened=Database::open(&path).unwrap(); assert_eq!(reopened.entries(&deck.id).unwrap().len(),1); assert_eq!(reopened.list_decks().unwrap()[0].entry_count,1);
+    }
+
+    #[test]
+    fn version_16_migration_splits_legacy_meaning_separators() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meanings-migration.db");
+        let db = Database::open(&path).unwrap();
+        let deck = db.create_deck("existing", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "後".into(),
+            meanings: vec!["뒤, 나중, 나머지".into()],
+            reading: Some("あと".into()),
+        }]).unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute("UPDATE schema_info SET version=16", []).unwrap();
+        drop(conn);
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        let entry = reopened.entries(&deck.id).unwrap().into_iter().next().unwrap();
+        assert_eq!(entry.meanings, vec!["뒤", "나중", "나머지"]);
+        let conn = reopened.conn().unwrap();
+        assert_eq!(conn.query_row("SELECT version FROM schema_info WHERE id=1", [], |row| row.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
