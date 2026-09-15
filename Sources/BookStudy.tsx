@@ -18,7 +18,7 @@ import { completionDelayMs, firstMeaningfulInputAt, isMeaningfulInput } from "./
 import { japaneseImeEnterCommitsYomi, japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { JapaneseImeSegment, JapaneseImeSession } from "./lib/japaneseIme";
 import { playEffectSound } from "./lib/soundEffects";
-import type { AudioSettings, DeckSummary, EntryDetails, PitchQuestion, StudyCard, SubmitResult } from "./lib/types";
+import type { AudioSettings, DeckSummary, EntryDetails, EntryListRecord, PitchQuestion, StudyCard, SubmitResult } from "./lib/types";
 
 function answerPlaceholder(card: StudyCard | null) {
   if (!card) return "답을 입력해주세요";
@@ -142,6 +142,7 @@ export function BookStudy({
   const [submittedPitch, setSubmittedPitch] = useState<PitchSelection | null>(null);
   const [submittedPitchQuestion, setSubmittedPitchQuestion] = useState<PitchQuestion | null>(null);
   const [submittedAnswerKnown, setSubmittedAnswerKnown] = useState(false);
+  const [entryStats, setEntryStats] = useState<EntryListRecord | null>(null);
 
   const ime = useRef<JapaneseImeSession | null>(null);
   const input = useRef<HTMLInputElement>(null);
@@ -208,6 +209,21 @@ export function BookStudy({
   const preedit = imeSegments.map((segment) => segment.text).join("");
   const candidates = imeSegments.find((segment) => segment.kind === "focus" && segment.candidates?.length);
   const total = card?.total ?? lastTotal.current;
+
+  useEffect(() => {
+    const entryId = card?.entry_id;
+    if (!entryId) {
+      setEntryStats(null);
+      return;
+    }
+    let disposed = false;
+    void api.listEntries(deck.id).then((entries) => {
+      if (!disposed && cardRef.current?.entry_id === entryId) {
+        setEntryStats(entries.find((entry) => entry.id === entryId) ?? null);
+      }
+    }).catch(() => undefined);
+    return () => { disposed = true; };
+  }, [deck.id, card?.entry_id, result.status, result.failure_type]);
 
   useEffect(() => {
     if (!editedEntry || !cardRef.current) return;
@@ -1100,6 +1116,11 @@ export function BookStudy({
       </div>
     </header>
     <div className="learning-progress" role="progressbar" aria-label="단계 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)}><i style={{ width: `${progress}%` }} /></div>
+    {entryStats && <div className="learning-entry-stats" aria-label="현재 표현 누적 학습 통계">
+      <span>누적 <strong>{entryStats.attempts.toLocaleString("ko-KR")}회</strong></span>
+      <span>문제 <strong>{entryStats.base_accuracy == null ? "—" : `${(entryStats.base_accuracy * 100).toFixed(1)}%`}</strong></span>
+      <span>피치 <strong>{entryStats.pitch_accuracy == null ? "—" : `${(entryStats.pitch_accuracy * 100).toFixed(1)}%`}</strong></span>
+    </div>}
 
     <main ref={transitionContent} className="learning-body book-learning-content">
       {complete ? <div className="learning-complete">

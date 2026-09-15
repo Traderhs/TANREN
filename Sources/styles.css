@@ -5620,7 +5620,7 @@ textarea:focus {
 .book-inline-entry-row {
   min-height: 34px;
   display: grid;
-  grid-template-columns: 40px minmax(74px,.82fr) minmax(66px,.72fr) minmax(104px,1.45fr) 72px 44px 36px;
+  grid-template-columns: 40px minmax(74px,.82fr) minmax(66px,.72fr) minmax(104px,1.45fr) 72px 64px 44px 36px;
   align-items: center;
   gap: 7px;
   padding: 0 5px;
@@ -5667,13 +5667,15 @@ textarea:focus {
 }
 
 .book-inline-entry-number,
-.book-inline-entry-attempts {
+.book-inline-entry-attempts,
+.book-inline-entry-accuracy {
   color: #dedbd4;
   font-weight: 580;
   font-variant-numeric: tabular-nums;
 }
 
-.book-inline-entry-attempts {
+.book-inline-entry-attempts,
+.book-inline-entry-accuracy {
   text-align: right;
 }
 
@@ -6407,6 +6409,8 @@ textarea:focus {
 .book-learning button:focus-visible { outline: 2px solid #d8ad5c; outline-offset: 4px; }
 .learning-progress { height: 2px; margin-top: 20px; background: #272b27; flex-shrink: 0; }
 .learning-progress i { display: block; height: 100%; background: #c6a366; transition: width .3s ease; }
+.learning-entry-stats { height: 22px; margin-top: 10px; padding-right: 12px; display: flex; justify-content: flex-end; align-items: center; gap: 16px; flex-shrink: 0; color: #777d72; font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.learning-entry-stats strong { margin-left: 4px; color: #a9ada4; font-size: 12px; font-weight: 600; }
 .learning-body { flex: 1; min-height: 0; overflow: auto; padding: 36px 20px; display: flex; flex-direction: column; justify-content: safe center; align-items: center; }
 .learning-question { width: 100%; text-align: center; margin: 0 0 38px; }
 .learning-question h1 { margin: 0; font-size: clamp(28px, 3.4vw, 52px); line-height: 1.6; letter-spacing: .025em; font-weight: 550; color: #eee9df; overflow-wrap: anywhere; }
@@ -6799,7 +6803,7 @@ html.tanren-book-study-navigation-lock .home-library-section>.home-guide-arrow,
 @container (max-width: 1200px) {
   .book-page-inner,
   .book-page-inner-right { padding: 20px; }
-  .book-inline-entry-row { min-width: 490px; }
+  .book-inline-entry-row { min-width: 558px; }
   .book-stage-middle.has-clear-times { grid-template-columns: 1fr; gap: 4px; }
   .book-stage-clear-times { justify-content: center; }
 }

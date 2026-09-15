@@ -148,6 +148,9 @@ export interface EntryRecord extends EntryDraft {
 export interface EntryListRecord extends EntryRecord {
   position: number;
   attempts: number;
+  base_accuracy: number | null;
+  pitch_accuracy: number | null;
+  accuracy: number | null;
 }
 
 export interface EntryDetails {

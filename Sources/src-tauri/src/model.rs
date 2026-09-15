@@ -122,6 +122,9 @@ pub struct EntryListRecord {
     pub meanings: Vec<String>,
     pub reading: Option<String>,
     pub attempts: usize,
+    pub base_accuracy: Option<f64>,
+    pub pitch_accuracy: Option<f64>,
+    pub accuracy: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

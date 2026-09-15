@@ -4,7 +4,7 @@ import { api } from "./lib/api";
 import { EntryEditButton } from "./EntryEditButton";
 import type { EntryListRecord } from "./lib/types";
 
-type BookEntrySortKey = "position" | "term" | "reading" | "meaning" | "attempts";
+type BookEntrySortKey = "position" | "term" | "reading" | "meaning" | "attempts" | "accuracy";
 
 export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDelete, onReady }: {
   deckId: string;
@@ -207,6 +207,12 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
     let result = 0;
     if (sort.key === "position") result = left.position - right.position;
     else if (sort.key === "attempts") result = left.attempts - right.attempts;
+    else if (sort.key === "accuracy") {
+      if (left.accuracy == null || right.accuracy == null) {
+        if (left.accuracy == null && right.accuracy == null) result = 0;
+        else return left.accuracy == null ? 1 : -1;
+      } else result = left.accuracy - right.accuracy;
+    }
     else if (sort.key === "term") result = textCollator.compare(left.term, right.term);
     else if (sort.key === "reading") result = textCollator.compare(left.reading ?? "", right.reading ?? "");
     else result = textCollator.compare(left.meanings.join(" / "), right.meanings.join(" / "));
@@ -273,7 +279,7 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
         const button = event.target as HTMLElement;
         const row = button.closest<HTMLElement>("[data-entry-index]");
         if (!row) {
-          if (!event.shiftKey && button.classList.contains("is-numeric") && sortedEntries.length) {
+          if (!event.shiftKey && button.classList.contains("book-inline-entry-last-sort") && sortedEntries.length) {
             event.preventDefault(); focusEntry(0, 0);
           }
           return;
@@ -291,6 +297,7 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
         <button type="button" className="ghost book-inline-entry-sort" onClick={() => toggleSort("reading")}>발음{sortMark("reading")}</button>
         <button type="button" className="ghost book-inline-entry-sort" onClick={() => toggleSort("meaning")}>뜻{sortMark("meaning")}</button>
         <button type="button" className="ghost book-inline-entry-sort is-numeric" onClick={() => toggleSort("attempts")}>{sortMarkBefore("attempts")}누적 시도</button>
+        <button type="button" className="ghost book-inline-entry-sort is-numeric book-inline-entry-last-sort" onClick={() => toggleSort("accuracy")}>{sortMarkBefore("accuracy")}정확도</button>
         <span className="book-inline-entry-settings-head">편집</span>
         <span className="book-inline-entry-delete-head">삭제</span>
       </div>
@@ -307,6 +314,7 @@ export function BookInlineEntryManager({ deckId, onAdd, onImport, onEdit, onDele
             <span className="book-inline-entry-reading" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, entry.reading || "—")}>{entry.reading || "—"}</span>
             <span className="book-inline-entry-meaning" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, entry.meanings.join(" / "))}>{entry.meanings.join(" / ")}</span>
             <span className="book-inline-entry-attempts" onMouseEnter={(event) => updateOverflowTooltip(event.currentTarget, `${entry.attempts.toLocaleString("ko-KR")}회`)}>{entry.attempts.toLocaleString("ko-KR")}회</span>
+            <span className="book-inline-entry-accuracy">{entry.accuracy == null ? "—" : `${(entry.accuracy * 100).toFixed(1)}%`}</span>
             <EntryEditButton onClick={() => onEdit(entry)} label={`${entry.term} 편집`} />
             <button type="button" className="book-inline-entry-delete" onClick={() => onDelete(entry)} aria-label={`${entry.term} 삭제`} title="표현 삭제">
               <svg viewBox="0 0 24 24" aria-hidden="true">

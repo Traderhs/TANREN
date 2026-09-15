@@ -777,7 +777,15 @@ impl Database {
     pub fn entry_list(&self, deck_id: &str) -> Result<Vec<EntryListRecord>, String> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT e.id,e.position,e.term,e.meanings,e.reading,COUNT(a.id) \
+            "SELECT e.id,e.position,e.term,e.meanings,e.reading,COUNT(a.id), \
+                    AVG(CASE WHEN a.id IS NULL THEN NULL ELSE CAST(a.base_correct AS REAL) END), \
+                    AVG(CAST(a.pitch_correct AS REAL)), \
+                    AVG(CASE \
+                        WHEN a.id IS NULL THEN NULL \
+                        WHEN a.pitch_correct IS NULL THEN CAST(a.joint_correct AS REAL) \
+                        WHEN a.base_correct=1 AND a.pitch_correct=1 THEN 1.0 \
+                        ELSE 0.0 \
+                    END) \
              FROM entries e \
              LEFT JOIN attempts a ON a.entry_id=e.id AND a.deck_id=e.deck_id \
              WHERE e.deck_id=?1 AND e.deleted_at IS NULL \
@@ -793,6 +801,9 @@ impl Database {
                 meanings: parse_json_column(&meanings, 3)?,
                 reading: row.get(4)?,
                 attempts: row.get::<_, i64>(5)? as usize,
+                base_accuracy: row.get(6)?,
+                pitch_accuracy: row.get(7)?,
+                accuracy: row.get(8)?,
             })
         }).map_err(|e| e.to_string())?;
         let mut entries = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
@@ -2138,6 +2149,35 @@ mod tests{
         let listed = db.entry_list(&deck.id).unwrap();
         assert_eq!(listed.iter().map(|entry| entry.position).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert_eq!(listed.iter().map(|entry| entry.term.as_str()).collect::<Vec<_>>(), vec!["二", "三", "四"]);
+    }
+
+    #[test]
+    fn entry_list_reports_base_pitch_and_strict_combined_accuracy() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("accuracy", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "舞う".into(), meanings: vec!["춤추다".into()], reading: Some("まう".into()),
+        }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+
+        let fresh = db.entry_list(&deck.id).unwrap().remove(0);
+        assert_eq!(fresh.attempts, 0);
+        assert_eq!(fresh.base_accuracy, None);
+        assert_eq!(fresh.pitch_accuracy, None);
+        assert_eq!(fresh.accuracy, None);
+
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "춤추다", true, Some(true), true, "exact", None, 300, 100, None).unwrap();
+        // A non-gating pitch miss may still have joint_correct=true for progression,
+        // but the entry-list accuracy must require both the answer and pitch to be correct.
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "춤추다", true, Some(false), true, "exact", None, 300, 100, None).unwrap();
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 1, "0~0", "틀림", false, None, false, "exact", None, 300, 100, Some("WRONG_ANSWER")).unwrap();
+
+        let listed = db.entry_list(&deck.id).unwrap().remove(0);
+        assert_eq!(listed.attempts, 3);
+        assert!((listed.base_accuracy.unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        assert!((listed.pitch_accuracy.unwrap() - 0.5).abs() < 1e-9);
+        assert!((listed.accuracy.unwrap() - 1.0 / 3.0).abs() < 1e-9);
     }
 
     #[test]
