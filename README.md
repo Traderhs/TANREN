@@ -36,7 +36,7 @@ The goal is simple: don’t just recognize a word. Make sure you can retrieve it
 - **Listening** — Hear it, identify it, and recover the meaning.
 - **Pitch** — Reinforce Japanese lexical pitch patterns as you study.
 
-The question types are mixed so the same word cannot always be memorized through the same cue.
+Each word is scheduled **once per round**, not once per question type. When the card appears, TANREN chooses Reading, Writing, or Listening from that word's latest performance and favors its weakest axis. If the word has no history yet, TANREN falls back to the weakest axis in your overall study history. Untried or long-neglected axes are periodically brought back so one cue cannot disappear forever.
 
 ---
 
@@ -49,7 +49,7 @@ The question types are mixed so the same word cannot always be memorized through
 - **듣기** — 소리만 듣고 표현과 뜻을 복원해요.
 - **피치** — 일본어 피치 패턴도 함께 익혀요.
 
-문제 유형은 섞여서 나와요. 같은 단어라도 매번 같은 방식으로 외울 수 없게 만들었어요.
+단어 하나는 한 회독에 **문제 하나만** 잡혀요. 대신 실제로 출제될 때 그 단어의 Reading / Writing / Listening 기록을 보고 가장 약한 축을 우선 골라요. 아직 그 단어의 기록이 없으면 전체 학습 기록에서 가장 약한 축을 사용해요. 한 번도 안 해봤거나 너무 오래 안 나온 축은 가끔 다시 끼워 넣어서 특정 방식이 영원히 빠지지 않게 해요.
 
 <br>
 
@@ -105,7 +105,7 @@ TANREN uses rounds instead of making you manage another complicated scheduling s
 
 The study range grows in **50-entry steps**, with a **cumulative review every 500 entries**.
 
-Get an item right and it leaves the current round. Miss it and it stays. Finish the round, go again, and keep narrowing the list until only the things you still do not know remain.
+Get an item right and it leaves the current round. Miss it and it stays. Finish the round, go again, and keep narrowing the list until only the things you still do not know remain. A miss does not lock the word to the same question type: when it comes back, the mode is selected again from the latest per-word performance.
 
 No need to rate every card as “Again,” “Hard,” or “Good.” Your actual answer is the signal.
 
@@ -120,6 +120,8 @@ TANREN은 복잡한 스케줄표 대신 **회독**을 사용해요.
 틀린 문제는 남아요.
 
 다 돌면 다시 시작해요.
+
+틀려서 다음 바퀴에 다시 나올 때도 문제 유형을 고정하지 않아요. 방금까지의 단어별 성적을 다시 보고 가장 필요한 축으로 출제해요.
 
 그러다 보면 결국 남는 건 아직 안 외워진 것뿐이에요.
 

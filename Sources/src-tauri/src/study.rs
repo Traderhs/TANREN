@@ -83,11 +83,12 @@ fn entry_slots(entries: &[EntryRecord]) -> Vec<Option<String>> {
 
 fn variants_for_slots(entry_slots: &[Option<String>], entries: &[EntryRecord], modes: &[StudyMode], range: &StudyRange) -> Vec<VariantKey> {
     let active_ids: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+    let Some(default_mode) = modes.first().copied() else { return Vec::new(); };
     entry_slots[range.start.min(entry_slots.len())..range.end.min(entry_slots.len())]
         .iter()
         .filter_map(|entry_id| entry_id.as_deref())
         .filter(|entry_id| active_ids.contains(*entry_id))
-        .flat_map(|entry_id| modes.iter().map(move |mode| VariantKey { entry_id: entry_id.to_string(), mode: *mode }))
+        .map(|entry_id| VariantKey { entry_id: entry_id.to_string(), mode: default_mode })
         .collect()
 }
 
@@ -108,6 +109,8 @@ pub struct QueueState {
 
 impl QueueState {
     pub fn new(mut variants: Vec<VariantKey>, seed: u64) -> Self {
+        let mut seen = HashSet::new();
+        variants.retain(|variant| seen.insert(variant.entry_id.clone()));
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         variants.shuffle(&mut rng);
         let queue = variants.iter().cloned().collect();
@@ -149,15 +152,14 @@ impl QueueState {
     }
 
     pub fn mark_pass(&mut self, variant: &VariantKey) {
-        self.remaining.retain(|v| v != variant);
-        self.queue.retain(|v| v != variant);
+        self.remaining.retain(|v| v.entry_id != variant.entry_id);
+        self.queue.retain(|v| v.entry_id != variant.entry_id);
     }
 
     pub fn mark_fail(&mut self, variant: &VariantKey) {
-        if !self.remaining.contains(variant) {
-            self.remaining.push(variant.clone());
-        }
-        self.queue.retain(|v| v != variant);
+        self.remaining.retain(|v| v.entry_id != variant.entry_id);
+        self.remaining.push(variant.clone());
+        self.queue.retain(|v| v.entry_id != variant.entry_id);
     }
 
     pub fn retain_entries(&mut self, active_ids: &HashSet<&str>) {
@@ -169,7 +171,7 @@ impl QueueState {
     fn add_variants(&mut self, variants: impl IntoIterator<Item = VariantKey>) {
         let mut changed = false;
         for variant in variants {
-            if self.remaining.contains(&variant) {
+            if self.remaining.iter().any(|existing| existing.entry_id == variant.entry_id) {
                 continue;
             }
             self.remaining.push(variant);
@@ -178,6 +180,14 @@ impl QueueState {
         if changed {
             self.rebuild_queue();
         }
+    }
+
+    fn dedupe_entries(&mut self) {
+        let mut seen = HashSet::new();
+        self.remaining.retain(|variant| seen.insert(variant.entry_id.clone()));
+        let remaining_ids: HashSet<&str> = self.remaining.iter().map(|variant| variant.entry_id.as_str()).collect();
+        let mut queued = HashSet::new();
+        self.queue.retain(|variant| remaining_ids.contains(variant.entry_id.as_str()) && queued.insert(variant.entry_id.clone()));
     }
 
     #[cfg(test)]
@@ -259,6 +269,7 @@ impl StudySession {
             }
         }
         self.queue.retain_entries(&active_ids);
+        self.queue.dedupe_entries();
         if self.current.as_ref().is_some_and(|variant| !active_ids.contains(variant.entry_id.as_str())) {
             self.current = None;
         }
@@ -302,10 +313,7 @@ impl StudySession {
             new_ids
                 .iter()
                 .filter(|entry_id| active_ids.contains(entry_id.as_str()))
-                .flat_map(|entry_id| modes.iter().map(move |mode| VariantKey {
-                    entry_id: entry_id.clone(),
-                    mode: *mode,
-                })),
+                .filter_map(|entry_id| modes.first().copied().map(|mode| VariantKey { entry_id: entry_id.clone(), mode })),
         );
         self.sync_entries(entries, modes);
     }
@@ -336,11 +344,32 @@ impl StudySession {
 
     pub fn range(&self) -> &StudyRange { &self.study_range }
 
+    #[cfg(test)]
     pub fn next_variant(&mut self, gap: usize) -> Option<VariantKey> {
         if self.current.is_some() { return None; }
         let next = self.queue.pop_next(gap)?;
         self.current = Some(next.clone());
         Some(next)
+    }
+
+    pub fn next_variant_selected<F>(&mut self, gap: usize, choose_mode: F) -> Result<Option<VariantKey>, String>
+    where
+        F: FnOnce(&str) -> Result<StudyMode, String>,
+    {
+        if self.current.is_some() { return Ok(None); }
+        let Some(mut next) = self.queue.pop_next(gap) else { return Ok(None); };
+        next.mode = match choose_mode(&next.entry_id) {
+            Ok(mode) => mode,
+            Err(error) => {
+                self.queue.queue.push_front(next);
+                return Err(error);
+            }
+        };
+        if let Some(remaining) = self.queue.remaining.iter_mut().find(|variant| variant.entry_id == next.entry_id) {
+            remaining.mode = next.mode;
+        }
+        self.current = Some(next.clone());
+        Ok(Some(next))
     }
 
     pub fn resolve_current(&mut self, variant: &VariantKey, passed: bool) -> Result<(), String> {
@@ -495,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn same_entry_modes_do_not_have_to_clump() {
+    fn queue_keeps_only_one_card_per_entry_even_with_multiple_modes() {
         let mut variants = Vec::new();
         for i in 0..20 {
             for mode in [StudyMode::Reading, StudyMode::Listening, StudyMode::Writing] {
@@ -503,12 +532,27 @@ mod tests {
             }
         }
         let mut q = QueueState::new(variants, 42);
-        let mut prev = None;
-        for _ in 0..40 {
+        assert_eq!(q.remaining_count(), 20);
+        let mut seen = HashSet::new();
+        for _ in 0..20 {
             let v = q.pop_next(10).unwrap();
-            if let Some(p) = &prev { assert_ne!(p, &v.entry_id); }
-            prev = Some(v.entry_id);
+            assert!(seen.insert(v.entry_id));
         }
+    }
+
+    #[test]
+    fn all_enabled_modes_still_schedule_one_card_per_entry() {
+        let session = StudySession::new(
+            "deck".into(),
+            1,
+            &entries(50),
+            &[StudyMode::Reading, StudyMode::Listening, StudyMode::Writing],
+            INCREMENT,
+            CHECKPOINT,
+            1,
+        ).unwrap();
+        assert_eq!(session.range_total, 50);
+        assert_eq!(session.queue.remaining_count(), 50);
     }
 
     fn entries(count: usize) -> Vec<EntryRecord> {
