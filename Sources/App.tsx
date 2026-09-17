@@ -1828,7 +1828,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     const current = Boolean(schedule?.active);
     const range = schedule?.study_range ?? fallbackRange;
     const entryCount = range ? Math.max(0, range.end - range.start) : 0;
-    const questionCount = entryCount * openedDeck.enabled_modes.length;
     const completed = Boolean(schedule?.completed);
     return <div className={`book-stage-group ${current ? "is-current-stage" : ""} ${completed ? "is-completed-stage" : ""}`} key={stage}>
       <button
@@ -1849,7 +1848,6 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
               >{formatStudyRangeLabel(range.label)}</span>
               <span className="book-stage-range-meta">
                 <span>{numberFormat.format(entryCount)}개</span>
-                <span>{numberFormat.format(questionCount)}문항</span>
               </span>
             </>}
           </span>

@@ -774,6 +774,78 @@ impl Database {
         rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())
     }
 
+    pub fn preferred_study_mode(&self, entry_id: &str, enabled_modes: &[StudyMode]) -> Result<StudyMode, String> {
+        let Some(&fallback_mode) = enabled_modes.first() else { return Err("활성화된 문제 유형이 없어요".into()); };
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT a.variant, \
+                    SUM(CASE WHEN a.entry_id=?1 THEN 1 ELSE 0 END), \
+                    SUM(CASE WHEN a.entry_id=?1 THEN a.base_correct ELSE 0 END), \
+                    COUNT(*), SUM(a.base_correct) \
+             FROM attempts a \
+             JOIN decks d ON d.id=a.deck_id \
+             WHERE d.deleted_at IS NULL \
+             GROUP BY a.variant"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([entry_id], |row| Ok((
+            row.get::<_, String>(0)?,
+            (
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as usize,
+                row.get::<_, i64>(4)? as usize,
+            ),
+        ))).map_err(|e| e.to_string())?;
+        let stats = rows.collect::<Result<HashMap<_, _>, _>>().map_err(|e| e.to_string())?;
+
+        let mode_stats = |mode: StudyMode| -> (usize, usize, usize, usize) {
+            stats.get(mode.as_str()).copied().unwrap_or((0, 0, 0, 0))
+        };
+        let global_score = |mode: StudyMode| {
+            let (_, _, attempts, correct) = mode_stats(mode);
+            if attempts == 0 { -1.0 } else { correct as f64 / attempts as f64 }
+        };
+        let mode_order = |mode: StudyMode| enabled_modes.iter().position(|candidate| *candidate == mode).unwrap_or(usize::MAX);
+        let weakest_global = |modes: &[StudyMode]| {
+            modes.iter().copied().min_by(|left, right| {
+                let left_stats = mode_stats(*left);
+                let right_stats = mode_stats(*right);
+                global_score(*left).total_cmp(&global_score(*right))
+                    .then_with(|| left_stats.2.cmp(&right_stats.2))
+                    .then_with(|| mode_order(*left).cmp(&mode_order(*right)))
+            }).unwrap_or(fallback_mode)
+        };
+
+        let entry_attempts: usize = enabled_modes.iter().map(|mode| mode_stats(*mode).0).sum();
+        if entry_attempts == 0 {
+            return Ok(weakest_global(enabled_modes));
+        }
+
+        let untried = enabled_modes.iter().copied().filter(|mode| mode_stats(*mode).0 == 0).collect::<Vec<_>>();
+        if !untried.is_empty() {
+            return Ok(weakest_global(&untried));
+        }
+
+        let min_attempts = enabled_modes.iter().map(|mode| mode_stats(*mode).0).min().unwrap_or(0);
+        let max_attempts = enabled_modes.iter().map(|mode| mode_stats(*mode).0).max().unwrap_or(0);
+        let candidates = if max_attempts.saturating_sub(min_attempts) >= 3 {
+            enabled_modes.iter().copied().filter(|mode| mode_stats(*mode).0 == min_attempts).collect::<Vec<_>>()
+        } else {
+            enabled_modes.to_vec()
+        };
+
+        Ok(candidates.into_iter().min_by(|left, right| {
+            let left_stats = mode_stats(*left);
+            let right_stats = mode_stats(*right);
+            let left_accuracy = left_stats.1 as f64 / left_stats.0 as f64;
+            let right_accuracy = right_stats.1 as f64 / right_stats.0 as f64;
+            left_accuracy.total_cmp(&right_accuracy)
+                .then_with(|| left_stats.0.cmp(&right_stats.0))
+                .then_with(|| global_score(*left).total_cmp(&global_score(*right)))
+                .then_with(|| mode_order(*left).cmp(&mode_order(*right)))
+        }).unwrap_or(fallback_mode))
+    }
+
     pub fn entry_list(&self, deck_id: &str) -> Result<Vec<EntryListRecord>, String> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -2181,6 +2253,31 @@ mod tests{
     }
 
     #[test]
+    fn preferred_mode_uses_entry_weakness_and_global_fallback() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("adaptive mode", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[
+            EntryDraft { term: "一".into(), meanings: vec!["하나".into()], reading: Some("いち".into()) },
+            EntryDraft { term: "二".into(), meanings: vec!["둘".into()], reading: Some("に".into()) },
+        ]).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let first = &entries[0];
+        let second = &entries[1];
+        let modes = [StudyMode::Reading, StudyMode::Listening, StudyMode::Writing];
+
+        assert_eq!(db.preferred_study_mode(&first.id, &modes).unwrap(), StudyMode::Reading);
+        db.insert_attempt(&first.id, &deck.id, StudyMode::Reading, 1, "0~1", "하나", true, None, true, "exact", None, 100, 50, None).unwrap();
+        assert_eq!(db.preferred_study_mode(&first.id, &modes).unwrap(), StudyMode::Listening);
+        db.insert_attempt(&first.id, &deck.id, StudyMode::Listening, 1, "0~1", "틀림", false, None, false, "exact", None, 100, 50, Some("WRONG_ANSWER")).unwrap();
+        assert_eq!(db.preferred_study_mode(&first.id, &modes).unwrap(), StudyMode::Writing);
+        db.insert_attempt(&first.id, &deck.id, StudyMode::Writing, 1, "0~1", "一", true, None, true, "exact", None, 100, 50, None).unwrap();
+        assert_eq!(db.preferred_study_mode(&first.id, &modes).unwrap(), StudyMode::Listening);
+
+        assert_eq!(db.preferred_study_mode(&second.id, &modes).unwrap(), StudyMode::Listening);
+    }
+
+    #[test]
     fn partial_stage_snapshot_expands_with_new_entries_and_requires_a_new_clear() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
@@ -2435,8 +2532,8 @@ mod tests{
 
         let resumed = db.load_session(&deck.id, 1).unwrap().unwrap();
         assert_eq!(resumed.study_range.label, "0~1");
-        assert_eq!(resumed.range_total, 6);
-        assert_eq!(resumed.queue.remaining_count(), 5);
+        assert_eq!(resumed.range_total, 2);
+        assert_eq!(resumed.queue.remaining_count(), 1);
         assert!(!resumed.queue.remaining.contains(&passed));
     }
 

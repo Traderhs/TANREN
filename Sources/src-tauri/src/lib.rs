@@ -1334,7 +1334,9 @@ fn review_result(entry: &EntryRecord, failure: Option<&str>, message: &str) -> S
 fn next_card(state: &AppState, engine: &mut Engine, status: SubmitStatus) -> Result<SubmitResult, String> {
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
     if session.current.is_some() { return Err("an unresolved active card already exists".into()); }
-    let variant = session.next_variant(10).ok_or("stage queue is empty")?;
+    let deck = state.db.deck(&session.deck_id)?;
+    let variant = session.next_variant_selected(10, |entry_id| state.db.preferred_study_mode(entry_id, &deck.enabled_modes))?
+        .ok_or("stage queue is empty")?;
     session.pending = None;
     let card = build_card(state, session, &variant)?;
     state.db.save_session(session)?;
