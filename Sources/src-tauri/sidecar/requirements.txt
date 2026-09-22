@@ -1,4 +1,4 @@
-pyopenjtalk-plus==0.4.1.post9
+pyopenjtalk-plus[onnxruntime]==0.4.1.post9
 fugashi==1.5.2
 unidic==1.1.0
 numpy>=2.0,<3

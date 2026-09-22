@@ -137,7 +137,7 @@ if (Test-Path -LiteralPath $StaleUniDicLite) {
 }
 
 if (-not [string]::IsNullOrWhiteSpace($PyOpenJTalkVersion) -and -not [string]::IsNullOrWhiteSpace($FugashiVersion) -and -not [string]::IsNullOrWhiteSpace($UniDicPackageVersion)) {
-    & $EnvPython -m pip install --upgrade "pyopenjtalk-plus==$PyOpenJTalkVersion" "fugashi==$FugashiVersion" "unidic==$UniDicPackageVersion"
+    & $EnvPython -m pip install --upgrade "pyopenjtalk-plus[onnxruntime]==$PyOpenJTalkVersion" "fugashi==$FugashiVersion" "unidic==$UniDicPackageVersion"
     if ($LASTEXITCODE -ne 0) { throw "latest sidecar runtime dependency install failed with exit code $LASTEXITCODE" }
 }
 
@@ -157,7 +157,7 @@ try {
 
 if (-not [string]::IsNullOrWhiteSpace($UniDicSource)) {
     $dicDir = (& $EnvPython -c "import unidic; print(unidic.DICDIR)").Trim()
-    if ((Test-Path -LiteralPath $dicDir) -and ((Get-Item -LiteralPath $dicDir).LinkType -eq "Junction")) {
+    if ((-not $DevOnly) -and (Test-Path -LiteralPath $dicDir) -and ((Get-Item -LiteralPath $dicDir).LinkType -eq "Junction")) {
         & cmd.exe /d /c rmdir "$dicDir"
         if ($LASTEXITCODE -ne 0) { throw "temporary UniDic dictionary junction removal failed with exit code $LASTEXITCODE" }
     }
@@ -207,6 +207,7 @@ New-Item -ItemType Directory -Force $Output | Out-Null
     --workpath (Join-Path $Results "pyinstaller-work") `
     --specpath (Join-Path $Results "pyinstaller-spec") `
     --collect-all pyopenjtalk `
+    --collect-all onnxruntime `
     --collect-all fugashi `
     --collect-all unidic `
     $Script

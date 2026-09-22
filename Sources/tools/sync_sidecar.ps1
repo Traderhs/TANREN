@@ -97,7 +97,7 @@ function Test-InstalledState {
     if (-not (Test-Path -LiteralPath $envPython)) { return $false }
 
     try {
-        $installedJson = & $envPython -c "import importlib.metadata as m, importlib.util, json; print(json.dumps({'pyopenjtalk_plus':m.version('pyopenjtalk-plus'),'fugashi':m.version('fugashi'),'unidic_package':m.version('unidic'),'unidic_lite_present':importlib.util.find_spec('unidic_lite') is not None}))"
+        $installedJson = & $envPython -c "import importlib.metadata as m, importlib.util, json; print(json.dumps({'pyopenjtalk_plus':m.version('pyopenjtalk-plus'),'fugashi':m.version('fugashi'),'unidic_package':m.version('unidic'),'onnxruntime_present':importlib.util.find_spec('onnxruntime') is not None,'unidic_lite_present':importlib.util.find_spec('unidic_lite') is not None}))"
         if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installedJson)) { return $false }
         $installed = $installedJson | ConvertFrom-Json
     } catch {
@@ -107,6 +107,7 @@ function Test-InstalledState {
     if ([string]$installed.pyopenjtalk_plus -ne [string]$ExpectedVersions.pyopenjtalk_plus) { return $false }
     if ([string]$installed.fugashi -ne [string]$ExpectedVersions.fugashi) { return $false }
     if ([string]$installed.unidic_package -ne [string]$ExpectedVersions.unidic_package) { return $false }
+    if (-not [bool]$installed.onnxruntime_present) { return $false }
     if ([bool]$installed.unidic_lite_present) { return $false }
 
     $dictionaryVersionPath = Join-Path $Output "tanren-unidic\version"
