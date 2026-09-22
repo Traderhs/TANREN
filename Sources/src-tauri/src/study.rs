@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rand::{RngCore, SeedableRng, seq::SliceRandom};
 use rand_chacha::ChaCha8Rng;
@@ -104,6 +104,8 @@ pub struct QueueState {
     pub queue: VecDeque<VariantKey>,
     pub recent_entries: VecDeque<String>,
     #[serde(default)]
+    pub retry_modes: HashMap<String, StudyMode>,
+    #[serde(default)]
     pub completed_cycles: usize,
 }
 
@@ -114,7 +116,14 @@ impl QueueState {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         variants.shuffle(&mut rng);
         let queue = variants.iter().cloned().collect();
-        Self { seed, remaining: variants, queue, recent_entries: VecDeque::new(), completed_cycles: 0 }
+        Self {
+            seed,
+            remaining: variants,
+            queue,
+            recent_entries: VecDeque::new(),
+            retry_modes: HashMap::new(),
+            completed_cycles: 0,
+        }
     }
 
     pub fn remaining_count(&self) -> usize { self.remaining.len() }
@@ -154,18 +163,25 @@ impl QueueState {
     pub fn mark_pass(&mut self, variant: &VariantKey) {
         self.remaining.retain(|v| v.entry_id != variant.entry_id);
         self.queue.retain(|v| v.entry_id != variant.entry_id);
+        self.retry_modes.remove(&variant.entry_id);
     }
 
     pub fn mark_fail(&mut self, variant: &VariantKey) {
         self.remaining.retain(|v| v.entry_id != variant.entry_id);
         self.remaining.push(variant.clone());
         self.queue.retain(|v| v.entry_id != variant.entry_id);
+        self.retry_modes.insert(variant.entry_id.clone(), variant.mode);
     }
 
     pub fn retain_entries(&mut self, active_ids: &HashSet<&str>) {
         self.remaining.retain(|variant| active_ids.contains(variant.entry_id.as_str()));
         self.queue.retain(|variant| active_ids.contains(variant.entry_id.as_str()));
         self.recent_entries.retain(|entry_id| active_ids.contains(entry_id.as_str()));
+        self.retry_modes.retain(|entry_id, _| active_ids.contains(entry_id.as_str()));
+    }
+
+    fn retry_mode(&self, entry_id: &str) -> Option<StudyMode> {
+        self.retry_modes.get(entry_id).copied()
     }
 
     fn add_variants(&mut self, variants: impl IntoIterator<Item = VariantKey>) {
@@ -188,6 +204,7 @@ impl QueueState {
         let remaining_ids: HashSet<&str> = self.remaining.iter().map(|variant| variant.entry_id.as_str()).collect();
         let mut queued = HashSet::new();
         self.queue.retain(|variant| remaining_ids.contains(variant.entry_id.as_str()) && queued.insert(variant.entry_id.clone()));
+        self.retry_modes.retain(|entry_id, _| remaining_ids.contains(entry_id.as_str()));
     }
 
     #[cfg(test)]
@@ -326,6 +343,7 @@ impl StudySession {
             }
         }
         self.queue.remove_entry(entry_id);
+        self.queue.retry_modes.remove(entry_id);
         if self.current.as_ref().is_some_and(|variant| variant.entry_id == entry_id) {
             self.current = None;
         }
@@ -358,11 +376,15 @@ impl StudySession {
     {
         if self.current.is_some() { return Ok(None); }
         let Some(mut next) = self.queue.pop_next(gap) else { return Ok(None); };
-        next.mode = match choose_mode(&next.entry_id) {
-            Ok(mode) => mode,
-            Err(error) => {
-                self.queue.queue.push_front(next);
-                return Err(error);
+        next.mode = if let Some(mode) = self.queue.retry_mode(&next.entry_id) {
+            mode
+        } else {
+            match choose_mode(&next.entry_id) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    self.queue.queue.push_front(next);
+                    return Err(error);
+                }
             }
         };
         if let Some(remaining) = self.queue.remaining.iter_mut().find(|variant| variant.entry_id == next.entry_id) {
@@ -466,6 +488,28 @@ mod tests {
         assert_eq!(q.remaining_count(), 1);
         q.mark_pass(&pulled);
         assert_eq!(q.remaining_count(), 0);
+    }
+
+    #[test]
+    fn failed_variant_retries_with_the_same_mode_before_dynamic_selection_resumes() {
+        let mut session = StudySession::new(
+            "deck".into(),
+            1,
+            &entries(1),
+            &[StudyMode::Reading, StudyMode::Listening, StudyMode::Writing],
+            INCREMENT,
+            CHECKPOINT,
+            1,
+        ).unwrap();
+
+        let first = session.next_variant_selected(10, |_| Ok(StudyMode::Listening)).unwrap().unwrap();
+        assert_eq!(first.mode, StudyMode::Listening);
+        session.resolve_current(&first, false).unwrap();
+
+        let retry = session.next_variant_selected(10, |_| Ok(StudyMode::Writing)).unwrap().unwrap();
+        assert_eq!(retry.mode, StudyMode::Listening);
+        session.resolve_current(&retry, true).unwrap();
+        assert!(session.queue.retry_modes.is_empty());
     }
 
     #[test]
