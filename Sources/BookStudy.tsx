@@ -252,8 +252,6 @@ export function BookStudy({
   const completedCount = complete ? total : card ? Math.max(0, total - displayRemaining) : 0;
   const progress = complete ? 100 : total > 0 ? Math.max(0, Math.min(100, completedCount / total * 100)) : 0;
   const listeningMeaningPhase = card?.mode === "listening" && listeningPhase === "meaning";
-  const phaseAnswer = listeningMeaningPhase ? meaningAnswer : answer;
-  const phaseComposing = listeningMeaningPhase ? meaningComposing.current : composing.current;
   const completionIdleMs = listeningMeaningPhase
     ? card?.listening_meaning_completion_idle_ms
     : card?.completion_idle_ms;
@@ -263,18 +261,11 @@ export function BookStudy({
   const now = timing.current.start + elapsed;
   const recalling = timing.current.first === null;
   const recallLeft = Math.max(0, (card?.recall_timeout_ms ?? 0) - (recalling ? elapsed : timing.current.first! - timing.current.start));
-  const inputDelay = completionDelayMs(completionIdleMs, phaseComposing, phaseAnswer, timing.current.compositionEnd, timing.current.last ?? now);
-  const inputLeft = inputDelay === null ? null : Math.max(0, inputDelay - (now - (timing.current.last ?? now)));
   const inputElapsed = recalling ? 0 : Math.max(0, now - timing.current.first!);
-  const completionTotalLeft = !recalling && completionTimeoutMs != null
-    ? Math.max(0, completionTimeoutMs - inputElapsed)
-    : null;
   const completionTimerEnabled = completionTimeoutMs != null || completionIdleMs != null;
   const inputClock = recalling
     ? "대기"
-    : completionTimerEnabled
-      ? formatTimerSeconds(completionTotalLeft ?? inputLeft ?? completionIdleMs ?? 0)
-      : formatTimerSeconds(inputElapsed);
+    : formatTimerSeconds(inputElapsed);
   const stageStudyTimeMs = stageStudyDuration.current + (studyActivityStartedAt.current == null
     ? 0
     : Math.max(0, studyActivityNow - studyActivityStartedAt.current));
@@ -1312,8 +1303,8 @@ export function BookStudy({
               <div className={`learning-timer ${recalling ? "is-active" : ""}`} role="timer" aria-label="회상 남은 시간">
                 <span>회상</span><strong>{formatTimerSeconds(recallLeft)}</strong><i aria-hidden="true"><b style={{ width: `${recallLeft / Math.max(1, card?.recall_timeout_ms ?? 1) * 100}%` }} /></i>
               </div>
-              <div className={`learning-timer ${!recalling ? "is-active" : ""}`} role="timer" aria-label={completionTimerEnabled ? "입력 남은 시간" : "입력 경과 시간"}>
-                <span>입력</span><strong>{inputClock}</strong><i aria-hidden="true"><b style={{ width: `${recalling ? 0 : inputLeft !== null ? Math.min(100, inputLeft / Math.max(1, inputDelay ?? 1) * 100) : 100}%` }} /></i>{!completionTimerEnabled && <small>타수 측정 기간이에요</small>}
+              <div className={`learning-timer ${!recalling ? "is-active" : ""}`} role="timer" aria-label="입력 경과 시간">
+                <span>입력</span><strong>{inputClock}</strong>{!completionTimerEnabled && <small>타수 측정 기간이에요</small>}
               </div>
             </div>
           </form>
