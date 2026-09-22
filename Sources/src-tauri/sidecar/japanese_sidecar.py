@@ -663,15 +663,12 @@ def jisho_dictionary_hint(term: str, reading: str) -> dict[str, Any] | None:
             definitions = [str(value).strip() for value in (sense.get("english_definitions") or []) if str(value).strip()]
             if not definitions:
                 continue
-            pos = [str(value).strip() for value in (sense.get("parts_of_speech") or []) if str(value).strip()]
             definition = "; ".join(definitions[:3])
-            label = " · ".join(pos[:2])
-            display_text = f"JMdict · {label} · {definition}" if label else f"JMdict · {definition}"
             digest = hashlib.sha256((term + "\0" + reading).encode("utf-8")).hexdigest()
             return {
                 "sentence_id": int(digest[:15], 16),
                 "sentence_text": definition,
-                "display_text": display_text,
+                "display_text": definition,
                 "owner": "EDRDG",
                 "license": "EDRDG licence",
                 "provider": "JMdict",
@@ -697,6 +694,7 @@ def rakuten_recipe_hint(term: str) -> dict[str, Any] | None:
     title = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
     if term not in title:
         return None
+    title = re.sub(r"\s*[|｜]\s*楽天レシピ.*$", "", title).strip()
     digest = hashlib.sha256(("rakuten-recipe\0" + term).encode("utf-8")).hexdigest()
     return {
         "sentence_id": int(digest[:15], 16),
