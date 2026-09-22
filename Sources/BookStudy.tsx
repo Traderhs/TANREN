@@ -1337,7 +1337,7 @@ export function BookStudy({
                 <span>회상</span><strong>{formatTimerSeconds(recallLeft)}</strong><i aria-hidden="true"><b style={{ width: `${recallLeft / Math.max(1, card?.recall_timeout_ms ?? 1) * 100}%` }} /></i>
               </div>
               <div className={`learning-timer ${!recalling ? "is-active" : ""}`} role="timer" aria-label={completionTimerEnabled ? "입력 남은 시간" : "입력 경과 시간"}>
-                <span>입력</span><strong>{inputClock}</strong>{completionTimerEnabled && <i aria-hidden="true"><b style={{ width: `${inputBarPercent}%` }} /></i>}{!completionTimerEnabled && <small>타수 측정 기간이에요</small>}
+                <span>입력</span><strong>{inputClock}</strong>{completionTimerEnabled ? <i aria-hidden="true"><b style={{ width: `${inputBarPercent}%` }} /></i> : <i aria-hidden="true"><b style={{ width: "100%" }} /></i>}{!completionTimerEnabled && <small>타수 측정 기간이에요</small>}
               </div>
             </div>
           </form>
