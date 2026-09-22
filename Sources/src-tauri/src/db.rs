@@ -471,6 +471,7 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_entries_import ON entries(deck_id,term,meanings,COALESCE(reading,'')) WHERE deleted_at IS NULL;
             CREATE INDEX IF NOT EXISTS idx_entries_deck_position ON entries(deck_id,position);
+            CREATE INDEX IF NOT EXISTS idx_entries_deck_reading ON entries(deck_id,reading) WHERE deleted_at IS NULL;
             CREATE INDEX IF NOT EXISTS idx_attempts_deck_entry ON attempts(deck_id,entry_id);
             CREATE INDEX IF NOT EXISTS idx_audio_assets_entry_live ON audio_assets(entry_id) WHERE deleted_at IS NULL;
             CREATE INDEX IF NOT EXISTS idx_pitch_patterns_analysis_live ON pitch_patterns(analysis_id) WHERE deleted_at IS NULL;
@@ -1067,6 +1068,10 @@ impl Database {
             params![term, meanings_json, reading, timestamp, revision, self.device_id, entry_id, deck_id],
         ).map_err(|e| e.to_string())?;
         if pronunciation_changed {
+            tx.execute(
+                "UPDATE entries SET metadata=json_remove(metadata,'$.listening_hint') WHERE id=?1",
+                [entry_id],
+            ).map_err(|e| e.to_string())?;
             let audio_rows = {
                 let mut stmt = tx.prepare("SELECT id,revision FROM audio_assets WHERE entry_id=?1").map_err(|e| e.to_string())?;
                 stmt.query_map([entry_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
@@ -1122,6 +1127,7 @@ impl Database {
             &serde_json::json!({"deck_id":deck_id,"term":term,"meanings":meanings,"reading":reading}),
         )?;
         tx.commit().map_err(|e| e.to_string())?;
+        self.clear_unambiguous_listening_hints()?;
         Ok(pronunciation_changed)
     }
 
@@ -1151,7 +1157,9 @@ impl Database {
             "delete",
             &serde_json::json!({"deck_id":deck_id,"deleted_at":timestamp}),
         )?;
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        self.clear_unambiguous_listening_hints()?;
+        Ok(())
     }
 
     pub fn update_deck(&self, deck_id: &str, name: &str, enabled_modes: &[StudyMode]) -> Result<(), String> {
@@ -1433,6 +1441,145 @@ impl Database {
             [entry_id],
             |row| row.get(0),
         ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn homophone_group(&self, entry_id: &str) -> Result<Vec<EntryRecord>, String> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT peer.id,peer.term,peer.meanings,peer.reading
+               FROM entries current
+               JOIN entries peer ON peer.deck_id=current.deck_id
+                 AND peer.deleted_at IS NULL
+                 AND peer.reading=current.reading
+               WHERE current.id=?1 AND current.deleted_at IS NULL
+                 AND current.reading IS NOT NULL AND current.reading<>''
+               ORDER BY peer.position"#,
+        ).map_err(|e| e.to_string())?;
+        let entries = stmt.query_map([entry_id], |row| {
+            let meanings: String = row.get(2)?;
+            Ok(EntryRecord {
+                id: row.get(0)?,
+                term: row.get(1)?,
+                meanings: parse_json_column(&meanings, 2)?,
+                reading: row.get(3)?,
+            })
+        }).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let distinct_terms = entries.iter().map(|entry| entry.term.as_str()).collect::<HashSet<_>>();
+        Ok((distinct_terms.len() >= 2).then_some(entries).unwrap_or_default())
+    }
+
+    pub fn missing_listening_hint_entries(&self) -> Result<Vec<EntryRecord>, String> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT e.id,e.term,e.meanings,e.reading
+               FROM entries e
+               JOIN decks d ON d.id=e.deck_id AND d.deleted_at IS NULL
+               WHERE e.deleted_at IS NULL
+                 AND e.language='ja-JP'
+                 AND e.reading IS NOT NULL AND e.reading<>''
+                 AND json_type(e.metadata,'$.listening_hint') IS NULL
+                 AND EXISTS (
+                   SELECT 1 FROM entries peer
+                   WHERE peer.deck_id=e.deck_id
+                     AND peer.deleted_at IS NULL
+                     AND peer.id<>e.id
+                     AND peer.reading=e.reading
+                     AND peer.term<>e.term
+                 )
+               ORDER BY e.term,e.reading,e.position"#,
+        ).map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| {
+            let meanings: String = row.get(2)?;
+            Ok(EntryRecord {
+                id: row.get(0)?,
+                term: row.get(1)?,
+                meanings: parse_json_column(&meanings, 2)?,
+                reading: row.get(3)?,
+            })
+        }).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn listening_hint(&self, entry_id: &str) -> Result<Option<(String, String)>, String> {
+        let conn = self.conn()?;
+        conn.query_row(
+            r#"SELECT json_extract(metadata,'$.listening_hint.display_text'),
+                      COALESCE(
+                        json_extract(metadata,'$.listening_hint.attribution'),
+                        printf('Tatoeba #%s · %s · %s',
+                          json_extract(metadata,'$.listening_hint.sentence_id'),
+                          json_extract(metadata,'$.listening_hint.owner'),
+                          json_extract(metadata,'$.listening_hint.license'))
+                      )
+               FROM entries
+               WHERE id=?1 AND deleted_at IS NULL
+                 AND json_type(metadata,'$.listening_hint')='object'"#,
+            [entry_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn has_listening_hint(&self, entry_id: &str) -> Result<bool, String> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM entries
+               WHERE id=?1 AND deleted_at IS NULL
+                 AND json_type(metadata,'$.listening_hint')='object'
+             )",
+            [entry_id],
+            |row| row.get::<_, bool>(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    pub fn set_listening_hint(
+        &self,
+        entry_id: &str,
+        sentence_id: i64,
+        sentence_text: &str,
+        display_text: &str,
+        owner: &str,
+        license: &str,
+        provider: &str,
+        attribution: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn()?;
+        let hint = serde_json::json!({
+            "provider": provider,
+            "sentence_id": sentence_id,
+            "sentence_text": sentence_text,
+            "display_text": display_text,
+            "owner": owner,
+            "license": license,
+            "attribution": attribution,
+        });
+        conn.execute(
+            "UPDATE entries SET metadata=json_set(metadata,'$.listening_hint',json(?1)) WHERE id=?2 AND deleted_at IS NULL",
+            params![hint.to_string(), entry_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clear_unambiguous_listening_hints(&self) -> Result<usize, String> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE entries AS current
+             SET metadata=json_remove(metadata,'$.listening_hint')
+             WHERE current.deleted_at IS NULL
+               AND json_type(current.metadata,'$.listening_hint')='object'
+               AND NOT EXISTS (
+                 SELECT 1 FROM entries peer
+                 WHERE peer.deck_id=current.deck_id
+                   AND peer.deleted_at IS NULL
+                   AND peer.id<>current.id
+                   AND peer.reading=current.reading
+                   AND peer.term<>current.term
+               )",
+            [],
+        ).map_err(|e| e.to_string())
     }
 
     pub fn library_stats(&self, deck_id: Option<&str>) -> Result<LibraryStats, String> {
@@ -2682,6 +2829,39 @@ mod tests{
         assert_eq!(db.queued_enrichment(3).unwrap().len(), 1);
         assert_eq!(db.requeue_pitch_data_revision("fixture-v1").unwrap(), 3);
         assert_eq!(db.queued_enrichment(3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn homophone_group_and_listening_hint_roundtrip() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("homophones", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[
+            EntryDraft { term: "橋".into(), meanings: vec!["다리".into()], reading: Some("はし".into()) },
+            EntryDraft { term: "箸".into(), meanings: vec!["젓가락".into()], reading: Some("はし".into()) },
+        ]).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let group = db.homophone_group(&entries[0].id).unwrap();
+        assert_eq!(group.len(), 2);
+        assert_eq!(db.missing_listening_hint_entries().unwrap().len(), 2);
+        assert!(!db.has_listening_hint(&entries[0].id).unwrap());
+
+        db.set_listening_hint(
+            &entries[0].id,
+            123,
+            "川に橋がある。",
+            "川に＿＿がある。",
+            "fixture-user",
+            "CC BY 2.0 FR",
+            "Tatoeba",
+            None,
+        ).unwrap();
+        let hint = db.listening_hint(&entries[0].id).unwrap().unwrap();
+        assert!(db.has_listening_hint(&entries[0].id).unwrap());
+        assert_eq!(db.missing_listening_hint_entries().unwrap().len(), 1);
+        assert_eq!(hint.0, "川に＿＿がある。");
+        assert!(hint.1.contains("Tatoeba #123"));
+        assert!(hint.1.contains("fixture-user"));
     }
 
     #[test]

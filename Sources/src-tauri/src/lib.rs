@@ -12,6 +12,7 @@ mod windows_input;
 #[cfg(test)]
 mod edit_matrix_tests;
 
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, Mutex,
@@ -22,7 +23,7 @@ use std::process::Command;
 
 use db::Database;
 use grading::{grade_form_with_reading, normalize_generic, split_reading_answer};
-use japanese::{JapaneseAnalyzer, PITCH_DATA_REVISION, VOICE_AUDIO_REVISION};
+use japanese::{JapaneseAnalyzer, ListeningHint, PITCH_DATA_REVISION, VOICE_AUDIO_REVISION};
 use model::{
     AdjudicationPrompt, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
     ListeningFeedback, MeaningGrade, PitchQuestion, StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
@@ -36,6 +37,8 @@ use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 use voicevox::{VoicevoxRuntime, VoicevoxRuntimeStatus};
 use windows_input::WindowsInputAdapter;
+
+const LISTENING_HINT_BACKFILL_REVISION: &str = "external-context-v2";
 
 #[derive(Default)]
 struct Engine {
@@ -1379,6 +1382,11 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
         None
     };
     let audio_path = state.db.next_audio_path(&entry.id)?;
+    let (listening_hint, listening_hint_attribution) = if matches!(variant.mode, StudyMode::Listening) {
+        state.db.listening_hint(&entry.id)?.map_or((None, None), |(hint, attribution)| (Some(hint), Some(attribution)))
+    } else {
+        (None, None)
+    };
     if matches!(variant.mode, StudyMode::Listening) && audio_path.is_none() {
         return Err("아직 음성이 준비되지 않았어요 잠시 후 다시 시도해주세요".into());
     }
@@ -1394,6 +1402,8 @@ fn build_card(state: &AppState, session: &StudySession, variant: &VariantKey) ->
         total: session.range_total,
         range_label: session.range().label.clone(),
         audio_path,
+        listening_hint,
+        listening_hint_attribution,
         recall_timeout_ms: deck.recall_timeout_by_mode.for_mode(variant.mode),
         completion_idle_ms: deck.adaptive_completion_timer_enabled.then(|| profile.allowed_idle_ms()).flatten(),
         completion_timeout_ms: deck.adaptive_completion_timer_enabled.then(|| profile.allowed_completion_ms(expected_input_chars)).flatten(),
@@ -1537,6 +1547,137 @@ fn validate_timeout_variant(current: &VariantKey, variant_id: &str) -> Result<()
     if current.id() == variant_id { Ok(()) } else { Err("stale study card timeout".into()) }
 }
 
+fn normalized_external_lookup(value: &str) -> &str {
+    value.trim_start_matches(['～', '~'])
+}
+
+fn is_explicit_spelling_variant(left: &EntryRecord, right: &EntryRecord) -> bool {
+    left.meanings == right.meanings
+        || left.meanings.iter().any(|meaning| meaning.contains(&right.term))
+        || right.meanings.iter().any(|meaning| meaning.contains(&left.term))
+}
+
+fn listening_hint_for_entry(
+    db: &Database,
+    analyzer: &JapaneseAnalyzer,
+    entry: &EntryRecord,
+) -> Result<Option<ListeningHint>, String> {
+    let direct = analyzer.listening_hint(&entry.term, entry.reading.as_deref())?;
+    if direct.is_some() {
+        return Ok(direct);
+    }
+
+    let stripped_term = normalized_external_lookup(&entry.term);
+    let stripped_reading = entry.reading.as_deref().map(normalized_external_lookup);
+    if stripped_term != entry.term || stripped_reading != entry.reading.as_deref() {
+        if let Some(hint) = analyzer.listening_hint(stripped_term, stripped_reading)? {
+            return Ok(Some(hint));
+        }
+    }
+
+    for peer in db.homophone_group(&entry.id)? {
+        if peer.id == entry.id || !is_explicit_spelling_variant(entry, &peer) {
+            continue;
+        }
+        if let Some(hint) = analyzer.listening_hint(&peer.term, peer.reading.as_deref())? {
+            return Ok(Some(hint));
+        }
+        let peer_term = normalized_external_lookup(&peer.term);
+        let peer_reading = peer.reading.as_deref().map(normalized_external_lookup);
+        if (peer_term != peer.term || peer_reading != peer.reading.as_deref())
+            && let Some(hint) = analyzer.listening_hint(peer_term, peer_reading)?
+        {
+            return Ok(Some(hint));
+        }
+    }
+    Ok(None)
+}
+
+fn refresh_listening_hints(db: &Database, analyzer: &JapaneseAnalyzer, entry_id: &str) -> Result<(), String> {
+    db.clear_unambiguous_listening_hints()?;
+    for entry in db.homophone_group(entry_id)? {
+        if db.has_listening_hint(&entry.id)? { continue; }
+        match listening_hint_for_entry(db, analyzer, &entry) {
+            Ok(Some(hint)) => db.set_listening_hint(
+                &entry.id,
+                hint.sentence_id,
+                &hint.sentence_text,
+                &hint.display_text,
+                &hint.owner,
+                &hint.license,
+                hint.provider.as_deref().unwrap_or("Tatoeba"),
+                hint.attribution.as_deref(),
+            )?,
+            Ok(None) => eprintln!("TANREN listening hint unavailable from Tatoeba: {}", entry.term),
+            Err(error) => eprintln!("TANREN listening hint lookup failed for {}: {error}", entry.term),
+        }
+    }
+    Ok(())
+}
+
+fn start_listening_hint_backfill(db: Database, analyzer: JapaneseAnalyzer) {
+    tauri::async_runtime::spawn_blocking(move || {
+        if db.setting("listening_hint_backfill_revision")
+            .ok()
+            .flatten()
+            .as_deref() == Some(LISTENING_HINT_BACKFILL_REVISION)
+        {
+            return;
+        }
+        let entries = match db.missing_listening_hint_entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("TANREN listening hint backfill query failed: {error}");
+                return;
+            }
+        };
+        let mut groups: HashMap<(String, String), Vec<EntryRecord>> = HashMap::new();
+        for entry in entries {
+            let Some(reading) = entry.reading.as_ref().filter(|value| !value.trim().is_empty()).cloned() else { continue; };
+            groups.entry((entry.term.clone(), reading)).or_default().push(entry);
+        }
+        let mut had_error = false;
+        for ((term, _reading), entries) in groups {
+            let Some(representative) = entries.first() else { continue; };
+            match listening_hint_for_entry(&db, &analyzer, representative) {
+                Ok(Some(hint)) => {
+                    for entry in entries {
+                        if let Err(error) = db.set_listening_hint(
+                            &entry.id,
+                            hint.sentence_id,
+                            &hint.sentence_text,
+                            &hint.display_text,
+                            &hint.owner,
+                            &hint.license,
+                            hint.provider.as_deref().unwrap_or("Tatoeba"),
+                            hint.attribution.as_deref(),
+                        ) {
+                            had_error = true;
+                            eprintln!("TANREN listening hint backfill write failed for {term}: {error}");
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    had_error = true;
+                    eprintln!("TANREN listening hint backfill lookup failed for {term}: {error}");
+                }
+            }
+        }
+        let complete = db.missing_listening_hint_entries()
+            .map(|entries| entries.is_empty())
+            .unwrap_or(false);
+        if !had_error && complete {
+            if let Err(error) = db.set_setting(
+                "listening_hint_backfill_revision",
+                Some(LISTENING_HINT_BACKFILL_REVISION),
+            ) {
+                eprintln!("TANREN listening hint backfill revision write failed: {error}");
+            }
+        }
+    });
+}
+
 fn start_enrichment_worker(
     db: Database,
     analyzer: JapaneseAnalyzer,
@@ -1590,7 +1731,11 @@ fn start_enrichment_worker(
                                 &analysis.scope,
                                 &audio,
                             ) {
-                                Ok(true) => {}
+                                Ok(true) => {
+                                    if let Err(error) = refresh_listening_hints(&db, &analyzer, &entry.id) {
+                                        eprintln!("TANREN listening hint refresh failed: {error}");
+                                    }
+                                }
                                 Ok(false) => {
                                     if let Err(error) = analyzer.invalidate_audio(&entry.id) {
                                         let _ = db.fail_enrichment(&entry.id, &error);
@@ -1795,6 +1940,7 @@ pub fn run() {
             let audio_dir = semantic_home.join("audio");
             app.asset_protocol_scope().allow_directory(&audio_dir, true).map_err(|e| e.to_string())?;
             let analyzer = JapaneseAnalyzer::install(app.handle().clone(), &app_data, audio_dir, Arc::clone(&voicevox))?;
+            start_listening_hint_backfill(db.clone(), analyzer.clone());
             let semantic_backend = LlamaCppEmbeddingBackend::install(semantic_home.clone());
             let semantic_relation = OnnxNliRelationBackend::install(semantic_home.clone());
             let semantic = Arc::new(SemanticGrader::new(semantic_backend, semantic_relation, db.clone(), SemanticThresholds::configured()));

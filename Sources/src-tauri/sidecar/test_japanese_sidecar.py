@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import urllib.error
+import json
 from unittest.mock import patch
 
 import japanese_sidecar as jp
@@ -87,7 +88,44 @@ class MoraFixtures(unittest.TestCase):
 
 
 class ScopeAndCacheFixtures(unittest.TestCase):
-    def test_voicevox_supplies_predicted_pitch_for_custom_reading(self):
+    def test_masked_context_accepts_multi_token_compound_reading(self):
+        with patch.object(jp, "token_data", return_value=([
+            {"surface": "看護", "lemma": "看護", "reading": "カンゴ"},
+            {"surface": "師", "lemma": "師", "reading": "シ"},
+            {"surface": "です", "lemma": "です", "reading": "デス"},
+        ], None, "fixture")):
+            self.assertEqual(
+                jp._masked_context("看護師", "かんごし", "看護師です"),
+                "＿＿です",
+            )
+
+    def test_tatoeba_hint_requires_matching_reading_for_homographs(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+            def read(self):
+                return json.dumps({
+                    "data": [
+                        {"id": 1, "text": "何なの？", "owner": "fixture", "license": "CC BY 2.0 FR"},
+                        {"id": 2, "text": "何ですか？", "owner": "fixture", "license": "CC BY 2.0 FR"},
+                    ]
+                }).encode("utf-8")
+
+        def fake_tokens(text):
+            reading = "ナニ" if "なの" in text else "ナン"
+            return ([{"surface": "何", "lemma": "何", "reading": reading}], None, "fixture")
+
+        with patch.object(jp.urllib.request, "urlopen", return_value=FakeResponse()), \
+             patch.object(jp, "token_data", side_effect=fake_tokens):
+            hint = jp.tatoeba_listening_hint("何", "なん")
+
+        self.assertIsNotNone(hint)
+        self.assertEqual(hint["sentence_id"], 2)
+        self.assertEqual(hint["display_text"], "＿＿ですか?")
+
+    def test_open_pitch_dictionary_supplies_verified_pitch_for_custom_reading(self):
         tokens = [{"reading": "ジュウサン", "pronunciation": "ジュウサン"}]
         with tempfile.TemporaryDirectory() as directory:
             accents = os.path.join(directory, "accents.txt")

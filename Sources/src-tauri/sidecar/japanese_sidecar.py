@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import copy
 import hashlib
+import html
 import shutil
 import io
 import os
@@ -394,6 +395,386 @@ def token_data(text: str) -> tuple[list[dict[str, Any]], list[int] | None, str |
     if len(raw_tokens) == 1:
         accent = parse_accent_types(tokens[0].get("accent_type"))
     return tokens, accent, _FUGASHI_VERSION
+
+
+def _masked_context(term: str, expected_reading: str, text: str) -> str | None:
+    tokens, _, _ = token_data(text)
+    matched_surface = None
+    for token in tokens:
+        surface = str(token.get("surface") or "")
+        lemma = str(token.get("lemma") or "")
+        token_reading = hira(str(token.get("reading") or token.get("pronunciation") or ""))
+        if surface == term or lemma == term:
+            if expected_reading and token_reading and token_reading != expected_reading:
+                continue
+            matched_surface = surface
+            break
+    if not matched_surface:
+        for start in range(len(tokens)):
+            surface_parts: list[str] = []
+            reading_parts: list[str] = []
+            for token in tokens[start:]:
+                surface = str(token.get("surface") or "")
+                if not surface:
+                    break
+                surface_parts.append(surface)
+                combined_surface = "".join(surface_parts)
+                if not term.startswith(combined_surface):
+                    break
+                token_reading = hira(str(token.get("reading") or token.get("pronunciation") or ""))
+                if token_reading and token_reading != "*":
+                    reading_parts.append(token_reading)
+                if combined_surface == term:
+                    combined_reading = "".join(reading_parts)
+                    if expected_reading and combined_reading and combined_reading != expected_reading:
+                        break
+                    matched_surface = combined_surface
+                    break
+            if matched_surface:
+                break
+    if not matched_surface:
+        return None
+    display_text = text.replace(matched_surface, "＿＿", 1)
+    if term in display_text:
+        return None
+    return display_text
+
+
+def mediawiki_listening_hint(
+    term: str,
+    reading: str,
+    endpoint: str,
+    provider: str,
+    license_text: str,
+) -> dict[str, Any] | None:
+    query = urllib.parse.urlencode({
+        "action": "query",
+        "format": "json",
+        "list": "search",
+        "srsearch": f'"{term}"',
+        "srwhat": "text",
+        "srlimit": "20",
+        "srprop": "snippet",
+    })
+    request = urllib.request.Request(
+        endpoint + "?" + query,
+        headers={"User-Agent": "TANREN/1.2.0 (listening homophone hint)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+    candidates = []
+    search_results = (payload.get("query") or {}).get("search") or []
+
+    def add_candidate(text: str, title: str, page_id: int) -> None:
+        text = unicodedata.normalize("NFKC", re.sub(r"\s+", " ", text).strip(" …"))
+        if not text or term not in text:
+            return
+        try:
+            display_text = _masked_context(term, reading, text)
+        except Exception:
+            return
+        if not display_text:
+            return
+        candidates.append({
+            "sentence_id": page_id,
+            "sentence_text": text,
+            "display_text": display_text,
+            "owner": title,
+            "license": license_text,
+            "provider": provider,
+            "attribution": f"{provider} · {title} · {license_text}",
+        })
+
+    for result in search_results:
+        raw = html.unescape(re.sub(r"<[^>]+>", "", str(result.get("snippet") or "")))
+        add_candidate(
+            raw,
+            str(result.get("title") or provider),
+            int(result.get("pageid") or 0),
+        )
+
+    page_ids = [str(result.get("pageid")) for result in search_results if result.get("pageid")]
+    if page_ids:
+        detail_query = urllib.parse.urlencode({
+            "action": "query",
+            "format": "json",
+            "prop": "extracts",
+            "explaintext": "1",
+            "pageids": "|".join(page_ids),
+        })
+        detail_request = urllib.request.Request(
+            endpoint + "?" + detail_query,
+            headers={"User-Agent": "TANREN/1.2.0 (listening homophone hint)"},
+        )
+        try:
+            with urllib.request.urlopen(detail_request, timeout=12) as response:
+                detail_payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            detail_payload = {}
+        pages = ((detail_payload.get("query") or {}).get("pages") or {})
+        for page in pages.values():
+            title = str(page.get("title") or provider)
+            page_id = int(page.get("pageid") or 0)
+            extract = str(page.get("extract") or "")
+            for fragment in re.split(r"(?<=[。！？!?])|[\r\n]+", extract):
+                if term in fragment:
+                    add_candidate(fragment, title, page_id)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (len(item["sentence_text"]), item["sentence_id"]))
+
+
+def aozora_listening_hint(term: str, reading: str) -> dict[str, Any] | None:
+    query = urllib.parse.urlencode({"word": term})
+    request = urllib.request.Request(
+        "https://myokoym.net/aozorasearch/search?" + query,
+        headers={"User-Agent": "TANREN/1.2.0 (listening homophone hint)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            page = response.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, UnicodeDecodeError):
+        return None
+
+    candidates = []
+    result_pattern = re.compile(
+        r"<li>\s*<h4>\s*<a href=[\"'](?P<card>https://www\.aozora\.gr\.jp/cards/[^\"']+)[\"']>"
+        r"(?P<title>.*?)</a>\s*</h4>.*?<p class=[\"']author[\"']>\s*(?P<author>.*?)\s*</p>"
+        r".*?</h5>\s*<p>\s*(?P<snippet>.*?)\s*</p>",
+        re.DOTALL,
+    )
+    for match in result_pattern.finditer(page):
+        title = html.unescape(re.sub(r"<[^>]+>", "", match.group("title"))).strip()
+        author = html.unescape(re.sub(r"<[^>]+>", "", match.group("author"))).strip()
+        card_url = html.unescape(match.group("card")).strip()
+        snippet = html.unescape(re.sub(r"<[^>]+>", "", match.group("snippet")))
+        for fragment in re.split(r"\s*/\s*", snippet):
+            text = unicodedata.normalize(
+                "NFKC",
+                re.sub(r"\s+", " ", fragment).strip(" .…\r\n\t"),
+            )
+            if not text or term not in text:
+                continue
+            try:
+                display_text = _masked_context(term, reading, text)
+            except Exception:
+                continue
+            if not display_text:
+                continue
+            card_match = re.search(r"card(\d+)\.html", card_url)
+            candidates.append({
+                "sentence_id": int(card_match.group(1)) if card_match else 0,
+                "sentence_text": text,
+                "display_text": display_text,
+                "owner": author or title or "Aozora Bunko",
+                "license": "see Aozora Bunko work rights",
+                "provider": "Aozora Bunko",
+                "attribution": f"青空文庫 · {title} · {author}".strip(" ·"),
+            })
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (len(item["sentence_text"]), item["sentence_id"]))
+
+
+def jreibun_listening_hint(term: str, reading: str) -> dict[str, Any] | None:
+    request = urllib.request.Request(
+        "https://jisho.org/search/" + urllib.parse.quote(term + " #sentences"),
+        headers={"User-Agent": "Mozilla/5.0 TANREN/1.2.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            page = response.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, UnicodeDecodeError):
+        return None
+
+    candidates = []
+    for block in page.split('<li class="entry sentence clearfix">')[1:]:
+        if "inline_copyright jreibun" not in block:
+            continue
+        sentence_match = re.search(
+            r'<ul class="japanese_sentence[^"]*"[^>]*>(.*?)</ul>',
+            block,
+            re.DOTALL,
+        )
+        if not sentence_match:
+            continue
+        sentence_html = re.sub(
+            r'<span class="furigana">.*?</span>',
+            "",
+            sentence_match.group(1),
+            flags=re.DOTALL,
+        )
+        text = html.unescape(re.sub(r"<[^>]+>", "", sentence_html))
+        text = unicodedata.normalize("NFKC", re.sub(r"\s+", "", text).strip())
+        if not text or term not in text:
+            continue
+        try:
+            display_text = _masked_context(term, reading, text)
+        except Exception:
+            continue
+        if not display_text:
+            continue
+        detail_match = re.search(r"/sentences/([0-9a-f]+)", block)
+        debug_match = re.search(r'<div class="debug">jreibun/(\d+)/(\d+)</div>', block)
+        sentence_id = 0
+        if debug_match:
+            sentence_id = int(debug_match.group(1)) * 1000 + int(debug_match.group(2))
+        candidates.append({
+            "sentence_id": sentence_id,
+            "sentence_text": text,
+            "display_text": display_text,
+            "owner": "Jreibun",
+            "license": "see Jreibun source",
+            "provider": "Jreibun",
+            "attribution": "Jreibun (TUFS) · via Jisho.org"
+                + (f" · {detail_match.group(1)}" if detail_match else ""),
+        })
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (len(item["sentence_text"]), item["sentence_id"]))
+
+
+def jisho_dictionary_hint(term: str, reading: str) -> dict[str, Any] | None:
+    query = urllib.parse.urlencode({"keyword": term})
+    request = urllib.request.Request(
+        "https://jisho.org/api/v1/search/words?" + query,
+        headers={"User-Agent": "TANREN/1.2.0 (listening homophone hint)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+    for result in payload.get("data") or []:
+        matched = False
+        for form in result.get("japanese") or []:
+            word = unicodedata.normalize("NFKC", str(form.get("word") or form.get("reading") or "").strip())
+            form_reading = hira(unicodedata.normalize("NFKC", str(form.get("reading") or "").strip()))
+            if word == term and (not reading or not form_reading or form_reading == reading):
+                matched = True
+                break
+        if not matched:
+            continue
+        for sense in result.get("senses") or []:
+            definitions = [str(value).strip() for value in (sense.get("english_definitions") or []) if str(value).strip()]
+            if not definitions:
+                continue
+            pos = [str(value).strip() for value in (sense.get("parts_of_speech") or []) if str(value).strip()]
+            definition = "; ".join(definitions[:3])
+            label = " · ".join(pos[:2])
+            display_text = f"JMdict · {label} · {definition}" if label else f"JMdict · {definition}"
+            digest = hashlib.sha256((term + "\0" + reading).encode("utf-8")).hexdigest()
+            return {
+                "sentence_id": int(digest[:15], 16),
+                "sentence_text": definition,
+                "display_text": display_text,
+                "owner": "EDRDG",
+                "license": "EDRDG licence",
+                "provider": "JMdict",
+                "attribution": "JMdict / EDRDG · via Jisho.org",
+            }
+    return None
+
+
+def rakuten_recipe_hint(term: str) -> dict[str, Any] | None:
+    request = urllib.request.Request(
+        "https://recipe.rakuten.co.jp/search/" + urllib.parse.quote(term) + "/",
+        headers={"User-Agent": "Mozilla/5.0 TANREN/1.2.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            page = response.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, UnicodeDecodeError):
+        return None
+
+    match = re.search(r"<title>(.*?)</title>", page, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return None
+    title = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
+    if term not in title:
+        return None
+    digest = hashlib.sha256(("rakuten-recipe\0" + term).encode("utf-8")).hexdigest()
+    return {
+        "sentence_id": int(digest[:15], 16),
+        "sentence_text": title,
+        "display_text": title.replace(term, "＿＿", 1),
+        "owner": "Rakuten Recipe",
+        "license": "see source page",
+        "provider": "Rakuten Recipe",
+        "attribution": "楽天レシピ検索",
+    }
+
+
+def tatoeba_listening_hint(term: str, reading: str | None = None) -> dict[str, Any] | None:
+    term = unicodedata.normalize("NFKC", term.strip())
+    expected_reading = hira(unicodedata.normalize("NFKC", str(reading or "").strip()))
+    if not term:
+        return None
+    query = urllib.parse.urlencode({
+        "lang": "jpn",
+        "q": term,
+        "sort": "words",
+        "is_unapproved": "no",
+    })
+    request = urllib.request.Request(
+        "https://api.tatoeba.org/v1/sentences?" + query,
+        headers={"User-Agent": "TANREN/1.2.0 (listening homophone hint)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        payload = {"data": []}
+
+    candidates: list[dict[str, Any]] = []
+    for sentence in payload.get("data") or []:
+        text = unicodedata.normalize("NFKC", str(sentence.get("text") or "").strip())
+        owner = sentence.get("owner")
+        if not text or not owner:
+            continue
+        display_text = _masked_context(term, expected_reading, text)
+        if not display_text:
+            continue
+        candidates.append({
+            "sentence_id": int(sentence["id"]),
+            "sentence_text": text,
+            "display_text": display_text,
+            "owner": str(owner),
+            "license": str(sentence.get("license") or "CC BY 2.0 FR"),
+            "provider": "Tatoeba",
+            "attribution": f"Tatoeba #{int(sentence['id'])} · {owner} · {str(sentence.get('license') or 'CC BY 2.0 FR')}",
+        })
+    if candidates:
+        return min(candidates, key=lambda item: (len(item["sentence_text"]), item["sentence_id"]))
+
+    for endpoint, provider, license_text in (
+        ("https://ja.wikipedia.org/w/api.php", "Japanese Wikipedia", "CC BY-SA 4.0"),
+        ("https://ja.wiktionary.org/w/api.php", "Japanese Wiktionary", "CC BY-SA 4.0"),
+        ("https://ja.wikisource.org/w/api.php", "Japanese Wikisource", "see source page"),
+        ("https://ja.wikibooks.org/w/api.php", "Japanese Wikibooks", "see source page"),
+        ("https://ja.wikinews.org/w/api.php", "Japanese Wikinews", "see source page"),
+    ):
+        hint = mediawiki_listening_hint(term, expected_reading, endpoint, provider, license_text)
+        if hint:
+            return hint
+
+    hint = jreibun_listening_hint(term, expected_reading)
+    if hint:
+        return hint
+
+    hint = aozora_listening_hint(term, expected_reading)
+    if hint:
+        return hint
+
+    hint = jisho_dictionary_hint(term, expected_reading)
+    if hint:
+        return hint
+
+    return rakuten_recipe_hint(term)
 
 
 def reading_from_openjtalk(text: str) -> tuple[str | None, str | None]:
@@ -1247,6 +1628,11 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
         voicevox_url = req.get("voicevox_url")
         warmed_profiles = warm_voicevox_profiles(str(voicevox_url)) if voicevox_url else 0
         return {"warm": True, "voicevox_profiles": warmed_profiles}
+    if req.get("op") == "listening_hint":
+        return {"hint": tatoeba_listening_hint(
+            str(req.get("term") or ""),
+            str(req.get("reading") or "") or None,
+        )}
     return analyze_request(req)
 
 

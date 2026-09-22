@@ -1128,6 +1128,10 @@ export function BookStudy({
                   ? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6v12M16 6v12" /></svg>
                   : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 10 7-10 7Z" /></svg>}
               </div>
+              {listeningPhase === "form" && card.listening_hint && <div className="learning-listening-hint">
+                <strong lang={deck.target_language}>{card.listening_hint}</strong>
+                {card.listening_hint_attribution && <small>{card.listening_hint_attribution}</small>}
+              </div>}
             </div> : <h1 lang={card?.mode === "writing" ? deck.source_language : deck.target_language}>{card?.question}</h1>}
           </div>
 

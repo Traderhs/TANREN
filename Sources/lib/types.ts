@@ -60,6 +60,8 @@ export interface StudyCard {
   total: number;
   range_label: string;
   audio_path?: string | null;
+  listening_hint?: string | null;
+  listening_hint_attribution?: string | null;
   recall_timeout_ms: number;
   completion_idle_ms?: number | null;
   completion_timeout_ms?: number | null;

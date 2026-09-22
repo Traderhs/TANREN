@@ -41,6 +41,19 @@ pub struct JapaneseEnrichment {
     pub audio_assets: Vec<AudioAssetDraft>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListeningHint {
+    pub sentence_id: i64,
+    pub sentence_text: String,
+    pub display_text: String,
+    pub owner: String,
+    pub license: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub attribution: Option<String>,
+}
+
 impl JapaneseEnrichment {
     pub fn analysis_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -320,6 +333,19 @@ impl JapaneseAnalyzer {
         } else {
             Err("VOICEVOX warm-up did not initialize any TANREN voice profiles".into())
         }
+    }
+
+    pub fn listening_hint(&self, term: &str, reading: Option<&str>) -> Result<Option<ListeningHint>, String> {
+        let response = self.request_sidecar(&serde_json::json!({
+            "op": "listening_hint",
+            "term": term,
+            "reading": reading,
+        }))?;
+        let Some(value) = response.get("hint") else { return Ok(None); };
+        if value.is_null() { return Ok(None); }
+        serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| format!("invalid listening hint payload: {error}"))
     }
 
     pub fn analyze(&self, entry: &EntryRecord) -> Result<(JapaneseEnrichment, Vec<AudioAssetDraft>), String> {
