@@ -33,7 +33,7 @@ function formatTimerSeconds(ms: number) {
 function cleanListeningHint(hint: string) {
   return hint
     .replace(/^JMdict\s*·\s*/, "")
-    .replace(/\s*[|｜]\s*楽天レシピ.*$/, "")
+    .replace(/\s*(?:[|｜]|[-–—]\s*[^|｜]*)?楽天レシピ.*$/, "")
     .trim();
 }
 

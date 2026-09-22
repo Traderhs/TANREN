@@ -694,7 +694,7 @@ def rakuten_recipe_hint(term: str) -> dict[str, Any] | None:
     title = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
     if term not in title:
         return None
-    title = re.sub(r"\s*[|｜]\s*楽天レシピ.*$", "", title).strip()
+    title = re.sub(r"\s*(?:[|｜]|[-–—]\s*[^|｜]*)?楽天レシピ.*$", "", title).strip()
     digest = hashlib.sha256(("rakuten-recipe\0" + term).encode("utf-8")).hexdigest()
     return {
         "sentence_id": int(digest[:15], 16),
