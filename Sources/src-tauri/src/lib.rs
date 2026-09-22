@@ -22,7 +22,7 @@ use std::process::Command;
 
 use db::Database;
 use grading::{grade_form_with_reading, normalize_generic, split_reading_answer};
-use japanese::{JapaneseAnalyzer, VOICE_AUDIO_REVISION};
+use japanese::{JapaneseAnalyzer, PITCH_DATA_REVISION, VOICE_AUDIO_REVISION};
 use model::{
     AdjudicationPrompt, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
     ListeningFeedback, MeaningGrade, PitchQuestion, StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
@@ -749,7 +749,7 @@ fn finish_pitch(db: &Database, active_session: &mut StudySession, variant_id: &s
     let mut result = review_result(
         &entry,
         failed_gate.then_some(FailureType::PitchWrong.as_str()),
-        if correct { "피치도 맞았어요" } else if question.gate_enabled { "피치가 달라요 이 문제는 다시 나와요" } else { "참고 피치와 달라요 정답 처리는 그대로예요" },
+        if correct { "피치도 맞았어요" } else { "피치가 달라요 이 문제는 다시 나와요" },
     );
     result.meaning_grades = meaning_grades;
     session.pending = Some(PendingState::Review { variant, result: result.clone() });
@@ -1785,6 +1785,7 @@ pub fn run() {
             let db = Database::open(app_data.join("tanren.db"))?;
             db.requeue_failed_enrichment()?;
             db.requeue_incomplete_japanese_enrichment()?;
+            db.requeue_pitch_data_revision(PITCH_DATA_REVISION)?;
             db.requeue_voice_audio_revision(VOICE_AUDIO_REVISION)?;
             let default_semantic_home = default_runtime_home()?;
             let semantic_home = configured_semantic_home(&db, &default_semantic_home)?;
@@ -2066,7 +2067,7 @@ mod state_tests {
     }
 
     #[test]
-    fn predicted_reference_only_pitch_cannot_fail_the_base_answer() {
+    fn any_presented_pitch_question_is_part_of_joint_correctness() {
         let question = model::PitchQuestion {
             kind: "lexical".into(),
             reading: "よそく".into(),
@@ -2074,8 +2075,8 @@ mod state_tests {
             phrase_count: 1,
             allowed_patterns: vec![vec![0, 1, 0]],
             confidence: model::PitchConfidence::Predicted,
-            gate_enabled: false,
+            gate_enabled: true,
         };
-        assert_eq!(grade_pitch_contour(&question, &[1, 0, 0]), (false, false));
+        assert_eq!(grade_pitch_contour(&question, &[1, 0, 0]), (false, true));
     }
 }

@@ -89,18 +89,22 @@ class MoraFixtures(unittest.TestCase):
 class ScopeAndCacheFixtures(unittest.TestCase):
     def test_voicevox_supplies_predicted_pitch_for_custom_reading(self):
         tokens = [{"reading": "ジュウサン", "pronunciation": "ジュウサン"}]
-        with patch.object(jp, "token_data", return_value=(tokens, [1], "unidic-test")), \
-             patch.object(jp, "voicevox_native_accent_type", return_value=(2, "test-version")):
-            result = jp.analyze_request({
-                "text": "十三",
-                "reading_hint": "じゅーさん",
-                "voicevox_url": "http://voicevox",
-            })
+        with tempfile.TemporaryDirectory() as directory:
+            accents = os.path.join(directory, "accents.txt")
+            with open(accents, "w", encoding="utf-8") as handle:
+                handle.write("十三\tじゅーさん\t2\n")
+            with patch.object(jp, "token_data", return_value=(tokens, [1], "unidic-test")):
+                result = jp.analyze_request({
+                    "text": "十三",
+                    "reading_hint": "じゅーさん",
+                    "kanjium_path": accents,
+                })
         self.assertEqual(result["morae"], ["じゅ", "ー", "さ", "ん"])
         self.assertEqual(result["accent_types"], [2])
         self.assertEqual(result["pitch_patterns"], [[0, 1, 0, 0]])
-        self.assertEqual(result["provider"], "voicevox-test-version")
-        self.assertEqual(result["confidence"], "PREDICTED")
+        self.assertEqual(result["provider"], "open-pitch-dictionary")
+        self.assertEqual(result["source"], "Kanjium pitch accent database")
+        self.assertEqual(result["confidence"], "VERIFIED")
 
     def test_voicevox_native_accent_requires_one_matching_phrase(self):
         with patch.object(jp, "voicevox_metadata", return_value=([{"speaker_id": 7}], "test-version")), \
@@ -150,18 +154,22 @@ class ScopeAndCacheFixtures(unittest.TestCase):
             "conjugation": "*",
             "accent_type": "0",
         }]
-        with patch.object(jp, "token_data", return_value=(tokens, [0], "test-unidic")), \
-             patch.object(jp, "voicevox_native_accent_type", return_value=(1, "test-version")):
-            result = jp.analyze_request({
-                "text": "水",
-                "reading_hint": "セックス",
-                "voicevox_url": "http://voicevox",
-            })
+        with tempfile.TemporaryDirectory() as directory:
+            accents = os.path.join(directory, "accents.txt")
+            with open(accents, "w", encoding="utf-8") as handle:
+                handle.write("水\tせっくす\t1\n")
+            with patch.object(jp, "token_data", return_value=(tokens, [0], "test-unidic")):
+                result = jp.analyze_request({
+                    "text": "水",
+                    "reading_hint": "セックス",
+                    "kanjium_path": accents,
+                })
         self.assertEqual(result["reading"], "せっくす")
         self.assertEqual(result["morae"], ["せ", "っ", "く", "す"])
         self.assertEqual(result["accent_types"], [1])
         self.assertEqual(result["pitch_patterns"], [[1, 0, 0, 0]])
-        self.assertEqual(result["provider"], "voicevox-test-version")
+        self.assertEqual(result["provider"], "open-pitch-dictionary")
+        self.assertEqual(result["confidence"], "VERIFIED")
 
     def test_kana_lexeme_isu_resolves_unidic_lemma_and_confirmed_pitch(self):
         tokens, accent_types, _ = jp.token_data("いす")
@@ -274,7 +282,7 @@ class ScopeAndCacheFixtures(unittest.TestCase):
         self.assertEqual(jp.scope_for("東京 大学", 2), "phrase")
         self.assertEqual(jp.scope_for("東京大学へ行く。", 4), "sentence")
 
-    def test_phrase_and_sentence_generate_pitch_and_tts(self):
+    def test_phrase_and_sentence_fall_back_to_voicevox_predicted_pitch(self):
         fixtures = [
             ("お水", "おみず", 2, "phrase", [0, 1, 1]),
             ("水を飲む。", "みずをのむ", 4, "sentence", [0, 1, 0, 1, 0]),
@@ -297,6 +305,7 @@ class ScopeAndCacheFixtures(unittest.TestCase):
                 self.assertIsNone(result["accent_types"])
                 self.assertEqual(result["provider"], "voicevox-test-version")
                 self.assertEqual(result["source"], "VOICEVOX accent phrases")
+                self.assertEqual(result["confidence"], "PREDICTED")
                 self.assertTrue(result["audio_written"])
                 self.assertEqual(result["audio_assets"], audio)
                 generate.assert_called_once_with(
@@ -378,7 +387,7 @@ class ScopeAndCacheFixtures(unittest.TestCase):
         self.assertEqual(contour[4], contour[3])
         self.assertEqual(version, "test-version")
 
-    def test_lexical_pitch_falls_back_to_voicevox_contour_when_accent_alignment_fails(self):
+    def test_lexical_pitch_falls_back_to_voicevox_prediction_after_dictionaries(self):
         tokens = [{"reading": "メンバー", "pronunciation": "メンバー"}]
         contour = [0, 1, 1, 1]
         with patch.object(jp, "token_data", return_value=(tokens, None, "unidic-test")), \

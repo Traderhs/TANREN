@@ -25,6 +25,12 @@ SMALL = set("ゃゅょぁぃぅぇぉゎャュョァィゥェォヮ")
 VOICE_AUDIO_REVISION = "v8"
 POST_PHONEME_LENGTH = 0.42
 TAIL_SILENCE_SECONDS = 0.22
+_KANJIUM_ACCENTS: dict[tuple[str, str], list[int]] | None = None
+_WIKTIONARY_ACCENTS: dict[tuple[str, str], list[int]] | None = None
+_KANJIUM_BY_READING: dict[str, set[tuple[int, ...]]] | None = None
+_WIKTIONARY_BY_READING: dict[str, set[tuple[int, ...]]] | None = None
+_KANJIUM_ACCENTS_PATH: str | None = None
+_WIKTIONARY_ACCENTS_PATH: str | None = None
 VOICE_PROFILES = [
     {
         "voice_profile": "child_feminine",
@@ -401,6 +407,100 @@ def reading_from_openjtalk(text: str) -> tuple[str | None, str | None]:
         return hira(pyopenjtalk.g2p(text, kana=True)), getattr(pyopenjtalk, "__version__", None)
     except Exception:
         return None, None
+
+
+def load_kanjium_accents(path: str | None) -> dict[tuple[str, str], list[int]]:
+    global _KANJIUM_ACCENTS, _KANJIUM_BY_READING, _KANJIUM_ACCENTS_PATH
+    normalized_path = os.path.abspath(path) if path else None
+    if _KANJIUM_ACCENTS is not None and _KANJIUM_ACCENTS_PATH == normalized_path:
+        return _KANJIUM_ACCENTS
+    values: dict[tuple[str, str], list[int]] = {}
+    by_reading: dict[str, set[tuple[int, ...]]] = {}
+    if path:
+        with open(path, "r", encoding="utf-8") as source:
+            for raw_line in source:
+                line = raw_line.rstrip("\r\n")
+                if not line:
+                    continue
+                fields = line.split("\t")
+                if len(fields) != 3:
+                    continue
+                word = unicodedata.normalize("NFKC", fields[0].strip())
+                reading = hira(unicodedata.normalize("NFKC", fields[1].strip()))
+                try:
+                    positions = [int(value) for value in fields[2].split(",") if value.strip() != ""]
+                except ValueError:
+                    continue
+                if word and reading and positions:
+                    values[(word, reading)] = positions
+                    by_reading.setdefault(reading, set()).add(tuple(positions))
+    _KANJIUM_ACCENTS = values
+    _KANJIUM_BY_READING = by_reading
+    _KANJIUM_ACCENTS_PATH = normalized_path
+    return values
+
+
+def load_wiktionary_accents(path: str | None) -> dict[tuple[str, str], list[int]]:
+    global _WIKTIONARY_ACCENTS, _WIKTIONARY_BY_READING, _WIKTIONARY_ACCENTS_PATH
+    normalized_path = os.path.abspath(path) if path else None
+    if _WIKTIONARY_ACCENTS is not None and _WIKTIONARY_ACCENTS_PATH == normalized_path:
+        return _WIKTIONARY_ACCENTS
+    values: dict[tuple[str, str], list[int]] = {}
+    by_reading: dict[str, set[tuple[int, ...]]] = {}
+    if path:
+        with open(path, "r", encoding="utf-8") as source:
+            payload = json.load(source)
+        for entry in payload.get("entries") or []:
+            word = unicodedata.normalize("NFKC", str(entry.get("word") or "").strip())
+            reading = hira(unicodedata.normalize("NFKC", str(entry.get("reading") or "").strip()))
+            raw_positions = entry.get("pitch_positions")
+            if not word or not reading or not isinstance(raw_positions, list):
+                continue
+            try:
+                positions = [int(value) for value in raw_positions]
+            except (TypeError, ValueError):
+                continue
+            if positions:
+                values[(word, reading)] = positions
+                by_reading.setdefault(reading, set()).add(tuple(positions))
+    _WIKTIONARY_ACCENTS = values
+    _WIKTIONARY_BY_READING = by_reading
+    _WIKTIONARY_ACCENTS_PATH = normalized_path
+    return values
+
+
+def open_pitch_accent(
+    text: str,
+    reading: str,
+    mora_count: int,
+    kanjium_path: str | None,
+    wiktionary_path: str | None,
+) -> tuple[list[int] | None, str | None]:
+    key = (
+        unicodedata.normalize("NFKC", text.strip()),
+        hira(unicodedata.normalize("NFKC", reading.strip())),
+    )
+    for source, values in (
+        ("Kanjium pitch accent database", load_kanjium_accents(kanjium_path)),
+        ("Japanese Wiktionary pitch accent", load_wiktionary_accents(wiktionary_path)),
+    ):
+        accent_types = values.get(key)
+        if not accent_types:
+            continue
+        valid = [value for value in accent_types if 0 <= value <= mora_count]
+        if valid:
+            return valid, source
+    reading_candidates: set[tuple[int, ...]] = set()
+    if _KANJIUM_BY_READING is not None:
+        reading_candidates.update(_KANJIUM_BY_READING.get(key[1], set()))
+    if _WIKTIONARY_BY_READING is not None:
+        reading_candidates.update(_WIKTIONARY_BY_READING.get(key[1], set()))
+    if len(reading_candidates) == 1:
+        candidate = next(iter(reading_candidates))
+        valid = [value for value in candidate if 0 <= value <= mora_count]
+        if len(valid) == len(candidate):
+            return valid, "Open pitch dictionaries (unique reading match)"
+    return None, None
 
 
 def voicevox_request(base_url: str, path: str, params: dict[str, Any] | None = None, body: Any = None, binary: bool = False):
@@ -1051,9 +1151,18 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
     patterns = accent_contours(len(mora_list), accent_types)
     audio_dir = req.get("audio_dir")
     voicevox_url = req.get("voicevox_url")
+    open_pitch_source = None
     voicevox_fallback_version = None
-    used_voicevox_pitch_fallback = False
     voicevox_pitch_source = None
+    if not patterns and reading:
+        accent_types, open_pitch_source = open_pitch_accent(
+            text,
+            reading,
+            len(mora_list),
+            req.get("kanjium_path"),
+            req.get("wiktionary_pitch_path"),
+        )
+        patterns = accent_contours(len(mora_list), accent_types)
     if not patterns and voicevox_url and scope == "lexical" and reading:
         native_accent, voicevox_fallback_version = voicevox_native_accent_type(
             str(voicevox_url),
@@ -1063,8 +1172,8 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
         if native_accent is not None:
             accent_types = [native_accent]
             patterns = accent_contours(len(mora_list), accent_types)
-            used_voicevox_pitch_fallback = patterns is not None
-            voicevox_pitch_source = "VOICEVOX lexical accent phrase"
+            if patterns:
+                voicevox_pitch_source = "VOICEVOX lexical accent phrase"
     if not patterns and voicevox_url and reading:
         native_contour, voicevox_fallback_version = voicevox_pitch_contour(
             str(voicevox_url),
@@ -1073,12 +1182,16 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
         )
         if native_contour is not None:
             patterns = [native_contour]
-            used_voicevox_pitch_fallback = True
             voicevox_pitch_source = "VOICEVOX accent phrases"
     if patterns:
-        if used_voicevox_pitch_fallback:
+        if open_pitch_source:
+            provider = "open-pitch-dictionary"
+            source = open_pitch_source
+            confidence = "VERIFIED"
+            model_version = None
+        elif voicevox_pitch_source:
             provider = f"voicevox-{voicevox_fallback_version or 'unknown'}"
-            source = voicevox_pitch_source or "VOICEVOX accent phrases"
+            source = voicevox_pitch_source
             confidence = "PREDICTED"
             model_version = voicevox_fallback_version
         else:
@@ -1089,12 +1202,12 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
     elif reading:
         provider = "pyopenjtalk" if openjtalk_version else "builtin-kana"
         source = "OpenJTalk analysis" if openjtalk_version else "surface kana"
-        confidence = "PREDICTED"
+        confidence = "UNAVAILABLE"
         model_version = openjtalk_version
     else:
         provider = "none"
         source = "unavailable"
-        confidence = "PREDICTED"
+        confidence = "UNAVAILABLE"
         model_version = None
 
     audio_assets: list[dict[str, Any]] = []
@@ -1158,6 +1271,10 @@ def main() -> None:
         try:
             req = json.loads(text.lstrip("\ufeff"))
             write_json_line(handle_request(req))
+        except json.JSONDecodeError:
+            # Invalid transport input is a protocol failure, not an
+            # enrichment failure.  Do not emit application JSON for it.
+            raise
         except Exception as error:
             # Application-level failures must not tear down the warm worker.
             # The caller receives the error for this entry and can retry/fail

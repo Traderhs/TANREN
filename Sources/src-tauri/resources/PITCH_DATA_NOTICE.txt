@@ -1,0 +1,15 @@
+TANREN pitch accent data
+
+Kanjium pitch accent database
+- Project: https://github.com/mifunetoshiro/kanjium
+- Pitch accent additions/modifications: Uros O.
+- License: CC BY-SA 4.0
+- Bundled accents.txt SHA-256: 8BD0DD127DAB32CEEC94CB03AB1BA6B68858EA73421DFA1731AF2F373DEB4F20
+
+Japanese Wiktionary supplementary pitch accent data
+- Source: Japanese Wiktionary via kaikki.org/wiktextract
+- Packaged by japanese-language-data
+- License: CC BY-SA 4.0
+- Bundled JSON SHA-256: 4CEC453A8447D9AA1B50E5D8A84EE907AF0E2DC99808C286D41E654059AE97CD
+
+TANREN uses these datasets as read-only pronunciation reference data.

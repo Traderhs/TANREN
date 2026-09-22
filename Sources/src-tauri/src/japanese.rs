@@ -17,7 +17,11 @@ use crate::{
 };
 
 const SIDECAR_SOURCE: &str = include_str!("../sidecar/japanese_sidecar.py");
+const KANJIUM_ACCENTS: &[u8] = include_bytes!("../resources/kanjium_accents.txt");
+const WIKTIONARY_PITCH_ACCENT: &[u8] = include_bytes!("../resources/wiktionary_pitch_accent.json");
+const PITCH_DATA_NOTICE: &[u8] = include_bytes!("../resources/PITCH_DATA_NOTICE.txt");
 pub const VOICE_AUDIO_REVISION: &str = "v8";
+pub const PITCH_DATA_REVISION: &str = "kanjium-8bd0dd12+wiktionary-4cec453a-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JapaneseEnrichment {
@@ -55,6 +59,8 @@ impl JapaneseEnrichment {
 pub struct JapaneseAnalyzer {
     app: AppHandle,
     script_path: PathBuf,
+    kanjium_path: PathBuf,
+    wiktionary_pitch_path: PathBuf,
     audio_dir: PathBuf,
     voicevox: Arc<VoicevoxRuntime>,
     sidecar: Arc<Mutex<LanguageSidecar>>,
@@ -228,9 +234,23 @@ impl JapaneseAnalyzer {
         if fs::read_to_string(&script_path).ok().as_deref() != Some(SIDECAR_SOURCE) {
             fs::write(&script_path, SIDECAR_SOURCE).map_err(|e| e.to_string())?;
         }
+        let kanjium_path = runtime_dir.join("kanjium_accents.txt");
+        if fs::read(&kanjium_path).ok().as_deref() != Some(KANJIUM_ACCENTS) {
+            fs::write(&kanjium_path, KANJIUM_ACCENTS).map_err(|e| e.to_string())?;
+        }
+        let wiktionary_pitch_path = runtime_dir.join("wiktionary_pitch_accent.json");
+        if fs::read(&wiktionary_pitch_path).ok().as_deref() != Some(WIKTIONARY_PITCH_ACCENT) {
+            fs::write(&wiktionary_pitch_path, WIKTIONARY_PITCH_ACCENT).map_err(|e| e.to_string())?;
+        }
+        let pitch_notice_path = runtime_dir.join("PITCH_DATA_NOTICE.txt");
+        if fs::read(&pitch_notice_path).ok().as_deref() != Some(PITCH_DATA_NOTICE) {
+            fs::write(&pitch_notice_path, PITCH_DATA_NOTICE).map_err(|e| e.to_string())?;
+        }
         Ok(Self {
             app,
             script_path,
+            kanjium_path,
+            wiktionary_pitch_path,
             audio_dir,
             voicevox,
             sidecar: Arc::new(Mutex::new(LanguageSidecar::new())),
@@ -310,6 +330,8 @@ impl JapaneseAnalyzer {
             "reading_hint": entry.reading,
             "audio_dir": audio_dir,
             "voicevox_url": voicevox_url,
+            "kanjium_path": self.kanjium_path,
+            "wiktionary_pitch_path": self.wiktionary_pitch_path,
         });
 
         let response = self.request_sidecar(&request)?;
@@ -317,9 +339,6 @@ impl JapaneseAnalyzer {
             .map_err(|error| format!("invalid language enrichment payload: {error}"))?;
         let audio: Vec<AudioAssetDraft> = enrichment.audio_assets.iter().filter(|asset| Path::new(&asset.path).exists()).cloned().collect();
         if matches!(enrichment.scope.as_str(), "lexical" | "phrase" | "sentence") {
-            if enrichment.pitch_patterns.as_ref().is_none_or(|patterns| patterns.is_empty()) {
-                return Err(format!("Japanese enrichment completed without generated pitch: {}", entry.term));
-            }
             if audio.is_empty() {
                 return Err(format!("Japanese enrichment completed without generated audio: {}", entry.term));
             }

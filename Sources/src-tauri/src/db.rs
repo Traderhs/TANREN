@@ -1343,7 +1343,7 @@ impl Database {
         tx.commit().map_err(|e| e.to_string())
     }
 
-    pub fn pitch_question(&self, entry_id:&str, predicted_gate:bool) -> Result<Option<PitchQuestion>,String> {
+    pub fn pitch_question(&self, entry_id:&str, _predicted_gate:bool) -> Result<Option<PitchQuestion>,String> {
         let conn=self.conn()?;
         let row:Option<(String,String,String,String)>=conn.query_row(
             "SELECT COALESCE(a.reading,''),a.analysis_json,p.patterns_json,p.confidence FROM japanese_analyses a JOIN pitch_patterns p ON p.analysis_id=a.id WHERE a.entry_id=?1 AND a.deleted_at IS NULL AND p.deleted_at IS NULL ORDER BY CASE p.confidence WHEN 'MANUAL' THEN 1 WHEN 'VERIFIED' THEN 2 WHEN 'CONSENSUS' THEN 3 ELSE 4 END LIMIT 1",
@@ -1358,7 +1358,7 @@ impl Database {
             "PREDICTED"=>PitchConfidence::Predicted,
             _=>return Ok(None),
         };
-        let gate=confidence.gates_by_default() || predicted_gate;
+        let gate = true;
         let Some(morae_values)=analysis.get("morae").and_then(Value::as_array) else{return Ok(None)};
         let Some(morae)=morae_values.iter().map(|value| value.as_str().map(String::from)).collect::<Option<Vec<_>>>() else{return Ok(None)};
         let Some(kind)=analysis.get("scope").and_then(Value::as_str).map(String::from) else{return Ok(None)};
@@ -1701,13 +1701,49 @@ impl Database {
                  WHERE e.deleted_at IS NULL \
                    AND e.language='ja-JP' \
                    AND json_extract(a.analysis_json,'$.scope') IN ('lexical','phrase','sentence') \
-                   AND ( \
-                     NOT EXISTS(SELECT 1 FROM audio_assets aa WHERE aa.entry_id=e.id AND aa.deleted_at IS NULL) \
-                     OR NOT EXISTS(SELECT 1 FROM pitch_patterns p WHERE p.analysis_id=a.id AND p.deleted_at IS NULL) \
-                   ) \
+                   AND NOT EXISTS(SELECT 1 FROM audio_assets aa WHERE aa.entry_id=e.id AND aa.deleted_at IS NULL) \
                )",
             [now()],
         ).map_err(|e| e.to_string())
+    }
+
+    pub fn requeue_pitch_data_revision(&self, revision: &str) -> Result<usize, String> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let current: Option<String> = tx.query_row(
+            "SELECT value FROM app_settings WHERE key='pitch_data_revision'",
+            [],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        if current.as_deref() == Some(revision) {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(0);
+        }
+        let updated = tx.execute(
+            "UPDATE enrichment_jobs SET status='queued',attempts=0,last_error=NULL,updated_at=?1 \
+             WHERE entry_id IN ( \
+               SELECT e.id FROM entries e \
+               JOIN decks d ON d.id=e.deck_id AND d.deleted_at IS NULL \
+               LEFT JOIN japanese_analyses a ON a.entry_id=e.id AND a.deleted_at IS NULL \
+               WHERE e.deleted_at IS NULL AND e.language='ja-JP' \
+                 AND ( \
+                   a.id IS NULL \
+                   OR a.confidence='PREDICTED' \
+                   OR NOT EXISTS( \
+                     SELECT 1 FROM pitch_patterns p \
+                     WHERE p.analysis_id=a.id AND p.deleted_at IS NULL AND p.confidence!='PREDICTED' \
+                   ) \
+                 ) \
+             )",
+            [now()],
+        ).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO app_settings(key,value,updated_at) VALUES('pitch_data_revision',?1,?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![revision, now()],
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(updated)
     }
 
     pub fn requeue_voice_audio_revision(&self, revision: &str) -> Result<usize, String> {
@@ -2589,7 +2625,7 @@ mod tests{
     }
 
     #[test]
-    fn completed_japanese_entries_missing_pitch_or_audio_are_requeued() {
+    fn incomplete_audio_requeues_normally_and_pitch_data_requeues_once_per_revision() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
         let deck = db.create_deck("incomplete Japanese", "ko-KR", "ja-JP").unwrap();
@@ -2642,7 +2678,9 @@ mod tests{
             &audio_only,
         ).unwrap();
         assert!(db.queued_enrichment(1).unwrap().is_empty());
-        assert_eq!(db.requeue_incomplete_japanese_enrichment().unwrap(), 3);
+        assert_eq!(db.requeue_incomplete_japanese_enrichment().unwrap(), 1);
+        assert_eq!(db.queued_enrichment(3).unwrap().len(), 1);
+        assert_eq!(db.requeue_pitch_data_revision("fixture-v1").unwrap(), 3);
         assert_eq!(db.queued_enrichment(3).unwrap().len(), 3);
     }
 
@@ -2920,18 +2958,18 @@ mod tests{
             &entries[1].id, Some("よそく"), &predicted, "fixture", "prediction fixture", "PREDICTED", None,
             Some(&[vec![0,1,0]]), "lexical", &[],
         ).unwrap();
-        assert!(!db.pitch_question(&entries[1].id, false).unwrap().unwrap().gate_enabled);
-        assert!(db.pitch_question(&entries[1].id, true).unwrap().unwrap().gate_enabled);
+        let predicted_question = db.pitch_question(&entries[1].id, false).unwrap().unwrap();
+        assert!(predicted_question.gate_enabled);
+        assert!(matches!(predicted_question.confidence, PitchConfidence::Predicted));
 
         let phrase = serde_json::json!({"scope":"phrase","morae":["と","う","きょ","う","だ","い","が","く"]});
         db.set_entry_analysis(
             &entries[2].id, Some("とうきょうだいがく"), &phrase, "fixture", "phrase prediction", "PREDICTED", None,
             Some(&[vec![0,1,1,1,1,1,1,0]]), "phrase", &[],
         ).unwrap();
-        let phrase_question = db.pitch_question(&entries[2].id, true).unwrap().unwrap();
-        assert_eq!(phrase_question.kind, "phrase");
-        assert_eq!(phrase_question.morae, vec!["と","う","きょ","う","だ","い","が","く"]);
-        assert_eq!(phrase_question.allowed_patterns, vec![vec![0,1,1,1,1,1,1,0]]);
+        let predicted_phrase = db.pitch_question(&entries[2].id, true).unwrap().unwrap();
+        assert!(predicted_phrase.gate_enabled);
+        assert!(matches!(predicted_phrase.confidence, PitchConfidence::Predicted));
 
         let unavailable = serde_json::json!({"scope":"lexical","morae":["ふ","め","い"]});
         db.set_entry_analysis(

@@ -182,12 +182,6 @@ pub enum PitchConfidence {
     Predicted,
 }
 
-impl PitchConfidence {
-    pub fn gates_by_default(&self) -> bool {
-        !matches!(self, Self::Predicted)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PitchQuestion {
     pub kind: String,
