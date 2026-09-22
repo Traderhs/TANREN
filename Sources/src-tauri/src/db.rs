@@ -2829,6 +2829,7 @@ mod tests{
         assert_eq!(db.queued_enrichment(3).unwrap().len(), 1);
         assert_eq!(db.requeue_pitch_data_revision("fixture-v1").unwrap(), 3);
         assert_eq!(db.queued_enrichment(3).unwrap().len(), 3);
+        assert_eq!(db.requeue_pitch_data_revision("fixture-v1").unwrap(), 0);
     }
 
     #[test]
