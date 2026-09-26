@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { completionDelayMs, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut } from "./studyTimers";
+import { completionDeadlineMs, completionDelayMs, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut } from "./studyTimers";
 
 describe("study timer semantics", () => {
   it("does not treat keydown or whitespace as meaningful recall input", () => {
@@ -34,5 +34,12 @@ describe("study timer semantics", () => {
     vi.advanceTimersByTime(1);
     expect(fired).toHaveBeenCalledOnce();
     vi.useRealTimers();
+  });
+
+  it("keeps the visible completion countdown aligned with the IME timeout deadline", () => {
+    const deadline = completionDeadlineMs(1_000, false, "見据える", 1_000, 1_000);
+    expect(deadline).toBe(2_800);
+    expect(Math.max(0, deadline! - 2_000)).toBe(800);
+    expect(Math.max(0, deadline! - 2_800)).toBe(0);
   });
 });

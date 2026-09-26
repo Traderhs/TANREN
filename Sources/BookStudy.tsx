@@ -14,7 +14,7 @@ import {
   type PitchLevel,
   type PitchSelection,
 } from "./lib/studyFlow";
-import { completionDelayMs, firstMeaningfulInputAt, isMeaningfulInput } from "./lib/studyTimers";
+import { completionDeadlineMs, firstMeaningfulInputAt, isMeaningfulInput } from "./lib/studyTimers";
 import { japaneseImeEnterCommitsYomi, japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { JapaneseImeSegment, JapaneseImeSession } from "./lib/japaneseIme";
 import { playEffectSound } from "./lib/soundEffects";
@@ -272,15 +272,18 @@ export function BookStudy({
   const recallLeft = Math.max(0, (card?.recall_timeout_ms ?? 0) - (recalling ? elapsed : timing.current.first! - timing.current.start));
   const inputElapsed = recalling ? 0 : Math.max(0, now - timing.current.first!);
   const completionTimerEnabled = completionTimeoutMs != null || completionIdleMs != null;
-  const inputIdleBudget = completionDelayMs(
+  const inputIdleDeadline = completionDeadlineMs(
     completionIdleMs,
     phaseComposing,
     phaseAnswer,
     timing.current.compositionEnd,
-    now,
+    timing.current.last,
   );
-  const inputIdleLeft = !recalling && timing.current.last !== null && inputIdleBudget !== null
-    ? Math.max(0, inputIdleBudget - (now - timing.current.last))
+  const inputIdleBudget = inputIdleDeadline !== null && timing.current.last !== null
+    ? inputIdleDeadline - timing.current.last
+    : null;
+  const inputIdleLeft = !recalling && inputIdleDeadline !== null
+    ? Math.max(0, inputIdleDeadline - now)
     : null;
   const inputTotalLeft = !recalling && completionTimeoutMs != null
     ? Math.max(0, completionTimeoutMs - inputElapsed)
@@ -935,9 +938,9 @@ export function BookStudy({
       const activeComposing = meaningPhase ? meaningComposing.current : composing.current;
       const activeCompletionIdleMs = meaningPhase ? card.listening_meaning_completion_idle_ms : card.completion_idle_ms;
       const activeCompletionTimeoutMs = meaningPhase ? card.listening_meaning_completion_timeout_ms : card.completion_timeout_ms;
-      const idle = completionDelayMs(activeCompletionIdleMs, activeComposing, activityText, currentTiming.compositionEnd, currentTiming.last ?? currentNow);
+      const idleDeadline = completionDeadlineMs(activeCompletionIdleMs, activeComposing, activityText, currentTiming.compositionEnd, currentTiming.last);
       const recall = currentTiming.first === null && currentNow - currentTiming.start >= card.recall_timeout_ms;
-      const idleCompletion = currentTiming.last !== null && idle !== null && currentNow - currentTiming.last >= idle;
+      const idleCompletion = idleDeadline !== null && currentNow >= idleDeadline;
       const totalCompletion = !activeComposing
         && currentTiming.first !== null
         && activeCompletionTimeoutMs != null
