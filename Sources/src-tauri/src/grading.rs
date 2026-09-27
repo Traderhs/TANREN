@@ -150,6 +150,9 @@ pub fn grade_reading_deterministic(
     rejected: &[String],
 ) -> Option<GradeOutcome> {
     let norm = normalize_generic(answer);
+    if exact_meanings_match_whitespace(entry, answer) {
+        return Some(GradeOutcome { decision: GradeDecision::Pass, method: "exact_meanings", score: Some(1.0) });
+    }
     let parts = split_reading_answer(answer, entry.meanings.len());
     if parts.len() != entry.meanings.len() {
         return Some(GradeOutcome { decision: GradeDecision::Fail, method: "meaning_count_mismatch", score: Some(0.0) });
@@ -168,6 +171,42 @@ pub fn grade_reading_deterministic(
         return Some(GradeOutcome { decision: GradeDecision::Pass, method: "exact_meanings", score: Some(1.0) });
     }
     None
+}
+
+fn exact_meanings_match_whitespace(entry: &EntryRecord, answer: &str) -> bool {
+    if entry.meanings.len() <= 1 {
+        return false;
+    }
+
+    let normalized_answer = normalize_generic(answer);
+    let answer_tokens: Vec<_> = normalized_answer.split_whitespace().collect();
+    let meaning_tokens: Vec<Vec<String>> = entry.meanings.iter()
+        .map(|meaning| normalize_generic(meaning).split_whitespace().map(ToOwned::to_owned).collect())
+        .collect();
+    let mut used = vec![false; meaning_tokens.len()];
+
+    fn matches_from(answer: &[&str], meanings: &[Vec<String>], used: &mut [bool], offset: usize) -> bool {
+        if offset == answer.len() {
+            return used.iter().all(|value| *value);
+        }
+
+        for index in 0..meanings.len() {
+            if used[index] || meanings[index].is_empty() || offset + meanings[index].len() > answer.len() {
+                continue;
+            }
+            if !meanings[index].iter().enumerate().all(|(part, expected)| answer[offset + part] == expected) {
+                continue;
+            }
+            used[index] = true;
+            if matches_from(answer, meanings, used, offset + meanings[index].len()) {
+                return true;
+            }
+            used[index] = false;
+        }
+        false
+    }
+
+    matches_from(&answer_tokens, &meaning_tokens, &mut used, 0)
 }
 
 pub fn split_reading_answer(answer: &str, expected_count: usize) -> Vec<String> {
@@ -232,6 +271,22 @@ mod tests {
         value.reading = Some("あと".into());
         assert_eq!(
             grade_reading_deterministic(&value, "뒤, 나중, 나머지", &[], &[]).unwrap().decision,
+            GradeDecision::Pass,
+        );
+    }
+
+    #[test]
+    fn multiple_meanings_accept_spaces_when_a_meaning_contains_spaces() {
+        let mut value = entry();
+        value.term = "行く".into();
+        value.meanings = vec!["가다".into(), "잘 되다".into()];
+        value.reading = Some("いく".into());
+        assert_eq!(
+            grade_reading_deterministic(&value, "가다 잘 되다", &[], &[]).unwrap().decision,
+            GradeDecision::Pass,
+        );
+        assert_eq!(
+            grade_reading_deterministic(&value, "잘 되다 가다", &[], &[]).unwrap().decision,
             GradeDecision::Pass,
         );
     }
