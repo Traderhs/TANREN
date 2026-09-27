@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { completionDeadlineMs, completionDelayMs, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut } from "./studyTimers";
+import { completionDeadlineMs, completionDelayMs, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut, totalCompletionHasTimedOut } from "./studyTimers";
 
 describe("study timer semantics", () => {
   it("does not treat keydown or whitespace as meaningful recall input", () => {
@@ -41,5 +41,10 @@ describe("study timer semantics", () => {
     expect(deadline).toBe(2_800);
     expect(Math.max(0, deadline! - 2_000)).toBe(800);
     expect(Math.max(0, deadline! - 2_800)).toBe(0);
+  });
+
+  it("fires the hard completion timeout exactly at its deadline", () => {
+    expect(totalCompletionHasTimedOut(1_000, 2_000, 2_999)).toBe(false);
+    expect(totalCompletionHasTimedOut(1_000, 2_000, 3_000)).toBe(true);
   });
 });

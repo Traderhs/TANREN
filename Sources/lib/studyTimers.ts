@@ -35,3 +35,13 @@ export function completionDeadlineMs(
   const delay = completionDelayMs(configuredIdleMs, composing, partialAnswer, compositionEndedAt, lastInputAt);
   return delay === null ? null : lastInputAt + delay;
 }
+
+export function totalCompletionHasTimedOut(
+  firstInputAt: number | null,
+  configuredTimeoutMs: number | null | undefined,
+  now: number,
+): boolean {
+  return firstInputAt !== null
+    && configuredTimeoutMs != null
+    && now - firstInputAt >= configuredTimeoutMs;
+}

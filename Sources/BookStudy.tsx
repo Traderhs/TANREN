@@ -14,7 +14,7 @@ import {
   type PitchLevel,
   type PitchSelection,
 } from "./lib/studyFlow";
-import { completionDeadlineMs, firstMeaningfulInputAt, isMeaningfulInput } from "./lib/studyTimers";
+import { completionDeadlineMs, firstMeaningfulInputAt, isMeaningfulInput, totalCompletionHasTimedOut } from "./lib/studyTimers";
 import { japaneseImeEnterCommitsYomi, japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { JapaneseImeSegment, JapaneseImeSession } from "./lib/japaneseIme";
 import { playEffectSound } from "./lib/soundEffects";
@@ -941,10 +941,11 @@ export function BookStudy({
       const idleDeadline = completionDeadlineMs(activeCompletionIdleMs, activeComposing, activityText, currentTiming.compositionEnd, currentTiming.last);
       const recall = currentTiming.first === null && currentNow - currentTiming.start >= card.recall_timeout_ms;
       const idleCompletion = idleDeadline !== null && currentNow >= idleDeadline;
-      const totalCompletion = !activeComposing
-        && currentTiming.first !== null
-        && activeCompletionTimeoutMs != null
-        && currentNow - currentTiming.first >= activeCompletionTimeoutMs;
+      const totalCompletion = totalCompletionHasTimedOut(
+        currentTiming.first,
+        activeCompletionTimeoutMs,
+        currentNow,
+      );
       const completion = idleCompletion || totalCompletion;
       if ((recall || completion) && !locked.current && !timeoutSent.current) {
         timeoutSent.current = true;
