@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    model::{AudioAssetDraft, DeckRecord, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImportResult, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageScheduleSummary, StudyMode},
+    model::{AudioAssetDraft, DeckRecord, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImportResult, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageCompletionStats, StageScheduleSummary, StudyMode},
     study::{stage_study_range, study_ranges, StudySession},
     timers::TypingProfileState,
 };
@@ -94,10 +94,11 @@ struct StatsAggregate {
     pitch_correct: usize,
     joint_correct: usize,
     recall_latencies: Vec<u64>,
+    typing_durations: Vec<u64>,
 }
 
 impl StatsAggregate {
-    fn record(&mut self, base_correct: bool, pitch_correct: Option<bool>, joint_correct: bool, recall_latency_ms: u64) {
+    fn record(&mut self, base_correct: bool, pitch_correct: Option<bool>, joint_correct: bool, recall_latency_ms: u64, typing_duration_ms: u64) {
         self.attempts += 1;
         self.base_correct += usize::from(base_correct);
         self.joint_correct += usize::from(joint_correct);
@@ -106,11 +107,19 @@ impl StatsAggregate {
             self.pitch_correct += usize::from(correct);
         }
         self.recall_latencies.push(recall_latency_ms);
+        self.typing_durations.push(typing_duration_ms);
     }
 
     fn median_recall_latency_ms(&self) -> Option<u64> {
         if self.recall_latencies.is_empty() { return None; }
         let mut values = self.recall_latencies.clone();
+        values.sort_unstable();
+        Some(values[values.len() / 2])
+    }
+
+    fn median_typing_duration_ms(&self) -> Option<u64> {
+        if self.typing_durations.is_empty() { return None; }
+        let mut values = self.typing_durations.clone();
         values.sort_unstable();
         Some(values[values.len() / 2])
     }
@@ -128,9 +137,12 @@ fn history_mode_points(
             let point = LibraryStatsModePoint {
                 attempts: stats.map_or(0, |value| value.attempts),
                 seen_entry_count: seen_entries_by_mode.get(&mode).map_or(0, HashSet::len),
+                learning_day_count: 0,
                 base_accuracy: stats.and_then(|value| ratio(value.base_correct, value.attempts)),
                 pitch_accuracy: stats.and_then(|value| ratio(value.pitch_correct, value.pitch_attempts)),
+                joint_accuracy: stats.and_then(|value| ratio(value.joint_correct, value.attempts)),
                 median_recall_latency_ms: stats.and_then(StatsAggregate::median_recall_latency_ms),
+                median_typing_duration_ms: stats.and_then(StatsAggregate::median_typing_duration_ms),
                 study_time_ms: 0,
             };
             (mode, point)
@@ -587,6 +599,71 @@ impl Database {
             params![Uuid::new_v4().to_string(), deck_id, stage as i64, duration_ms as i64, cycle_count as i64, timestamp, self.device_id],
         ).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn stage_completion_stats(&self, deck_id: &str, stage: u32) -> Result<StageCompletionStats, String> {
+        let conn = self.conn()?;
+        let mut completion_stmt = conn.prepare(
+            "SELECT completed_at,duration_ms,cycle_count FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at DESC,id DESC LIMIT 2",
+        ).map_err(|e| e.to_string())?;
+        let completions = completion_stmt.query_map(params![deck_id, stage as i64], |row| Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? as u64,
+            row.get::<_, i64>(2)? as u32,
+        ))).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let latest_completion_at = completions.first().map(|value| value.0.as_str());
+        let previous_completion_at = completions.get(1).map(|value| value.0.as_str());
+        let (study_time_ms, cycle_count) = completions.first()
+            .map(|value| (value.1, value.2))
+            .unwrap_or((0, 0));
+
+        let mut aggregate = StatsAggregate::default();
+        let mut seen_entries = HashSet::new();
+        let mut first_passes = 0usize;
+        let mut timeout_count = 0usize;
+        let mut typing_durations = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT entry_id,base_correct,pitch_correct,joint_correct,recall_latency_ms,typing_duration_ms,failure_type FROM attempts WHERE deck_id=?1 AND stage=?2 AND (?3 IS NULL OR timestamp>?3) AND (?4 IS NULL OR timestamp<=?4) ORDER BY timestamp,id",
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![deck_id, stage as i64, previous_completion_at, latest_completion_at], |row| Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? != 0,
+            row.get::<_, Option<i64>>(2)?.map(|value| value != 0),
+            row.get::<_, i64>(3)? != 0,
+            row.get::<_, i64>(4)? as u64,
+            row.get::<_, i64>(5)? as u64,
+            row.get::<_, Option<String>>(6)?,
+        ))).map_err(|e| e.to_string())?;
+        for row in rows {
+            let (entry_id, base_correct, pitch_correct, joint_correct, recall_latency_ms, typing_duration_ms, failure_type) = row.map_err(|e| e.to_string())?;
+            if seen_entries.insert(entry_id) && joint_correct {
+                first_passes += 1;
+            }
+            if failure_type.as_deref().is_some_and(|failure| matches!(failure, "RECALL_TIMEOUT" | "COMPLETION_TIMEOUT")) {
+                timeout_count += 1;
+            }
+            typing_durations.push(typing_duration_ms);
+            aggregate.record(base_correct, pitch_correct, joint_correct, recall_latency_ms, typing_duration_ms);
+        }
+        typing_durations.sort_unstable();
+        let median_typing_duration_ms = typing_durations.get(typing_durations.len() / 2).copied();
+        let unique_entries = seen_entries.len();
+        Ok(StageCompletionStats {
+            stage,
+            attempts: aggregate.attempts,
+            base_accuracy: ratio(aggregate.base_correct, aggregate.attempts),
+            pitch_accuracy: ratio(aggregate.pitch_correct, aggregate.pitch_attempts),
+            joint_accuracy: ratio(aggregate.joint_correct, aggregate.attempts),
+            first_pass_accuracy: ratio(first_passes, unique_entries),
+            retry_count: aggregate.attempts.saturating_sub(unique_entries),
+            timeout_count,
+            median_recall_latency_ms: aggregate.median_recall_latency_ms(),
+            median_typing_duration_ms,
+            study_time_ms,
+            cycle_count,
+        })
     }
 
     #[cfg(test)]
@@ -1594,11 +1671,30 @@ impl Database {
         let mut by_mode: HashMap<StudyMode, StatsAggregate> = HashMap::new();
         let mut seen_entries = HashSet::new();
         let mut seen_entries_by_mode: HashMap<StudyMode, HashSet<String>> = HashMap::new();
+        let mut attempt_dates_by_mode: HashMap<StudyMode, HashSet<String>> = HashMap::new();
         let mut history = Vec::new();
         let mut history_date: Option<String> = None;
 
+        let item_created_dates = {
+            let mut dates = Vec::new();
+            if let Some(deck_id) = deck_id {
+                let mut stmt = conn.prepare(
+                    "SELECT created_at FROM entries WHERE deck_id=?1 AND deleted_at IS NULL ORDER BY created_at",
+                ).map_err(|e| e.to_string())?;
+                let rows = stmt.query_map([deck_id], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+                for row in rows { dates.push(local_date(&row.map_err(|e| e.to_string())?)?); }
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT created_at FROM decks WHERE deleted_at IS NULL ORDER BY created_at",
+                ).map_err(|e| e.to_string())?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+                for row in rows { dates.push(local_date(&row.map_err(|e| e.to_string())?)?); }
+            }
+            dates
+        };
+
         let mut stmt = conn.prepare(
-            "SELECT a.entry_id,a.variant,a.base_correct,a.pitch_correct,a.joint_correct,a.recall_latency_ms,a.timestamp FROM attempts a JOIN decks d ON d.id=a.deck_id WHERE d.deleted_at IS NULL AND (?1 IS NULL OR a.deck_id=?1) ORDER BY a.timestamp,a.id",
+            "SELECT a.entry_id,a.variant,a.base_correct,a.pitch_correct,a.joint_correct,a.recall_latency_ms,a.typing_duration_ms,a.timestamp FROM attempts a JOIN decks d ON d.id=a.deck_id WHERE d.deleted_at IS NULL AND (?1 IS NULL OR a.deck_id=?1) ORDER BY a.timestamp,a.id",
         ).map_err(|e| e.to_string())?;
         let rows = stmt.query_map(params![deck_id], |row| Ok((
             row.get::<_, String>(0)?,
@@ -1607,25 +1703,30 @@ impl Database {
             row.get::<_, Option<i64>>(3)?.map(|value| value != 0),
             row.get::<_, i64>(4)? != 0,
             row.get::<_, i64>(5)? as u64,
-            row.get::<_, String>(6)?,
+            row.get::<_, i64>(6)? as u64,
+            row.get::<_, String>(7)?,
         ))).map_err(|e| e.to_string())?;
 
         for row in rows {
-            let (entry_id, variant, base_correct, pitch_correct, joint_correct, recall_latency_ms, timestamp) = row.map_err(|e| e.to_string())?;
+            let (entry_id, variant, base_correct, pitch_correct, joint_correct, recall_latency_ms, typing_duration_ms, timestamp) = row.map_err(|e| e.to_string())?;
             let date = local_date(&timestamp)?;
             if history_date.as_deref().is_some_and(|previous| previous != date) {
                 history.push(LibraryStatsPoint {
                     date: history_date.take().unwrap(),
                     attempts: overall.attempts,
                     seen_entry_count: seen_entries.len(),
+                    item_count: 0,
+                    learning_day_count: 0,
                     base_accuracy: ratio(overall.base_correct, overall.attempts),
                     pitch_accuracy: ratio(overall.pitch_correct, overall.pitch_attempts),
+                    joint_accuracy: ratio(overall.joint_correct, overall.attempts),
                     median_recall_latency_ms: overall.median_recall_latency_ms(),
+                    median_typing_duration_ms: overall.median_typing_duration_ms(),
                     study_time_ms: 0,
                     modes: history_mode_points(&by_mode, &seen_entries_by_mode),
                 });
             }
-            history_date = Some(date);
+            history_date = Some(date.clone());
             let mode = match variant.as_str() {
                 "reading" => StudyMode::Reading,
                 "listening" => StudyMode::Listening,
@@ -1634,17 +1735,22 @@ impl Database {
             };
             seen_entries.insert(entry_id.clone());
             seen_entries_by_mode.entry(mode).or_default().insert(entry_id);
-            overall.record(base_correct, pitch_correct, joint_correct, recall_latency_ms);
-            by_mode.entry(mode).or_default().record(base_correct, pitch_correct, joint_correct, recall_latency_ms);
+            attempt_dates_by_mode.entry(mode).or_default().insert(date.clone());
+            overall.record(base_correct, pitch_correct, joint_correct, recall_latency_ms, typing_duration_ms);
+            by_mode.entry(mode).or_default().record(base_correct, pitch_correct, joint_correct, recall_latency_ms, typing_duration_ms);
         }
         if let Some(date) = history_date {
             history.push(LibraryStatsPoint {
                 date,
                 attempts: overall.attempts,
                 seen_entry_count: seen_entries.len(),
+                item_count: 0,
+                learning_day_count: 0,
                 base_accuracy: ratio(overall.base_correct, overall.attempts),
                 pitch_accuracy: ratio(overall.pitch_correct, overall.pitch_attempts),
+                joint_accuracy: ratio(overall.joint_correct, overall.attempts),
                 median_recall_latency_ms: overall.median_recall_latency_ms(),
+                median_typing_duration_ms: overall.median_typing_duration_ms(),
                 study_time_ms: 0,
                 modes: history_mode_points(&by_mode, &seen_entries_by_mode),
             });
@@ -1674,6 +1780,7 @@ impl Database {
         let mut last_attempt_point: Option<LibraryStatsPoint> = None;
         let mut cumulative_study_time_ms = 0u64;
         let mut cumulative_mode_study_time: HashMap<StudyMode, u64> = HashMap::new();
+        let mut cumulative_mode_learning_days: HashMap<StudyMode, usize> = HashMap::new();
         for date in dates.into_keys() {
             if let Some(point) = attempt_history.remove(&date) {
                 last_attempt_point = Some(point);
@@ -1696,17 +1803,31 @@ impl Database {
                 date: date.clone(),
                 attempts: 0,
                 seen_entry_count: 0,
+                item_count: 0,
+                learning_day_count: 0,
                 base_accuracy: None,
                 pitch_accuracy: None,
+                joint_accuracy: None,
                 median_recall_latency_ms: None,
+                median_typing_duration_ms: None,
                 study_time_ms: 0,
                 modes: history_mode_points(&HashMap::new(), &HashMap::new()),
             });
             point.date = date;
+            point.item_count = item_created_dates.iter().filter(|created| created.as_str() <= point.date.as_str()).count();
+            point.learning_day_count = history.len() + 1;
             point.study_time_ms = cumulative_study_time_ms;
             for mode in [StudyMode::Reading, StudyMode::Listening, StudyMode::Writing] {
+                let has_attempt = attempt_dates_by_mode.get(&mode).is_some_and(|mode_dates| mode_dates.contains(&point.date));
+                let has_activity = activity_by_date.get(&point.date)
+                    .and_then(|activity| activity.get(mode.as_str()))
+                    .is_some_and(|duration| *duration > 0);
+                if has_attempt || has_activity {
+                    *cumulative_mode_learning_days.entry(mode).or_default() += 1;
+                }
                 if let Some(mode_point) = point.modes.get_mut(&mode) {
                     mode_point.study_time_ms = cumulative_mode_study_time.get(&mode).copied().unwrap_or(0);
+                    mode_point.learning_day_count = cumulative_mode_learning_days.get(&mode).copied().unwrap_or(0);
                 }
             }
             history.push(point);
@@ -1721,6 +1842,7 @@ impl Database {
             pitch_accuracy: ratio(overall.pitch_correct, overall.pitch_attempts),
             joint_accuracy: ratio(overall.joint_correct, overall.attempts),
             median_recall_latency_ms: overall.median_recall_latency_ms(),
+            median_typing_duration_ms: overall.median_typing_duration_ms(),
             study_time_ms: cumulative_study_time_ms,
             history,
         })
@@ -2995,7 +3117,7 @@ mod tests{
         let reading_entry = db.entries(&reading_deck.id).unwrap().remove(0);
         let listening_entry = db.entries(&listening_deck.id).unwrap().remove(0);
         db.insert_attempt(&reading_entry.id, &reading_deck.id, StudyMode::Reading, 1, "0~0", "고양이", true, Some(true), true, "exact", None, 400, 100, None).unwrap();
-        db.insert_attempt(&listening_entry.id, &listening_deck.id, StudyMode::Listening, 1, "0~0", "猫", false, Some(false), false, "exact", None, 800, 100, None).unwrap();
+        db.insert_attempt(&listening_entry.id, &listening_deck.id, StudyMode::Listening, 1, "0~0", "猫", false, Some(false), false, "exact", None, 800, 300, None).unwrap();
         db.record_study_activity(&reading_deck.id, Some(StudyMode::Reading), 2_500).unwrap();
         db.record_study_activity(&listening_deck.id, Some(StudyMode::Listening), 3_500).unwrap();
         db.record_study_activity(&reading_deck.id, None, 500).unwrap();
@@ -3009,13 +3131,22 @@ mod tests{
         assert_eq!(stats.pitch_accuracy, Some(0.5));
         assert_eq!(stats.joint_accuracy, Some(0.5));
         assert_eq!(stats.median_recall_latency_ms, Some(800));
+        assert_eq!(stats.median_typing_duration_ms, Some(300));
         assert_eq!(stats.study_time_ms, 6_500);
         assert_eq!(stats.history.last().map(|point| point.attempts), Some(2));
         assert_eq!(stats.history.last().map(|point| point.seen_entry_count), Some(2));
+        assert_eq!(stats.history.last().map(|point| point.item_count), Some(3));
+        assert_eq!(stats.history.last().map(|point| point.learning_day_count), Some(1));
         assert_eq!(stats.history.last().map(|point| point.study_time_ms), Some(6_500));
         let latest_history = stats.history.last().unwrap();
+        assert_eq!(latest_history.joint_accuracy, Some(0.5));
+        assert_eq!(latest_history.median_typing_duration_ms, Some(300));
         assert_eq!(latest_history.modes.get(&StudyMode::Reading).map(|point| (point.attempts, point.seen_entry_count, point.base_accuracy)), Some((1, 1, Some(1.0))));
         assert_eq!(latest_history.modes.get(&StudyMode::Listening).map(|point| (point.attempts, point.seen_entry_count, point.base_accuracy)), Some((1, 1, Some(0.0))));
+        assert_eq!(latest_history.modes.get(&StudyMode::Reading).map(|point| (point.joint_accuracy, point.median_typing_duration_ms)), Some((Some(1.0), Some(100))));
+        assert_eq!(latest_history.modes.get(&StudyMode::Listening).map(|point| (point.joint_accuracy, point.median_typing_duration_ms)), Some((Some(0.0), Some(300))));
+        assert_eq!(latest_history.modes.get(&StudyMode::Reading).map(|point| point.learning_day_count), Some(1));
+        assert_eq!(latest_history.modes.get(&StudyMode::Listening).map(|point| point.learning_day_count), Some(1));
         assert_eq!(latest_history.modes.get(&StudyMode::Reading).map(|point| point.study_time_ms), Some(2_500));
         assert_eq!(latest_history.modes.get(&StudyMode::Listening).map(|point| point.study_time_ms), Some(3_500));
 
@@ -3026,9 +3157,43 @@ mod tests{
         assert_eq!(reading_stats.attempts, 1);
         assert_eq!(reading_stats.base_accuracy, Some(1.0));
         assert_eq!(reading_stats.pitch_accuracy, Some(1.0));
+        assert_eq!(reading_stats.joint_accuracy, Some(1.0));
+        assert_eq!(reading_stats.median_typing_duration_ms, Some(100));
+        assert_eq!(reading_stats.history.last().map(|point| point.item_count), Some(1));
+        assert_eq!(reading_stats.history.last().map(|point| point.learning_day_count), Some(1));
         assert_eq!(reading_stats.study_time_ms, 3_000);
         assert_eq!(reading_stats.history.last().map(|point| point.attempts), Some(1));
         assert_eq!(reading_stats.history.last().map(|point| point.study_time_ms), Some(3_000));
+    }
+
+    #[test]
+    fn stage_completion_stats_only_include_the_requested_stage() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("Stage stats", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft { term: "猫".into(), meanings: vec!["고양이".into()], reading: Some("ねこ".into()) }]).unwrap();
+        let entry = db.entries(&deck.id).unwrap().remove(0);
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 2, "0~0", "고양이", true, Some(true), true, "exact", None, 100, 100, None).unwrap();
+        db.mark_stage_completed(&deck.id, 2, 20_000, 1).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 2, "0~0", "고양이", true, Some(true), true, "exact", None, 400, 100, None).unwrap();
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 2, "0~0", "고양", false, Some(false), false, "completion_timeout", None, 900, 180, Some("COMPLETION_TIMEOUT")).unwrap();
+        db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 3, "0~0", "고양이", true, Some(true), true, "exact", None, 100, 100, None).unwrap();
+        db.mark_stage_completed(&deck.id, 2, 65_000, 3).unwrap();
+
+        let stats = db.stage_completion_stats(&deck.id, 2).unwrap();
+        assert_eq!(stats.stage, 2);
+        assert_eq!(stats.attempts, 2);
+        assert_eq!(stats.base_accuracy, Some(0.5));
+        assert_eq!(stats.pitch_accuracy, Some(0.5));
+        assert_eq!(stats.joint_accuracy, Some(0.5));
+        assert_eq!(stats.first_pass_accuracy, Some(1.0));
+        assert_eq!(stats.retry_count, 1);
+        assert_eq!(stats.timeout_count, 1);
+        assert_eq!(stats.median_recall_latency_ms, Some(900));
+        assert_eq!(stats.median_typing_duration_ms, Some(180));
+        assert_eq!(stats.study_time_ms, 65_000);
+        assert_eq!(stats.cycle_count, 3);
     }
 
     #[test]

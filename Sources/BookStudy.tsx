@@ -18,7 +18,7 @@ import { completionDeadlineMs, firstMeaningfulInputAt, isMeaningfulInput, totalC
 import { japaneseImeEnterCommitsYomi, japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { JapaneseImeSegment, JapaneseImeSession } from "./lib/japaneseIme";
 import { playEffectSound } from "./lib/soundEffects";
-import type { AudioSettings, DeckSummary, EntryDetails, EntryListRecord, PitchQuestion, StudyCard, SubmitResult } from "./lib/types";
+import type { AudioSettings, DeckSummary, EntryDetails, EntryListRecord, PitchQuestion, StageCompletionStats, StudyCard, SubmitResult } from "./lib/types";
 
 function answerPlaceholder(card: StudyCard | null) {
   if (!card) return "답을 입력해주세요";
@@ -150,6 +150,7 @@ export function BookStudy({
   const [submittedPitchQuestion, setSubmittedPitchQuestion] = useState<PitchQuestion | null>(null);
   const [submittedAnswerKnown, setSubmittedAnswerKnown] = useState(false);
   const [entryStats, setEntryStats] = useState<EntryListRecord | null>(null);
+  const [completionStats, setCompletionStats] = useState<StageCompletionStats | null>(null);
 
   const ime = useRef<JapaneseImeSession | null>(null);
   const input = useRef<HTMLInputElement>(null);
@@ -231,6 +232,18 @@ export function BookStudy({
     }).catch(() => undefined);
     return () => { disposed = true; };
   }, [deck.id, card?.entry_id, result.status, result.failure_type]);
+
+  useEffect(() => {
+    if (!complete) {
+      setCompletionStats(null);
+      return;
+    }
+    let disposed = false;
+    void api.stageStats(deck.id, lastStage.current).then((stats) => {
+      if (!disposed) setCompletionStats(stats);
+    }).catch(() => undefined);
+    return () => { disposed = true; };
+  }, [complete, deck.id]);
 
   useEffect(() => {
     if (!editedEntry || !cardRef.current) return;
@@ -1141,7 +1154,7 @@ export function BookStudy({
       </div>
     </header>
     <div className="learning-progress" role="progressbar" aria-label="단계 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)}><i style={{ width: `${progress}%` }} /></div>
-    {entryStats && <div className="learning-entry-stats" aria-label="현재 표현 누적 학습 통계">
+    {!complete && entryStats && <div className="learning-entry-stats" aria-label="현재 표현 누적 학습 통계">
       <span>누적 <strong>{entryStats.attempts.toLocaleString("ko-KR")}회</strong></span>
       <span>문제 <strong>{entryStats.base_accuracy == null ? "—" : `${(entryStats.base_accuracy * 100).toFixed(1)}%`}</strong></span>
       <span>피치 <strong>{entryStats.pitch_accuracy == null ? "—" : `${(entryStats.pitch_accuracy * 100).toFixed(1)}%`}</strong></span>
@@ -1149,10 +1162,45 @@ export function BookStudy({
 
     <main ref={transitionContent} className="learning-body book-learning-content">
       {complete ? <div className="learning-complete">
-        <span className="learning-complete-mark">✓</span>
-        <span className="learning-eyebrow">WELL DONE</span>
-        <h1>한 걸음 더, 익숙해졌어요</h1>
-        <p>이번 단계를 모두 마쳤어요</p>
+        <div className="learning-complete-head">
+          <div className="learning-complete-title">
+            <span className="learning-complete-mark">✓</span>
+            <div>
+              <span className="learning-eyebrow">STAGE COMPLETE</span>
+              <h1>한 걸음 더, 익숙해졌어요</h1>
+              <p>{lastStage.current}단계를 모두 마쳤어요</p>
+            </div>
+          </div>
+        </div>
+        {completionStats && <div className="learning-complete-insights" aria-label="이번 단계 핵심 학습 통계">
+          <div>
+            <span>총 시도</span>
+            <strong>{completionStats.attempts.toLocaleString("ko-KR")}회</strong>
+            <small>이번 단계를 끝내기까지 푼 횟수</small>
+          </div>
+          <div>
+            <span>회독</span>
+            <strong>{completionStats.cycle_count.toLocaleString("ko-KR")}회</strong>
+            <small>이번 단계를 끝내기까지 돈 횟수</small>
+          </div>
+          <div>
+            <span>시간 초과</span>
+            <strong>{completionStats.timeout_count.toLocaleString("ko-KR")}회</strong>
+            <small>회상·입력 제한을 넘긴 횟수</small>
+          </div>
+          <div>
+            <span>첫 시도 통과율</span>
+            <strong>{completionStats.first_pass_accuracy == null ? "—" : `${(completionStats.first_pass_accuracy * 100).toFixed(1)}%`}</strong>
+            <small>처음 만났을 때 바로 끝낸 비율</small>
+          </div>
+        </div>}
+        {completionStats && <div className="learning-complete-detail" aria-label="이번 단계 세부 학습 통계">
+          <span><small>중앙 회상 시간</small><strong>{completionStats.median_recall_latency_ms == null ? "—" : `${(completionStats.median_recall_latency_ms / 1000).toFixed(2)}초`}</strong></span>
+          <span><small>중앙 입력 시간</small><strong>{completionStats.median_typing_duration_ms == null ? "—" : `${(completionStats.median_typing_duration_ms / 1000).toFixed(2)}초`}</strong></span>
+          <span><small>문제 정확도</small><strong>{completionStats.base_accuracy == null ? "—" : `${(completionStats.base_accuracy * 100).toFixed(1)}%`}</strong></span>
+          <span><small>피치 정확도</small><strong>{completionStats.pitch_accuracy == null ? "—" : `${(completionStats.pitch_accuracy * 100).toFixed(1)}%`}</strong></span>
+          <span><small>종합 정확도</small><strong>{completionStats.joint_accuracy == null ? "—" : `${(completionStats.joint_accuracy * 100).toFixed(1)}%`}</strong></span>
+        </div>}
       </div> : <>
         {active && <>
           <div className="learning-question">

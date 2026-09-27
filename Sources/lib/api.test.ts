@@ -22,6 +22,12 @@ describe("study command payloads", () => {
     });
   });
 
+  it("loads one completed stage's stats", async () => {
+    invoke.mockResolvedValue({ stage: 3, attempts: 12 });
+    await api.stageStats("deck", 3);
+    expect(invoke).toHaveBeenCalledWith("stage_stats", { deckId: "deck", stage: 3 });
+  });
+
   it("submits listening form and meaning together", async () => {
     invoke.mockResolvedValue({ status: "review" });
     await api.submitAnswer("entry:listening", "答", "뜻", 800, 1200, [120, 90], 200, 900, [140, 110], 150);

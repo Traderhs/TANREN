@@ -78,6 +78,22 @@ pub struct StageScheduleSummary {
     pub clear_cycles: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageCompletionStats {
+    pub stage: u32,
+    pub attempts: usize,
+    pub base_accuracy: Option<f64>,
+    pub pitch_accuracy: Option<f64>,
+    pub joint_accuracy: Option<f64>,
+    pub first_pass_accuracy: Option<f64>,
+    pub retry_count: usize,
+    pub timeout_count: usize,
+    pub median_recall_latency_ms: Option<u64>,
+    pub median_typing_duration_ms: Option<u64>,
+    pub study_time_ms: u64,
+    pub cycle_count: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeckRecord {
     pub id: String,
@@ -269,6 +285,7 @@ pub struct LibraryStats {
     pub pitch_accuracy: Option<f64>,
     pub joint_accuracy: Option<f64>,
     pub median_recall_latency_ms: Option<u64>,
+    pub median_typing_duration_ms: Option<u64>,
     pub study_time_ms: u64,
     pub history: Vec<LibraryStatsPoint>,
 }
@@ -278,9 +295,13 @@ pub struct LibraryStatsPoint {
     pub date: String,
     pub attempts: usize,
     pub seen_entry_count: usize,
+    pub item_count: usize,
+    pub learning_day_count: usize,
     pub base_accuracy: Option<f64>,
     pub pitch_accuracy: Option<f64>,
+    pub joint_accuracy: Option<f64>,
     pub median_recall_latency_ms: Option<u64>,
+    pub median_typing_duration_ms: Option<u64>,
     pub study_time_ms: u64,
     pub modes: std::collections::HashMap<StudyMode, LibraryStatsModePoint>,
 }
@@ -289,9 +310,12 @@ pub struct LibraryStatsPoint {
 pub struct LibraryStatsModePoint {
     pub attempts: usize,
     pub seen_entry_count: usize,
+    pub learning_day_count: usize,
     pub base_accuracy: Option<f64>,
     pub pitch_accuracy: Option<f64>,
+    pub joint_accuracy: Option<f64>,
     pub median_recall_latency_ms: Option<u64>,
+    pub median_typing_duration_ms: Option<u64>,
     pub study_time_ms: u64,
 }
 

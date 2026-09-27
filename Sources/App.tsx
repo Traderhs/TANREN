@@ -2469,7 +2469,7 @@ function StatsMetric({ label, value, help, featured = false }: { label: string; 
   </article>;
 }
 
-type GrowthMetric = "attempts" | "seen_entry_count" | "base_accuracy" | "pitch_accuracy" | "median_recall_latency_ms" | "study_time_ms";
+type GrowthMetric = "attempts" | "seen_entry_count" | "median_recall_latency_ms" | "median_typing_duration_ms" | "base_accuracy" | "pitch_accuracy" | "joint_accuracy" | "item_count" | "study_time_ms" | "learning_day_count";
 type GrowthScope = "all" | "reading" | "writing" | "listening";
 
 const GROWTH_SCOPES: Record<GrowthScope, string> = {
@@ -2482,10 +2482,14 @@ const GROWTH_SCOPES: Record<GrowthScope, string> = {
 const GROWTH_METRICS: Record<GrowthMetric, { label: string; format: (value: number | null) => string; value: (point: LibraryStats["history"][number]) => number | null }> = {
   attempts: { label: "누적 시도", format: (value) => value == null ? "—" : `${numberFormat.format(value)}회`, value: (point) => point.attempts },
   seen_entry_count: { label: "누적 표현 수", format: (value) => value == null ? "—" : `${numberFormat.format(value)}개`, value: (point) => point.seen_entry_count },
+  median_recall_latency_ms: { label: "중앙 회상 시간", format: (value) => value == null ? "—" : formatLatency(value), value: (point) => point.median_recall_latency_ms },
+  median_typing_duration_ms: { label: "중앙 입력 시간", format: (value) => value == null ? "—" : formatLatency(value), value: (point) => point.median_typing_duration_ms },
   base_accuracy: { label: "문제 정확도", format: (value) => value == null ? "—" : `${(value * 100).toFixed(1)}%`, value: (point) => point.base_accuracy },
   pitch_accuracy: { label: "피치 정확도", format: (value) => value == null ? "—" : `${(value * 100).toFixed(1)}%`, value: (point) => point.pitch_accuracy },
-  median_recall_latency_ms: { label: "중앙 응답시간", format: (value) => value == null ? "—" : formatLatency(value), value: (point) => point.median_recall_latency_ms },
+  joint_accuracy: { label: "종합 정확도", format: (value) => value == null ? "—" : `${(value * 100).toFixed(1)}%`, value: (point) => point.joint_accuracy },
+  item_count: { label: "책 개수", format: (value) => value == null ? "—" : `${numberFormat.format(value)}개`, value: (point) => point.item_count },
   study_time_ms: { label: "공부 시간", format: (value) => formatStudyTime(value), value: (point) => point.study_time_ms },
+  learning_day_count: { label: "학습 일수", format: (value) => value == null ? "—" : `${numberFormat.format(value)}일`, value: (point) => point.learning_day_count },
 };
 
 function GrowthSelect<T extends string | number>({ label, value, options, onChange }: {
@@ -2622,7 +2626,7 @@ function GrowthTooltip({ active, payload, metricInfo }: any) {
   </div>;
 }
 
-function GrowthChart({ stats }: { stats: LibraryStats }) {
+function GrowthChart({ stats, itemMetricLabel }: { stats: LibraryStats; itemMetricLabel: "책 개수" | "수록 표현" }) {
   const [metric, setMetric] = useState<GrowthMetric>("base_accuracy");
   const [scope, setScope] = useState<GrowthScope>("all");
   const [zoomWindow, setZoomWindow] = useState({ start: 0, end: Math.max(0, stats.history.length - 1) });
@@ -2695,7 +2699,11 @@ function GrowthChart({ stats }: { stats: LibraryStats }) {
   const metricInfo = GROWTH_METRICS[metric];
   const chartData = stats.history.map((point, index) => {
     const modePoint = scope === "all" ? null : point.modes[scope];
-    const value = scope === "all" ? metricInfo.value(point) : modePoint?.[metric] ?? null;
+    const value = metric === "item_count"
+      ? metricInfo.value(point)
+      : scope === "all"
+        ? metricInfo.value(point)
+        : modePoint?.[metric] ?? null;
     return {
       index,
       date: point.date,
@@ -2708,18 +2716,23 @@ function GrowthChart({ stats }: { stats: LibraryStats }) {
   const visibleChartData = chartData.slice(visibleStart, visibleEnd + 1);
   const values = visibleChartData.map((point) => point.value);
   const validValues = values.filter((value): value is number => value != null);
-  const isPercent = metric === "base_accuracy" || metric === "pitch_accuracy";
+  const isPercent = metric === "base_accuracy" || metric === "pitch_accuracy" || metric === "joint_accuracy";
   const yDomain: [number, number | "auto"] = isPercent ? [0, 1] : [0, "auto"];
   const yTick = (value: number) => {
     if (isPercent) return `${Math.round(value * 100)}%`;
-    if (metric === "median_recall_latency_ms") return value < 1_000 ? `${Math.round(value)}ms` : `${(value / 1_000).toFixed(1)}s`;
+    if (metric === "median_recall_latency_ms" || metric === "median_typing_duration_ms") return value < 1_000 ? `${Math.round(value)}ms` : `${(value / 1_000).toFixed(1)}s`;
     if (metric === "study_time_ms") return formatStudyTime(value);
     if (metric === "attempts") return `${numberFormat.format(value)}회`;
     if (metric === "seen_entry_count") return `${numberFormat.format(value)}개`;
+    if (metric === "item_count") return `${numberFormat.format(value)}개`;
+    if (metric === "learning_day_count") return `${numberFormat.format(value)}일`;
     return numberFormat.format(value);
   };
   const scopeOptions = (Object.keys(GROWTH_SCOPES) as GrowthScope[]).map((key) => ({ value: key, label: GROWTH_SCOPES[key] }));
-  const metricOptions = (Object.keys(GROWTH_METRICS) as GrowthMetric[]).map((key) => ({ value: key, label: GROWTH_METRICS[key].label }));
+  const metricOptions = (Object.keys(GROWTH_METRICS) as GrowthMetric[]).map((key) => ({
+    value: key,
+    label: key === "item_count" ? itemMetricLabel : GROWTH_METRICS[key].label,
+  }));
 
   const timestampAtIndex = (index: number) => {
     if (chartData.length === 0) return 0;
@@ -2975,19 +2988,26 @@ function LibraryStatsView({ stats, deck }: { stats: LibraryStats | null; deck: D
             <span>{deck ? "BOOK" : "LIBRARY"}</span>
             <strong>{deck ? `${deck.name} 통계` : "전체 통계"}</strong>
           </div>
-          <div className="stats-summary-grid">
-            <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="지금까지 문제를 푼 횟수예요" />
-            <StatsMetric label="누적 표현 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help="한 번이라도 학습한 표현 수예요" />
-            <StatsMetric label="문제 정확도" value={formatPercent(stats.base_accuracy)} help="피치를 제외한 문제의 정답률이에요" />
-            <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help="피치를 정확히 맞힌 비율이에요" />
-            <StatsMetric label="중앙 응답시간" value={formatLatency(stats.median_recall_latency_ms)} help="문제를 보고 답을 입력하기 시작하기까지 걸린 시간이에요" />
-            <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="학습 화면에서 실제로 공부한 시간을 기록해요" />
-            {deck
-              ? <StatsMetric label="수록 표현" value={`${numberFormat.format(stats.entry_count)}개`} help="이 책에 들어 있는 전체 표현 수예요" />
-              : <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요" />}
-          </div>
+          <div className="stats-main-layout">
+            <aside className="stats-overview-panel" aria-label="통계 요약">
+              <div className="stats-overview-grid">
+                  <StatsMetric label="누적 시도" value={`${numberFormat.format(stats.attempts)}회`} help="지금까지 문제를 푼 횟수예요" />
+                  <StatsMetric label="누적 표현 수" value={`${numberFormat.format(stats.seen_entry_count)}개`} help="한 번이라도 학습한 표현 수예요" />
+                  <StatsMetric label="중앙 회상 시간" value={formatLatency(stats.median_recall_latency_ms)} help="문제를 보고 답을 입력하기 시작하기까지 걸린 시간이에요" />
+                  <StatsMetric label="중앙 입력 시간" value={formatLatency(stats.median_typing_duration_ms)} help="답을 입력하기 시작한 뒤 제출하기까지 걸린 시간이에요" />
+                  <StatsMetric label="문제 정확도" value={formatPercent(stats.base_accuracy)} help="피치를 제외한 문제의 정답률이에요" />
+                  <StatsMetric label="피치 정확도" value={formatPercent(stats.pitch_accuracy)} help="피치를 정확히 맞힌 비율이에요" />
+                  <StatsMetric label="종합 정확도" value={formatPercent(stats.joint_accuracy)} help="문제와 피치를 모두 통과한 비율이에요" />
+                  {deck
+                    ? <StatsMetric label="수록 표현" value={`${numberFormat.format(stats.entry_count)}개`} help="이 책에 들어 있는 전체 표현 수예요" />
+                    : <StatsMetric label="책 개수" value={`${numberFormat.format(stats.deck_count)}개`} help="현재 책장에 있는 책의 개수예요" />}
+                  <StatsMetric label="공부 시간" value={formatStudyTime(stats.study_time_ms)} help="학습 화면에서 실제로 공부한 시간을 기록해요" />
+                  <StatsMetric label="학습 일수" value={`${numberFormat.format(stats.history.length)}일`} help="학습 기록이 남아 있는 날짜 수예요" />
+              </div>
+            </aside>
 
-          <GrowthChart stats={stats} />
+            <GrowthChart stats={stats} itemMetricLabel={deck ? "수록 표현" : "책 개수"} />
+          </div>
         </>}
   </section>;
 }

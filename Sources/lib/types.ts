@@ -33,6 +33,21 @@ export interface StageScheduleSummary {
   clear_cycles: number[];
 }
 
+export interface StageCompletionStats {
+  stage: number;
+  attempts: number;
+  base_accuracy: number | null;
+  pitch_accuracy: number | null;
+  joint_accuracy: number | null;
+  first_pass_accuracy: number | null;
+  retry_count: number;
+  timeout_count: number;
+  median_recall_latency_ms: number | null;
+  median_typing_duration_ms: number | null;
+  study_time_ms: number;
+  cycle_count: number;
+}
+
 export interface ImportResult {
   inserted: number;
   duplicates: number;
@@ -113,6 +128,7 @@ export interface LibraryStats {
   pitch_accuracy: number | null;
   joint_accuracy: number | null;
   median_recall_latency_ms: number | null;
+  median_typing_duration_ms: number | null;
   study_time_ms: number;
   history: LibraryStatsPoint[];
 }
@@ -121,9 +137,13 @@ export interface LibraryStatsPoint {
   date: string;
   attempts: number;
   seen_entry_count: number;
+  item_count: number;
+  learning_day_count: number;
   base_accuracy: number | null;
   pitch_accuracy: number | null;
+  joint_accuracy: number | null;
   median_recall_latency_ms: number | null;
+  median_typing_duration_ms: number | null;
   study_time_ms: number;
   modes: Partial<Record<StudyMode, LibraryStatsModePoint>>;
 }
@@ -131,9 +151,12 @@ export interface LibraryStatsPoint {
 export interface LibraryStatsModePoint {
   attempts: number;
   seen_entry_count: number;
+  learning_day_count: number;
   base_accuracy: number | null;
   pitch_accuracy: number | null;
+  joint_accuracy: number | null;
   median_recall_latency_ms: number | null;
+  median_typing_duration_ms: number | null;
   study_time_ms: number;
 }
 
