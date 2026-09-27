@@ -788,6 +788,37 @@ def reading_from_openjtalk(text: str) -> tuple[str | None, str | None]:
         return None, None
 
 
+def openjtalk_pitch_contour(text: str, expected_morae: list[str]) -> tuple[list[int] | None, str | None]:
+    """Return one OpenJTalk accent phrase as TANREN L/H levels.
+
+    OpenJTalk's full-context F field exposes the mora count and phrase accent
+    nucleus. Phrase-final heiban/odaka collapse to the same within-entry L/H
+    contour, which is exactly the representation TANREN grades.
+    """
+    if not expected_morae:
+        return None, None
+    try:
+        pyopenjtalk = import_pyopenjtalk()
+        labels = pyopenjtalk.make_label(pyopenjtalk.run_frontend(text))
+        version = getattr(pyopenjtalk, "__version__", None)
+    except Exception:
+        return None, None
+
+    phrases: set[tuple[int, int]] = set()
+    for label in labels:
+        match = re.search(r"/F:(\d+)_(\d+)#", label)
+        if match:
+            phrases.add((int(match.group(1)), int(match.group(2))))
+    if len(phrases) != 1:
+        return None, version
+
+    mora_count, nucleus = next(iter(phrases))
+    if mora_count != len(expected_morae) or not 1 <= nucleus <= mora_count:
+        return None, version
+    accent_type = 0 if nucleus == mora_count else nucleus
+    return accent_contour(mora_count, accent_type), version
+
+
 def load_kanjium_accents(path: str | None) -> dict[tuple[str, str], list[int]]:
     global _KANJIUM_ACCENTS, _KANJIUM_BY_READING, _KANJIUM_ACCENTS_PATH
     normalized_path = os.path.abspath(path) if path else None
@@ -1531,6 +1562,7 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
     audio_dir = req.get("audio_dir")
     voicevox_url = req.get("voicevox_url")
     open_pitch_source = None
+    openjtalk_pitch_version = None
     voicevox_fallback_version = None
     voicevox_pitch_source = None
     if not patterns and reading:
@@ -1542,6 +1574,12 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
             req.get("wiktionary_pitch_path"),
         )
         patterns = accent_contours(len(mora_list), accent_types)
+    if not patterns and reading and scope == "phrase":
+        openjtalk_contour, openjtalk_pitch_version = openjtalk_pitch_contour(text, mora_list)
+        if openjtalk_contour is not None:
+            patterns = [openjtalk_contour]
+        else:
+            openjtalk_pitch_version = None
     if not patterns and voicevox_url and scope == "lexical" and reading:
         native_accent, voicevox_fallback_version = voicevox_native_accent_type(
             str(voicevox_url),
@@ -1568,6 +1606,11 @@ def analyze_request(req: dict[str, Any]) -> dict[str, Any]:
             source = open_pitch_source
             confidence = "VERIFIED"
             model_version = None
+        elif openjtalk_pitch_version:
+            provider = f"pyopenjtalk-{openjtalk_pitch_version}"
+            source = "OpenJTalk single accent phrase"
+            confidence = "PREDICTED"
+            model_version = openjtalk_pitch_version
         elif voicevox_pitch_source:
             provider = f"voicevox-{voicevox_fallback_version or 'unknown'}"
             source = voicevox_pitch_source

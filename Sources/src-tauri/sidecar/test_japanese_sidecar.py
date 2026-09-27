@@ -88,6 +88,35 @@ class MoraFixtures(unittest.TestCase):
 
 
 class ScopeAndCacheFixtures(unittest.TestCase):
+    def test_openjtalk_single_accent_phrase_recovers_osake_contour(self):
+        contour, version = jp.openjtalk_pitch_contour("お酒", ["お", "さ", "け"])
+        self.assertEqual(contour, [0, 1, 1])
+        self.assertIsNotNone(version)
+
+        phrase_contour, _ = jp.openjtalk_pitch_contour("水を飲む", ["み", "ず", "を", "の", "む"])
+        self.assertIsNone(phrase_contour)
+
+    def test_multitoken_single_accent_phrase_uses_openjtalk_before_voicevox(self):
+        tokens = [
+            {"surface": "お", "lemma": "御", "reading": "オ", "pronunciation": "オ"},
+            {"surface": "酒", "lemma": "酒", "reading": "サケ", "pronunciation": "サケ"},
+        ]
+        with patch.object(jp, "token_data", return_value=(tokens, None, "unidic-test")), \
+             patch.object(jp, "openjtalk_pitch_contour", return_value=([0, 1, 1], "openjtalk-test")), \
+             patch.object(jp, "voicevox_pitch_contour", return_value=([1, 0, 0], "voicevox-test")) as voicevox:
+            result = jp.analyze_request({
+                "text": "お酒",
+                "reading_hint": "おさけ",
+                "voicevox_url": "http://voicevox",
+            })
+
+        self.assertEqual(result["scope"], "phrase")
+        self.assertEqual(result["pitch_patterns"], [[0, 1, 1]])
+        self.assertEqual(result["provider"], "pyopenjtalk-openjtalk-test")
+        self.assertEqual(result["source"], "OpenJTalk single accent phrase")
+        self.assertEqual(result["confidence"], "PREDICTED")
+        voicevox.assert_not_called()
+
     def test_masked_context_accepts_multi_token_compound_reading(self):
         with patch.object(jp, "token_data", return_value=([
             {"surface": "看護", "lemma": "看護", "reading": "カンゴ"},
@@ -330,6 +359,7 @@ class ScopeAndCacheFixtures(unittest.TestCase):
                 tokens = [{"reading": None, "pronunciation": None} for _ in range(token_count)]
                 audio = [{"path": "voice.wav", "provider": "voicevox-test"}]
                 with patch.object(jp, "token_data", return_value=(tokens, None, "unidic-test")), \
+                     patch.object(jp, "openjtalk_pitch_contour", return_value=(None, "openjtalk-test")), \
                      patch.object(jp, "voicevox_pitch_contour", return_value=(contour, "test-version")), \
                      patch.object(jp, "generate_voicevox_assets", return_value=audio) as generate:
                     result = jp.analyze_request({

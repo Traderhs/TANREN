@@ -21,7 +21,7 @@ const KANJIUM_ACCENTS: &[u8] = include_bytes!("../resources/kanjium_accents.txt"
 const WIKTIONARY_PITCH_ACCENT: &[u8] = include_bytes!("../resources/wiktionary_pitch_accent.json");
 const PITCH_DATA_NOTICE: &[u8] = include_bytes!("../resources/PITCH_DATA_NOTICE.txt");
 pub const VOICE_AUDIO_REVISION: &str = "v8";
-pub const PITCH_DATA_REVISION: &str = "kanjium-8bd0dd12+wiktionary-4cec453a-v1";
+pub const PITCH_DATA_REVISION: &str = "kanjium-8bd0dd12+wiktionary-4cec453a+openjtalk-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JapaneseEnrichment {
