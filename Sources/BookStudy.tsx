@@ -1224,6 +1224,13 @@ export function BookStudy({
                   timing.current.last = currentNow;
                 }}
                 onKeyDown={(event) => {
+                  if (!japanese && event.key !== "Enter" && (event.nativeEvent.isComposing || composing.current || event.keyCode === 229)) {
+                    const currentNow = performance.now();
+                    const currentTiming = timing.current;
+                    currentTiming.first ??= currentNow;
+                    if (currentTiming.last !== null) currentTiming.gaps.push(Math.round(currentNow - currentTiming.last));
+                    currentTiming.last = currentNow;
+                  }
                   if (japanese && active) {
                     const listeningTab = card?.mode === "listening" && event.key === "Tab";
                     if (!imeReady) {
@@ -1324,6 +1331,13 @@ export function BookStudy({
                   timing.current.last = currentNow;
                 }}
                 onKeyDown={(event) => {
+                  if (event.key !== "Enter" && (event.nativeEvent.isComposing || meaningComposing.current || event.keyCode === 229)) {
+                    const currentNow = performance.now();
+                    const currentTiming = timing.current;
+                    currentTiming.first ??= currentNow;
+                    if (currentTiming.last !== null) currentTiming.gaps.push(Math.round(currentNow - currentTiming.last));
+                    currentTiming.last = currentNow;
+                  }
                   if (event.key !== "Enter") return;
                   if (event.nativeEvent.isComposing || meaningComposing.current || event.keyCode === 229) {
                     event.preventDefault();
