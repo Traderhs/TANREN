@@ -1174,6 +1174,9 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const skipDeleteConfirmDeckIdsRef = useRef(new Set<string>());
   const flutterTimerRef = useRef<number | null>(null);
   const studyFlutterTimerRef = useRef<number | null>(null);
+  // react-pageflip can retain same-length page children (and their click closures).
+  // Keep the study-entry gate mutable so retained stage-card handlers see current state.
+  const bookStudyBusyRef = useRef(false);
   const flutteringRef = useRef(false);
   const activeBookSessionRef = useRef("");
   const flutterRetryRef = useRef(0);
@@ -1415,7 +1418,18 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     studyFlutterTimerRef.current = null;
   };
 
+  const finishBookStudyExit = useCallback(() => {
+    bookStudyBusyRef.current = false;
+    setBookStudyActive(false);
+    setBookStudyExiting(false);
+    setBookStudyTransitioning(false);
+    setStudyResult(null);
+    setCompletionReplay(null);
+    setBookStudyNavigationLocked(false);
+  }, []);
+
   const showBookStudy = () => {
+    bookStudyBusyRef.current = true;
     setEditedStudyEntry(null);
     clearStudyFlutterTimer();
     setBookStudyExiting(false);
@@ -1448,7 +1462,8 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   };
 
   const startBookStudy = useCallback(async (stage: number) => {
-    if (!openedDeck || bookStudyTransitioning || bookStudyActive || bookClosingRef.current) return;
+    if (!openedDeck || bookStudyBusyRef.current || bookClosingRef.current) return;
+    bookStudyBusyRef.current = true;
     setCompletionReplay(null);
     setBookStudyExiting(false);
     setBookStudyNavigationLocked(true);
@@ -1464,14 +1479,16 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       }
       scheduleStudyFlutter(bookSessionKey, 8);
     } catch (error) {
+      bookStudyBusyRef.current = false;
       setBookStudyNavigationLocked(false);
       setBookStudyTransitioning(false);
       setEntryMessage(String(error));
     }
-  }, [openedDeck, bookStudyTransitioning, bookStudyActive, onRequestHomeSection, reduceMotion, bookSessionKey, audioSettings.effect_volume]);
+  }, [openedDeck, onRequestHomeSection, reduceMotion, bookSessionKey, audioSettings.effect_volume]);
 
   const openStageCompletion = useCallback(async (stage: number, clearIndex: number, entryCount: number) => {
-    if (!openedDeck || bookStudyTransitioning || bookStudyActive || bookClosingRef.current) return;
+    if (!openedDeck || bookStudyBusyRef.current || bookClosingRef.current) return;
+    bookStudyBusyRef.current = true;
     setBookStudyExiting(false);
     setBookStudyNavigationLocked(true);
     onRequestHomeSection(0);
@@ -1488,11 +1505,12 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       }
       scheduleStudyFlutter(bookSessionKey, 8);
     } catch (error) {
+      bookStudyBusyRef.current = false;
       setBookStudyNavigationLocked(false);
       setBookStudyTransitioning(false);
       setEntryMessage(String(error));
     }
-  }, [openedDeck, bookStudyTransitioning, bookStudyActive, onRequestHomeSection, reduceMotion, bookSessionKey, audioSettings.effect_volume]);
+  }, [openedDeck, onRequestHomeSection, reduceMotion, bookSessionKey, audioSettings.effect_volume]);
 
   const scheduleBookFlutter = (sessionKey: string, delayMs: number) => {
     clearFlutterTimer();
@@ -1550,6 +1568,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   };
 
   const finishClosingBook = () => {
+    bookStudyBusyRef.current = false;
     setBookStudyNavigationLocked(false);
     activeBookSessionRef.current = "";
     clearFlutterTimer();
@@ -2078,18 +2097,12 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                 setStudyEntryLoading(false);
               }
             }}
-            onExitFadeComplete={() => {
-              setBookStudyActive(false);
-              setBookStudyExiting(false);
-              setBookStudyTransitioning(false);
-              setStudyResult(null);
-              setCompletionReplay(null);
-              setBookStudyNavigationLocked(false);
-            }}
+            onExitFadeComplete={finishBookStudyExit}
             onExit={async () => {
             if (!completionReplay) await api.exitStudy();
             if (reduceMotion) {
               flipBookRef.current?.pageFlip?.().turnToPage(BOOK_CONTENT_PAGE);
+              bookStudyBusyRef.current = false;
               setBookStudyActive(false);
               setBookStudyExiting(false);
               setBookStudyTransitioning(false);
@@ -2276,6 +2289,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                   setBookStudyActive(false);
                   setBookStudyExiting(false);
                   setBookStudyTransitioning(false);
+                  bookStudyBusyRef.current = false;
                   bookClosingRef.current = false;
                   setBookClosing(false);
                   setBookPanel("study");
