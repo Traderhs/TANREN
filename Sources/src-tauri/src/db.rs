@@ -762,8 +762,12 @@ impl Database {
         let conn = self.conn()?;
         let mut fallback_count = None;
         let mut summaries = Vec::with_capacity(stages.len());
+        let active_stage = conn.query_row(
+            "SELECT stage FROM stage_states WHERE deck_id=?1 ORDER BY updated_at DESC,rowid DESC LIMIT 1",
+            [deck_id],
+            |row| row.get::<_, i64>(0),
+        ).optional().map_err(|e| e.to_string())?.map(|value| value as u32);
         let mut slots_query = conn.prepare("SELECT entry_slots_json FROM stage_schedules WHERE deck_id=?1 AND stage=?2").map_err(|e| e.to_string())?;
-        let mut active_query = conn.prepare("SELECT EXISTS(SELECT 1 FROM stage_states WHERE deck_id=?1 AND stage=?2)").map_err(|e| e.to_string())?;
         let mut clears_query = conn.prepare("SELECT duration_ms,cycle_count FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at,id").map_err(|e| e.to_string())?;
         for &stage in stages {
             let raw: Option<String> = slots_query.query_row(params![deck_id, stage as i64], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
@@ -779,7 +783,7 @@ impl Database {
                 },
             };
             let study_range = stage_study_range(slot_count, deck.increment_size, deck.checkpoint_size, stage).ok_or("존재하지 않는 단계예요")?;
-            let active = active_query.query_row(params![deck_id, stage as i64], |row| row.get(0)).map_err(|e| e.to_string())?;
+            let active = active_stage == Some(stage);
             let clears = clears_query.query_map(params![deck_id, stage as i64], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
                 .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
             let clear_times_ms: Vec<_> = clears.iter().map(|(duration, _)| (*duration).max(0) as u64).collect();
@@ -3119,6 +3123,51 @@ mod tests{
 
         db.select_stage(&deck.id, 7).unwrap();
         assert_eq!(db.list_decks().unwrap().remove(0).current_stage, 7);
+    }
+
+    #[test]
+    fn only_most_recent_stage_state_is_marked_active() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("active stage", "ko-KR", "ja-JP").unwrap();
+        let drafts = (1..=100).map(|index| EntryDraft {
+            term: format!("単語{index:03}"),
+            meanings: vec![format!("entry {index:03}")],
+            reading: Some("たんご".into()),
+        }).collect::<Vec<_>>();
+        db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
+
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO stage_states(deck_id,stage,state_json,updated_at,device_id) VALUES(?1,1,'{}','2026-01-01T00:00:00Z','test')",
+            [&deck.id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO stage_states(deck_id,stage,state_json,updated_at,device_id) VALUES(?1,2,'{}','2026-01-01T00:01:00Z','test')",
+            [&deck.id],
+        ).unwrap();
+        drop(conn);
+
+        let summaries = db.stage_schedule_summaries(&deck.id, &[1, 2]).unwrap();
+        assert!(!summaries[0].active);
+        assert!(summaries[1].active);
+
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE stage_states SET updated_at='2026-01-01T00:02:00Z' WHERE deck_id=?1 AND stage=1",
+            [&deck.id],
+        ).unwrap();
+        let state_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM stage_states WHERE deck_id=?1",
+            [&deck.id],
+            |row| row.get(0),
+        ).unwrap();
+        drop(conn);
+
+        let summaries = db.stage_schedule_summaries(&deck.id, &[1, 2]).unwrap();
+        assert!(summaries[0].active);
+        assert!(!summaries[1].active);
+        assert_eq!(state_count, 2);
     }
 
     #[test]
