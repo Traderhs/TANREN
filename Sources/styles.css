@@ -5350,11 +5350,19 @@ textarea:focus {
   line-height: 1.2;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  cursor: pointer;
+  transition: border-color .18s ease, background-color .18s ease, color .18s ease;
 }
 
 .book-stage-group.is-current-stage .book-stage-clear-time {
   border-color: rgba(216, 173, 92, .24);
   color: #d8ad5c;
+}
+
+.book-stage-group .book-stage-clear-time:hover {
+  border-color: rgba(216, 173, 92, .48);
+  background: rgba(216, 173, 92, .08);
+  color: #dfc183;
 }
 
 .book-stage-range-link {

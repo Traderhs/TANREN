@@ -108,6 +108,7 @@ export function BookStudy({
   initialResult,
   audioSettings,
   onExit,
+  completionReplay,
   exiting = false,
   onExitFadeComplete,
   onEditEntry,
@@ -120,6 +121,7 @@ export function BookStudy({
   initialResult: SubmitResult;
   audioSettings: AudioSettings;
   onExit: () => Promise<void>;
+  completionReplay?: { stage: number; total: number; stats: StageCompletionStats } | null;
   exiting?: boolean;
   onExitFadeComplete?: () => void;
   onEditEntry: (entryId: string) => Promise<void>;
@@ -150,7 +152,7 @@ export function BookStudy({
   const [submittedPitchQuestion, setSubmittedPitchQuestion] = useState<PitchQuestion | null>(null);
   const [submittedAnswerKnown, setSubmittedAnswerKnown] = useState(false);
   const [entryStats, setEntryStats] = useState<EntryListRecord | null>(null);
-  const [completionStats, setCompletionStats] = useState<StageCompletionStats | null>(null);
+  const [completionStats, setCompletionStats] = useState<StageCompletionStats | null>(completionReplay?.stats ?? null);
 
   const ime = useRef<JapaneseImeSession | null>(null);
   const input = useRef<HTMLInputElement>(null);
@@ -177,8 +179,8 @@ export function BookStudy({
     imeCompositionMs: 0,
   });
   const selection = useRef({ start: 0, end: 0 });
-  const lastTotal = useRef(initialResult.card?.total ?? 0);
-  const lastStage = useRef(initialResult.card?.stage ?? deck.current_stage);
+  const lastTotal = useRef(initialResult.card?.total ?? completionReplay?.total ?? 0);
+  const lastStage = useRef(initialResult.card?.stage ?? completionReplay?.stage ?? deck.current_stage);
   const timeoutSent = useRef(false);
   const locked = useRef(false);
   const composing = useRef(false);
@@ -187,7 +189,7 @@ export function BookStudy({
     initialResult.card?.mode !== "listening" || !initialResult.card?.audio_path,
   );
   const studyActivityStartedAt = useRef<number | null>(null);
-  const stageStudyDuration = useRef(initialResult.card?.active_duration_ms ?? 0);
+  const stageStudyDuration = useRef(initialResult.card?.active_duration_ms ?? completionReplay?.stats.study_time_ms ?? 0);
   const studyActivityMode = useRef(card?.mode ?? null);
   const pendingStudyActivity = useRef(new Map<StudyCard["mode"] | "all", number>());
   const timing = useRef({
@@ -238,12 +240,16 @@ export function BookStudy({
       setCompletionStats(null);
       return;
     }
+    if (completionReplay) {
+      setCompletionStats(completionReplay.stats);
+      return;
+    }
     let disposed = false;
     void api.stageStats(deck.id, lastStage.current).then((stats) => {
       if (!disposed) setCompletionStats(stats);
     }).catch(() => undefined);
     return () => { disposed = true; };
-  }, [complete, deck.id]);
+  }, [complete, deck.id, completionReplay]);
 
   useEffect(() => {
     if (!editedEntry || !cardRef.current) return;
@@ -1179,8 +1185,8 @@ export function BookStudy({
             <small>이번 단계를 끝내기까지 푼 횟수</small>
           </div>
           <div>
-            <span>회독</span>
-            <strong>{completionStats.cycle_count.toLocaleString("ko-KR")}회</strong>
+            <span>총 바퀴</span>
+            <strong>{completionStats.cycle_count.toLocaleString("ko-KR")}바퀴</strong>
             <small>이번 단계를 끝내기까지 돈 횟수</small>
           </div>
           <div>

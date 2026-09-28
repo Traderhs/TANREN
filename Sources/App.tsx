@@ -15,7 +15,7 @@ import { BookStudy } from "./BookStudy";
 import { loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import { playEffectSound, preloadBookEffectSounds } from "./lib/soundEffects";
 import type { SubmitResult } from "./lib/types";
-import type { AudioSettings, DeckSummary, EntryDetails, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
+import type { AudioSettings, DeckSummary, EntryDetails, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageCompletionStats, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
 
 type View = "decks" | "editor" | "settings";
 
@@ -1138,6 +1138,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
   const [bookEntries, setBookEntries] = useState<EntryRecord[]>([]);
   const [bookPanelLoading, setBookPanelLoading] = useState(false);
   const [stageSchedules, setStageSchedules] = useState<Record<number, StageScheduleSummary>>({});
+  const [completionReplay, setCompletionReplay] = useState<{ stage: number; total: number; stats: StageCompletionStats } | null>(null);
   const [bookStudyActive, setBookStudyActive] = useState(false);
   const [bookStudyExiting, setBookStudyExiting] = useState(false);
   const [studyResult, setStudyResult] = useState<SubmitResult | null>(null);
@@ -1402,6 +1403,8 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     return () => { disposed = true; };
   }, [openedDeck?.id, openedDeck?.entry_count, openedDeck?.current_stage, openedDeck?.total_stage_count, bookStudyActive]);
 
+  useEffect(() => setCompletionReplay(null), [openedDeckId]);
+
   const clearFlutterTimer = () => {
     if (flutterTimerRef.current !== null) window.clearTimeout(flutterTimerRef.current);
     flutterTimerRef.current = null;
@@ -1446,6 +1449,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
 
   const startBookStudy = useCallback(async (stage: number) => {
     if (!openedDeck || bookStudyTransitioning || bookStudyActive || bookClosingRef.current) return;
+    setCompletionReplay(null);
     setBookStudyExiting(false);
     setBookStudyNavigationLocked(true);
     onRequestHomeSection(0);
@@ -1453,6 +1457,30 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setEntryMessage("");
     try {
       setStudyResult(await api.startStudy(openedDeck.id, stage));
+      if (reduceMotion) {
+        flipBookRef.current?.pageFlip?.().turnToPage(BOOK_STUDY_PAGE);
+        showBookStudy();
+        return;
+      }
+      scheduleStudyFlutter(bookSessionKey, 8);
+    } catch (error) {
+      setBookStudyNavigationLocked(false);
+      setBookStudyTransitioning(false);
+      setEntryMessage(String(error));
+    }
+  }, [openedDeck, bookStudyTransitioning, bookStudyActive, onRequestHomeSection, reduceMotion, bookSessionKey, audioSettings.effect_volume]);
+
+  const openStageCompletion = useCallback(async (stage: number, clearIndex: number, entryCount: number) => {
+    if (!openedDeck || bookStudyTransitioning || bookStudyActive || bookClosingRef.current) return;
+    setBookStudyExiting(false);
+    setBookStudyNavigationLocked(true);
+    onRequestHomeSection(0);
+    setBookStudyTransitioning(true);
+    setEntryMessage("");
+    try {
+      const stats = await api.stageStatsAt(openedDeck.id, stage, clearIndex);
+      setCompletionReplay({ stage, total: entryCount, stats });
+      setStudyResult({ status: "stage_complete" });
       if (reduceMotion) {
         flipBookRef.current?.pageFlip?.().turnToPage(BOOK_STUDY_PAGE);
         showBookStudy();
@@ -1833,7 +1861,15 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       <button
         type="button"
         className="ghost book-stage-card"
-        onClick={() => void startBookStudy(stage)}
+        onClick={(event) => {
+          const clearTime = (event.target as HTMLElement).closest<HTMLElement>(".book-stage-clear-time");
+          const clearIndex = clearTime?.dataset.clearIndex;
+          if (clearIndex !== undefined) {
+            void openStageCompletion(stage, Number(clearIndex), entryCount);
+            return;
+          }
+          void startBookStudy(stage);
+        }}
       >
         <strong className={`book-stage-title ${range?.cumulative ? "is-cumulative" : ""}`}>
           {range?.cumulative && <small>총복습</small>}
@@ -1852,7 +1888,12 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             </>}
           </span>
           {schedule?.clear_times_ms.length ? <span className="book-stage-clear-times" aria-label={`${stage}단계 클리어 기록`}>
-            {schedule.clear_times_ms.map((durationMs, clearIndex) => <span className="book-stage-clear-time" key={`${stage}-${clearIndex}-${durationMs}`}>
+            {schedule.clear_times_ms.map((durationMs, clearIndex) => <span
+              className="book-stage-clear-time"
+              data-clear-index={clearIndex}
+              title="완료 기록 보기"
+              key={`${stage}-${clearIndex}-${durationMs}`}
+            >
               {clearIndex + 1}회독 {schedule.clear_cycles[clearIndex]}바퀴 {formatStudyTime(durationMs)}
             </span>)}
           </span> : null}
@@ -1861,7 +1902,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       </button>
     </div>;
   }) : null,
-    [openedDeck, stageSchedules, startBookStudy]);
+    [openedDeck, stageSchedules, startBookStudy, openStageCompletion]);
 
   return <section className={`content home-content ${bookLayoutOpen ? "is-book-open" : ""}`}>
     <AnimatePresence
@@ -2023,6 +2064,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             deck={openedDeck}
             initialResult={studyResult}
             audioSettings={audioSettings}
+            completionReplay={completionReplay}
             exiting={bookStudyExiting}
             entryEditing={Boolean(entryDialog) || entrySaving || studyEntryLoading}
             editedEntry={editedStudyEntry}
@@ -2041,16 +2083,18 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
               setBookStudyExiting(false);
               setBookStudyTransitioning(false);
               setStudyResult(null);
+              setCompletionReplay(null);
               setBookStudyNavigationLocked(false);
             }}
             onExit={async () => {
-            await api.exitStudy();
+            if (!completionReplay) await api.exitStudy();
             if (reduceMotion) {
               flipBookRef.current?.pageFlip?.().turnToPage(BOOK_CONTENT_PAGE);
               setBookStudyActive(false);
               setBookStudyExiting(false);
               setBookStudyTransitioning(false);
               setStudyResult(null);
+              setCompletionReplay(null);
               setBookStudyNavigationLocked(false);
             } else {
               // Put the expression/stage spread underneath first, then simply
