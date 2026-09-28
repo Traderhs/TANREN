@@ -136,7 +136,7 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
       connection.init({
         wasmJs: assetUrl(HECHIMA_WASM_JS),
         dataUrl: assetUrl(HECHIMA_WASM),
-        learning: false,
+        learning: true,
         scope: "tanren",
       }),
       workerFailure,
