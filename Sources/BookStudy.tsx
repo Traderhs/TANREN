@@ -1409,7 +1409,7 @@ export function BookStudy({
           </form>
         </>}
 
-        {cycleComplete && <div className="learning-complete" aria-live="polite">
+        {cycleComplete && <div className="learning-complete learning-cycle-complete" aria-live="polite">
           <span className="learning-complete-mark">↻</span>
           <h1>{result.message}</h1>
           <p>남은 {(card?.remaining ?? 0).toLocaleString("ko-KR")}개를 다시 풀어요</p>

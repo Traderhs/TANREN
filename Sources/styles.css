@@ -6467,6 +6467,10 @@ textarea:focus {
 .learning-complete-mark { flex: 0 0 auto; display: grid; place-items: center; width: 64px; height: 64px; border-radius: 50%; border: 1px solid #71603e; color: #dbc28f; font-size: 28px; line-height: 1; }
 .learning-complete h1 { margin: 5px 0 0; font-size: clamp(28px, 3vw, 38px); font-weight: 550; letter-spacing: -.02em; }
 .learning-complete p { margin: 7px 0 0; color: #898f85; font-size: 13px; }
+.learning-cycle-complete { width: auto; align-self: auto; margin: 0; align-items: center; gap: 20px; text-align: center; }
+.learning-cycle-complete .learning-complete-mark { flex: initial; line-height: normal; }
+.learning-cycle-complete h1 { margin: 0; font-size: 32px; letter-spacing: normal; }
+.learning-cycle-complete p { margin: 0 0 12px; color: #999f93; font-size: inherit; }
 .learning-complete .learning-eyebrow { font-size: 14px; }
 .learning-complete-insights { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 30px 0 28px; border-bottom: 1px solid #31352f; }
 .learning-complete-insights>div { min-width: 0; width: max-content; max-width: 100%; justify-self: center; display: grid; justify-items: start; gap: 7px; text-align: left; }
