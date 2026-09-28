@@ -8,6 +8,7 @@ export const api = {
   stageSchedules: (deckId: string, stages: number[]) => invoke<StageScheduleSummary[]>("stage_schedules", { deckId, stages }),
   stageSchedule: (deckId: string, stage: number) => invoke<StageScheduleSummary>("stage_schedule", { deckId, stage }),
   stageStats: (deckId: string, stage: number) => invoke<StageCompletionStats>("stage_stats", { deckId, stage }),
+  stageStatsAt: (deckId: string, stage: number, clearIndex: number) => invoke<StageCompletionStats>("stage_stats_at", { deckId, stage, clearIndex }),
   createDeck: (name: string) =>
     invoke<DeckSummary>("create_deck", {
       name,

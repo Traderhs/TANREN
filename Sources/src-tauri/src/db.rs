@@ -602,9 +602,17 @@ impl Database {
     }
 
     pub fn stage_completion_stats(&self, deck_id: &str, stage: u32) -> Result<StageCompletionStats, String> {
+        self.stage_completion_stats_for_clear(deck_id, stage, None)
+    }
+
+    pub fn stage_completion_stats_at(&self, deck_id: &str, stage: u32, clear_index: usize) -> Result<StageCompletionStats, String> {
+        self.stage_completion_stats_for_clear(deck_id, stage, Some(clear_index))
+    }
+
+    fn stage_completion_stats_for_clear(&self, deck_id: &str, stage: u32, clear_index: Option<usize>) -> Result<StageCompletionStats, String> {
         let conn = self.conn()?;
         let mut completion_stmt = conn.prepare(
-            "SELECT completed_at,duration_ms,cycle_count FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at DESC,id DESC LIMIT 2",
+            "SELECT completed_at,duration_ms,cycle_count FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at,id",
         ).map_err(|e| e.to_string())?;
         let completions = completion_stmt.query_map(params![deck_id, stage as i64], |row| Ok((
             row.get::<_, String>(0)?,
@@ -613,9 +621,18 @@ impl Database {
         ))).map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        let latest_completion_at = completions.first().map(|value| value.0.as_str());
-        let previous_completion_at = completions.get(1).map(|value| value.0.as_str());
-        let (study_time_ms, cycle_count) = completions.first()
+        let selected_index = match clear_index {
+            Some(index) if index >= completions.len() => return Err("완료 기록이 없어요".into()),
+            Some(index) => Some(index),
+            None => completions.len().checked_sub(1),
+        };
+        let selected_completion = selected_index.and_then(|index| completions.get(index));
+        let latest_completion_at = selected_completion.map(|value| value.0.as_str());
+        let previous_completion_at = selected_index
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| completions.get(index))
+            .map(|value| value.0.as_str());
+        let (study_time_ms, cycle_count) = selected_completion
             .map(|value| (value.1, value.2))
             .unwrap_or((0, 0));
 
@@ -3180,6 +3197,12 @@ mod tests{
         db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 2, "0~0", "고양", false, Some(false), false, "completion_timeout", None, 900, 180, Some("COMPLETION_TIMEOUT")).unwrap();
         db.insert_attempt(&entry.id, &deck.id, StudyMode::Reading, 3, "0~0", "고양이", true, Some(true), true, "exact", None, 100, 100, None).unwrap();
         db.mark_stage_completed(&deck.id, 2, 65_000, 3).unwrap();
+
+        let first_stats = db.stage_completion_stats_at(&deck.id, 2, 0).unwrap();
+        assert_eq!(first_stats.attempts, 1);
+        assert_eq!(first_stats.base_accuracy, Some(1.0));
+        assert_eq!(first_stats.study_time_ms, 20_000);
+        assert_eq!(first_stats.cycle_count, 1);
 
         let stats = db.stage_completion_stats(&deck.id, 2).unwrap();
         assert_eq!(stats.stage, 2);

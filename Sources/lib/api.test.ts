@@ -28,6 +28,12 @@ describe("study command payloads", () => {
     expect(invoke).toHaveBeenCalledWith("stage_stats", { deckId: "deck", stage: 3 });
   });
 
+  it("loads a specific historical stage completion", async () => {
+    invoke.mockResolvedValue({ stage: 3, attempts: 8 });
+    await api.stageStatsAt("deck", 3, 1);
+    expect(invoke).toHaveBeenCalledWith("stage_stats_at", { deckId: "deck", stage: 3, clearIndex: 1 });
+  });
+
   it("submits listening form and meaning together", async () => {
     invoke.mockResolvedValue({ status: "review" });
     await api.submitAnswer("entry:listening", "答", "뜻", 800, 1200, [120, 90], 200, 900, [140, 110], 150);

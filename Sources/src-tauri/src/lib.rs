@@ -826,6 +826,11 @@ async fn stage_stats(state: State<'_, AppState>, deck_id: String, stage: u32) ->
 }
 
 #[tauri::command]
+async fn stage_stats_at(state: State<'_, AppState>, deck_id: String, stage: u32, clear_index: usize) -> Result<model::StageCompletionStats, String> {
+    state.db.stage_completion_stats_at(&deck_id, stage, clear_index)
+}
+
+#[tauri::command]
 fn semantic_status(state: State<'_, AppState>) -> SemanticRuntimeStatus {
     state.semantic.status()
 }
@@ -2043,6 +2048,7 @@ pub fn run() {
             continue_review,
             continue_cycle,
             stage_stats,
+            stage_stats_at,
             library_stats,
             semantic_status,
             voicevox_status,
