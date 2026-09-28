@@ -13,6 +13,10 @@ pub fn normalize_generic(input: &str) -> String {
         .to_lowercase()
 }
 
+fn normalize_meaning(input: &str) -> String {
+    normalize_generic(input).chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 pub fn normalize_japanese(input: &str) -> String {
     normalize_generic(input)
         .chars()
@@ -149,7 +153,7 @@ pub fn grade_reading_deterministic(
     accepted: &[String],
     rejected: &[String],
 ) -> Option<GradeOutcome> {
-    let norm = normalize_generic(answer);
+    let norm = normalize_meaning(answer);
     if exact_meanings_match_whitespace(entry, answer) {
         return Some(GradeOutcome { decision: GradeDecision::Pass, method: "exact_meanings", score: Some(1.0) });
     }
@@ -157,14 +161,14 @@ pub fn grade_reading_deterministic(
     if parts.len() != entry.meanings.len() {
         return Some(GradeOutcome { decision: GradeDecision::Fail, method: "meaning_count_mismatch", score: Some(0.0) });
     }
-    if accepted.iter().any(|v| normalize_generic(v) == norm) {
+    if accepted.iter().any(|v| normalize_meaning(v) == norm) {
         return Some(GradeOutcome { decision: GradeDecision::Pass, method: "accepted_alias", score: Some(1.0) });
     }
-    if rejected.iter().any(|v| normalize_generic(v) == norm) {
+    if rejected.iter().any(|v| normalize_meaning(v) == norm) {
         return Some(GradeOutcome { decision: GradeDecision::Fail, method: "rejected_alias", score: Some(0.0) });
     }
-    let mut expected: Vec<_> = entry.meanings.iter().map(|v| normalize_generic(v)).collect();
-    let mut actual: Vec<_> = parts.iter().map(|v| normalize_generic(v)).collect();
+    let mut expected: Vec<_> = entry.meanings.iter().map(|v| normalize_meaning(v)).collect();
+    let mut actual: Vec<_> = parts.iter().map(|v| normalize_meaning(v)).collect();
     expected.sort_unstable();
     actual.sort_unstable();
     if expected == actual {
@@ -174,27 +178,21 @@ pub fn grade_reading_deterministic(
 }
 
 fn exact_meanings_match_whitespace(entry: &EntryRecord, answer: &str) -> bool {
-    if entry.meanings.len() <= 1 {
+    if entry.meanings.is_empty() {
         return false;
     }
 
-    let normalized_answer = normalize_generic(answer);
-    let answer_tokens: Vec<_> = normalized_answer.split_whitespace().collect();
-    let meaning_tokens: Vec<Vec<String>> = entry.meanings.iter()
-        .map(|meaning| normalize_generic(meaning).split_whitespace().map(ToOwned::to_owned).collect())
-        .collect();
-    let mut used = vec![false; meaning_tokens.len()];
+    let normalized_answer = normalize_meaning(answer);
+    let meanings: Vec<_> = entry.meanings.iter().map(|meaning| normalize_meaning(meaning)).collect();
+    let mut used = vec![false; meanings.len()];
 
-    fn matches_from(answer: &[&str], meanings: &[Vec<String>], used: &mut [bool], offset: usize) -> bool {
+    fn matches_from(answer: &str, meanings: &[String], used: &mut [bool], offset: usize) -> bool {
         if offset == answer.len() {
             return used.iter().all(|value| *value);
         }
 
         for index in 0..meanings.len() {
-            if used[index] || meanings[index].is_empty() || offset + meanings[index].len() > answer.len() {
-                continue;
-            }
-            if !meanings[index].iter().enumerate().all(|(part, expected)| answer[offset + part] == expected) {
+            if used[index] || meanings[index].is_empty() || !answer[offset..].starts_with(&meanings[index]) {
                 continue;
             }
             used[index] = true;
@@ -206,7 +204,7 @@ fn exact_meanings_match_whitespace(entry: &EntryRecord, answer: &str) -> bool {
         false
     }
 
-    matches_from(&answer_tokens, &meaning_tokens, &mut used, 0)
+    matches_from(&normalized_answer, &meanings, &mut used, 0)
 }
 
 pub fn split_reading_answer(answer: &str, expected_count: usize) -> Vec<String> {
@@ -252,6 +250,7 @@ mod tests {
     fn exact_and_alias_grading() {
         assert_eq!(grade_reading_deterministic(&entry(), "내다보다", &[], &[]).unwrap().decision, GradeDecision::Pass);
         assert_eq!(grade_reading_deterministic(&entry(), "앞날을 내다보다", &["앞날을 내다보다".into()], &[]).unwrap().decision, GradeDecision::Pass);
+        assert_eq!(grade_reading_deterministic(&entry(), "앞날을내다보다", &["앞날을 내다보다".into()], &[]).unwrap().decision, GradeDecision::Pass);
         assert_eq!(grade_reading_deterministic(&entry(), "예상하다", &[], &["예상하다".into()]).unwrap().decision, GradeDecision::Fail);
     }
 
@@ -287,6 +286,24 @@ mod tests {
         );
         assert_eq!(
             grade_reading_deterministic(&value, "잘 되다 가다", &[], &[]).unwrap().decision,
+            GradeDecision::Pass,
+        );
+    }
+
+    #[test]
+    fn meaning_grading_ignores_spacing_inside_meanings() {
+        let mut value = entry();
+        value.term = "彼".into();
+        value.meanings = vec!["그".into(), "남자 친구".into()];
+        value.reading = Some("かれ".into());
+        assert_eq!(
+            grade_reading_deterministic(&value, "그 남자친구", &[], &[]).unwrap().decision,
+            GradeDecision::Pass,
+        );
+
+        value.meanings = vec!["남자 친구".into()];
+        assert_eq!(
+            grade_reading_deterministic(&value, "남자친구", &[], &[]).unwrap().decision,
             GradeDecision::Pass,
         );
     }
