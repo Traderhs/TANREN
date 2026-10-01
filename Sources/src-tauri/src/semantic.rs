@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::{
     db::Database,
-    grading::{grade_reading_deterministic, normalize_generic, split_reading_answer},
+    grading::{grade_reading_deterministic, meaning_core, normalize_generic, split_reading_answer},
     model::{EntryRecord, GradeDecision, GradeOutcome, MeaningGrade},
 };
 
@@ -215,7 +215,8 @@ impl SemanticGrader {
             return GradeOutcome { decision: GradeDecision::Fail, method: "semantic_degenerate", score: Some(0.0) };
         }
 
-        let positives = normalized_unique(entry.meanings.iter().chain(accepted.iter()));
+        let canonical_meanings = entry.meanings.iter().map(|value| meaning_core(value)).collect::<Vec<_>>();
+        let positives = normalized_unique(canonical_meanings.iter().chain(accepted.iter()));
         if positives.is_empty() {
             return GradeOutcome { decision: GradeDecision::Ambiguous, method: "semantic_no_positive", score: None };
         }
@@ -382,7 +383,8 @@ impl SemanticGrader {
             return (GradeOutcome { decision: GradeDecision::Fail, method: "semantic_degenerate", score: Some(0.0) }, Vec::new());
         }
 
-        let meanings = normalized_unique(entry.meanings.iter());
+        let canonical_meanings = entry.meanings.iter().map(|value| meaning_core(value)).collect::<Vec<_>>();
+        let meanings = normalized_unique(canonical_meanings.iter());
         if meanings.len() != entry.meanings.len() {
             return (GradeOutcome { decision: GradeDecision::Fail, method: "duplicate_canonical_meaning", score: Some(0.0) }, Vec::new());
         }

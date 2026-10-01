@@ -13,8 +13,27 @@ pub fn normalize_generic(input: &str) -> String {
         .to_lowercase()
 }
 
+pub(crate) fn meaning_core(input: &str) -> String {
+    let normalized = input.nfkc().collect::<String>();
+    let mut value = normalized.trim();
+
+    loop {
+        let Some(rest) = value.strip_prefix('(') else { break; };
+        let Some(close) = rest.find(')') else { break; };
+        let tail = rest[close + 1..].trim_start();
+        if tail.is_empty() { break; }
+        value = tail;
+    }
+
+    value.to_owned()
+}
+
 fn normalize_meaning(input: &str) -> String {
     normalize_generic(input).chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn normalize_canonical_meaning(input: &str) -> String {
+    normalize_meaning(&meaning_core(input))
 }
 
 pub fn normalize_japanese(input: &str) -> String {
@@ -167,7 +186,7 @@ pub fn grade_reading_deterministic(
     if rejected.iter().any(|v| normalize_meaning(v) == norm) {
         return Some(GradeOutcome { decision: GradeDecision::Fail, method: "rejected_alias", score: Some(0.0) });
     }
-    let mut expected: Vec<_> = entry.meanings.iter().map(|v| normalize_meaning(v)).collect();
+    let mut expected: Vec<_> = entry.meanings.iter().map(|v| normalize_canonical_meaning(v)).collect();
     let mut actual: Vec<_> = parts.iter().map(|v| normalize_meaning(v)).collect();
     expected.sort_unstable();
     actual.sort_unstable();
@@ -183,7 +202,7 @@ fn exact_meanings_match_whitespace(entry: &EntryRecord, answer: &str) -> bool {
     }
 
     let normalized_answer = normalize_meaning(answer);
-    let meanings: Vec<_> = entry.meanings.iter().map(|meaning| normalize_meaning(meaning)).collect();
+    let meanings: Vec<_> = entry.meanings.iter().map(|meaning| normalize_canonical_meaning(meaning)).collect();
     let mut used = vec![false; meanings.len()];
 
     fn matches_from(answer: &str, meanings: &[String], used: &mut [bool], offset: usize) -> bool {
@@ -287,6 +306,18 @@ mod tests {
         assert_eq!(
             grade_reading_deterministic(&value, "잘 되다 가다", &[], &[]).unwrap().decision,
             GradeDecision::Pass,
+        );
+    }
+
+    #[test]
+    fn leading_parenthetical_qualifier_is_not_required_in_meaning_answer() {
+        let mut value = entry();
+        value.term = "お兄さん".into();
+        value.meanings = vec!["(호칭) 형".into(), "오빠".into()];
+        value.reading = Some("おにいさん".into());
+        assert_eq!(
+            grade_reading_deterministic(&value, "형 오빠", &[], &[]).map(|outcome| outcome.decision),
+            Some(GradeDecision::Pass),
         );
     }
 
