@@ -1046,6 +1046,14 @@ export function BookStudy({
         ? meaningInput.current?.value ?? meaningAnswerRef.current
         : meaningAnswerRef.current
       : null;
+    if (isCompletionTimeoutSubmission) {
+      answerRef.current = submittedAnswer;
+      setAnswer(submittedAnswer);
+      if (isListening && submittedMeaningAnswer !== null) {
+        meaningAnswerRef.current = submittedMeaningAnswer;
+        setMeaningAnswer(submittedMeaningAnswer);
+      }
+    }
     void run(() => api.submitAnswer(
       card.variant_id,
       submittedAnswer,
