@@ -343,6 +343,7 @@ async fn submit_answer(
     meaning_typing_duration_ms: u64,
     meaning_interkey_gaps_ms: Vec<u64>,
     meaning_ime_composition_ms: u64,
+    completion_timeout_submit: bool,
 ) -> Result<SubmitResult, String> {
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let session = engine.session.as_mut().ok_or("진행 중인 학습이 없어요")?;
@@ -380,14 +381,14 @@ async fn submit_answer(
     let profile = state.db.typing_profile(&deck.id, &input_language, variant.mode)?;
     let max_gap = interkey_gaps_ms.iter().copied().max().unwrap_or(0);
     let expected_input_chars = expected_answer_chars(&entry, variant.mode);
-    if profile.completion_timed_out(max_gap, typing_duration_ms, expected_input_chars) {
+    if !completion_timeout_submit && profile.completion_timed_out(max_gap, typing_duration_ms, expected_input_chars) {
         let feedback = is_listening.then(|| listening_feedback_for_answers(&state, &deck, &entry, &answer, &meaning_answer)).transpose()?;
         return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None, feedback);
     }
     if is_listening {
         let meaning_profile = state.db.typing_profile(&deck.id, &deck.source_language, variant.mode)?;
         let meaning_max_gap = meaning_interkey_gaps_ms.iter().copied().max().unwrap_or(0);
-        if meaning_profile.completion_timed_out(meaning_max_gap, meaning_typing_duration_ms, expected_meaning_chars(&entry)) {
+        if !completion_timeout_submit && meaning_profile.completion_timed_out(meaning_max_gap, meaning_typing_duration_ms, expected_meaning_chars(&entry)) {
             let feedback = Some(listening_feedback_for_answers(&state, &deck, &entry, &answer, &meaning_answer)?);
             return fail_base(&state.db, &mut engine, variant, &entry, stored_answer, recall_latency_ms, attempt_typing_duration_ms, "completion_timeout", FailureType::CompletionTimeout, None, None, feedback);
         }
@@ -482,7 +483,7 @@ async fn submit_answer(
             })
         }
         GradeDecision::Pass => {
-            if is_listening {
+            if !completion_timeout_submit && is_listening {
                 record_successful_typing_for_language(
                     &state.db, &deck.id, &deck.target_language, variant.mode, &answer,
                     &interkey_gaps_ms, typing_duration_ms, ime_composition_ms,
@@ -491,7 +492,7 @@ async fn submit_answer(
                     &state.db, &deck.id, &deck.source_language, variant.mode, &meaning_answer,
                     &meaning_interkey_gaps_ms, meaning_typing_duration_ms, meaning_ime_composition_ms,
                 )?;
-            } else {
+            } else if !completion_timeout_submit {
                 record_successful_typing(&state.db, &deck, &variant, &stored_answer, &interkey_gaps_ms, typing_duration_ms, ime_composition_ms)?;
             }
             let pitch = state.db.pitch_question(&entry.id, deck.pitch_policy == "include_predicted")?;

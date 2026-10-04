@@ -44,9 +44,10 @@ export const api = {
     meaningTypingDurationMs: number,
     meaningInterkeyGapsMs: number[],
     meaningImeCompositionMs: number,
+    completionTimeoutSubmit = false,
   ) => invoke<SubmitResult>("submit_answer", {
     variantId, answer, meaningAnswer, recallLatencyMs, typingDurationMs, interkeyGapsMs, imeCompositionMs,
-    meaningTypingDurationMs, meaningInterkeyGapsMs, meaningImeCompositionMs,
+    meaningTypingDurationMs, meaningInterkeyGapsMs, meaningImeCompositionMs, completionTimeoutSubmit,
   }),
   timeoutCurrent: (variantId: string, kind: "recall" | "completion", answer: string, meaningAnswer: string | null, elapsedMs: number, typingDurationMs: number) =>
     invoke<SubmitResult>("timeout_current", { variantId, kind, answer, meaningAnswer, elapsedMs, typingDurationMs }),

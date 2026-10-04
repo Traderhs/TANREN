@@ -41,7 +41,18 @@ describe("study command payloads", () => {
       variantId: "entry:listening", answer: "答", meaningAnswer: "뜻", recallLatencyMs: 800,
       typingDurationMs: 1200, interkeyGapsMs: [120, 90], imeCompositionMs: 200,
       meaningTypingDurationMs: 900, meaningInterkeyGapsMs: [140, 110], meaningImeCompositionMs: 150,
+      completionTimeoutSubmit: false,
     });
+  });
+
+  it("marks an automatic completion-timeout submission for normal grading", async () => {
+    invoke.mockResolvedValue({ status: "review" });
+    await api.submitAnswer("entry:writing", "答", null, 800, 3200, [120, 90], 0, 0, [], 0, true);
+    expect(invoke).toHaveBeenCalledWith("submit_answer", expect.objectContaining({
+      variantId: "entry:writing",
+      answer: "答",
+      completionTimeoutSubmit: true,
+    }));
   });
 
   it("activates the answer language after the study input is focused", async () => {

@@ -182,6 +182,8 @@ export function BookStudy({
   const lastTotal = useRef(initialResult.card?.total ?? completionReplay?.total ?? 0);
   const lastStage = useRef(initialResult.card?.stage ?? completionReplay?.stage ?? deck.current_stage);
   const timeoutSent = useRef(false);
+  const completionTimeoutSubmission = useRef(false);
+  const submitAnswerRef = useRef<(completionTimeoutSubmit?: boolean) => boolean>(() => false);
   const locked = useRef(false);
   const composing = useRef(false);
   const meaningComposing = useRef(false);
@@ -401,6 +403,7 @@ export function BookStudy({
     lastTotal.current = nextCard.total;
     lastStage.current = nextCard.stage;
     timeoutSent.current = false;
+    completionTimeoutSubmission.current = false;
     setAnswer("");
     answerRef.current = "";
     setMeaningAnswer("");
@@ -442,6 +445,7 @@ export function BookStudy({
     const currentCard = cardRef.current;
     if (!currentCard || currentCard.mode !== "listening" || listeningTimerStarted.current) return;
     listeningTimerStarted.current = true;
+    completionTimeoutSubmission.current = false;
     listeningPhaseRef.current = "form";
     setListeningPhase("form");
     listeningFormTiming.current = {
@@ -973,6 +977,18 @@ export function BookStudy({
       );
       const completion = idleCompletion || totalCompletion;
       if ((recall || completion) && !locked.current && !timeoutSent.current) {
+        if (completion && card.mode === "listening" && !meaningPhase) {
+          const visibleAnswer = input.current?.value ?? answerRef.current;
+          answerRef.current = visibleAnswer;
+          setAnswer(visibleAnswer);
+          completionTimeoutSubmission.current = true;
+          focusListeningMeaning();
+          return;
+        }
+        if (completion) {
+          if (submitAnswerRef.current(true)) timeoutSent.current = true;
+          return;
+        }
         timeoutSent.current = true;
         setSubmittedAnswerKnown(true);
         const currentTypingDuration = currentTiming.first === null ? 0 : Math.round(currentNow - currentTiming.first);
@@ -987,7 +1003,7 @@ export function BookStudy({
           : currentTiming.first === null ? 0 : Math.round(currentNow - currentTiming.first);
         void run(() => api.timeoutCurrent(
           card.variant_id,
-          recall ? "recall" : "completion",
+          "recall",
           answerRef.current,
           card.mode === "listening" ? meaningAnswerRef.current : null,
           storedRecallLatency,
@@ -998,11 +1014,12 @@ export function BookStudy({
     return () => window.clearInterval(interval);
   }, [active, card?.variant_id, card?.recall_timeout_ms, card?.completion_idle_ms, card?.completion_timeout_ms, card?.listening_meaning_completion_idle_ms, card?.listening_meaning_completion_timeout_ms, card?.mode, listeningAudioFinished, busy, error]);
 
-  function submitAnswer() {
-    if (!card || !active || locked.current || composing.current || meaningComposing.current || (japanese && !imeReady)) return;
+  function submitAnswer(completionTimeoutSubmit = false): boolean {
+    if (!card || !active || locked.current || (japanese && !imeReady)) return false;
+    if (!completionTimeoutSubmit && (composing.current || meaningComposing.current)) return false;
     if (card.mode === "listening" && listeningPhaseRef.current !== "meaning") {
       focusListeningMeaning();
-      return;
+      return true;
     }
     setSubmittedAnswerKnown(true);
     const currentTiming = timing.current;
@@ -1020,10 +1037,19 @@ export function BookStudy({
     const meaningTypingDurationMs = isListening
       ? Math.round(currentNow - (currentTiming.first ?? currentNow))
       : 0;
+    const isCompletionTimeoutSubmission = completionTimeoutSubmit || completionTimeoutSubmission.current;
+    const submittedAnswer = isCompletionTimeoutSubmission
+      ? input.current?.value ?? answerRef.current
+      : answerRef.current;
+    const submittedMeaningAnswer = isListening
+      ? isCompletionTimeoutSubmission
+        ? meaningInput.current?.value ?? meaningAnswerRef.current
+        : meaningAnswerRef.current
+      : null;
     void run(() => api.submitAnswer(
       card.variant_id,
-      answerRef.current,
-      isListening ? meaningAnswerRef.current : null,
+      submittedAnswer,
+      submittedMeaningAnswer,
       recallLatencyMs,
       typingDurationMs,
       interkeyGapsMs,
@@ -1031,8 +1057,11 @@ export function BookStudy({
       meaningTypingDurationMs,
       isListening ? currentTiming.gaps : [],
       isListening ? Math.round(currentTiming.compositionMs) : 0,
+      isCompletionTimeoutSubmission,
     ));
+    return true;
   }
+  submitAnswerRef.current = submitAnswer;
 
   function focusPitch(index: number, smooth = true) {
     if (!pitchQuestion) return;
