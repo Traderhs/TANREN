@@ -14,7 +14,7 @@ import {
   type PitchLevel,
   type PitchSelection,
 } from "./lib/studyFlow";
-import { completionDeadlineHasTimedOut, completionDeadlineMs, completionIdleDisplay, firstMeaningfulInputAt, isMeaningfulInput, totalCompletionHasTimedOut } from "./lib/studyTimers";
+import { completionDeadlineMs, completionHasTimedOut, completionIdleDisplay, firstMeaningfulInputAt, isMeaningfulInput } from "./lib/studyTimers";
 import { japaneseImeEnterCommitsYomi, japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { JapaneseImeSegment, JapaneseImeSession } from "./lib/japaneseIme";
 import { playEffectSound } from "./lib/soundEffects";
@@ -280,8 +280,6 @@ export function BookStudy({
   const completedCount = complete ? total : card ? Math.max(0, total - displayRemaining) : 0;
   const progress = complete ? 100 : total > 0 ? Math.max(0, Math.min(100, completedCount / total * 100)) : 0;
   const listeningMeaningPhase = card?.mode === "listening" && listeningPhase === "meaning";
-  const phaseAnswer = listeningMeaningPhase ? meaningAnswer : answer;
-  const phaseComposing = listeningMeaningPhase ? meaningComposing.current : composing.current;
   const completionIdleMs = listeningMeaningPhase
     ? card?.listening_meaning_completion_idle_ms
     : card?.completion_idle_ms;
@@ -293,18 +291,11 @@ export function BookStudy({
   const recallLeft = Math.max(0, (card?.recall_timeout_ms ?? 0) - (recalling ? elapsed : timing.current.first! - timing.current.start));
   const inputElapsed = recalling ? 0 : Math.max(0, now - timing.current.first!);
   const completionTimerEnabled = completionTimeoutMs != null || completionIdleMs != null;
-  const inputIdleDeadline = completionDeadlineMs(
-    completionIdleMs,
-    phaseComposing,
-    phaseAnswer,
-    timing.current.compositionEnd,
-    timing.current.last,
-  );
-  const inputIdleDisplay = !recalling
+  const inputIdleDisplay = !recalling && completionTimeoutMs == null
     ? completionIdleDisplay(
         completionIdleMs,
-        phaseComposing,
-        phaseAnswer,
+        listeningMeaningPhase ? meaningComposing.current : composing.current,
+        listeningMeaningPhase ? meaningAnswer : answer,
         timing.current.compositionEnd,
         timing.current.last,
         now,
@@ -315,9 +306,8 @@ export function BookStudy({
   const inputTotalLeft = !recalling && completionTimeoutMs != null
     ? Math.max(0, completionTimeoutMs - inputElapsed)
     : null;
-  const inputUsesTotal = inputTotalLeft !== null && (inputIdleLeft === null || inputTotalLeft <= inputIdleLeft);
-  const inputLeft = inputUsesTotal ? inputTotalLeft : inputIdleLeft;
-  const inputBarTotal = inputUsesTotal ? completionTimeoutMs : inputIdleBudget;
+  const inputLeft = inputTotalLeft ?? inputIdleLeft;
+  const inputBarTotal = completionTimeoutMs ?? inputIdleBudget;
   const inputBarPercent = !recalling && inputLeft !== null && inputBarTotal != null
     ? Math.max(0, Math.min(100, inputLeft / Math.max(1, inputBarTotal) * 100))
     : 0;
@@ -963,19 +953,19 @@ export function BookStudy({
       const currentTiming = timing.current;
       setElapsed(currentNow - currentTiming.start);
       const meaningPhase = card.mode === "listening" && listeningPhaseRef.current === "meaning";
-      const activityText = meaningPhase ? meaningAnswerRef.current : answerRef.current;
-      const activeComposing = meaningPhase ? meaningComposing.current : composing.current;
       const activeCompletionIdleMs = meaningPhase ? card.listening_meaning_completion_idle_ms : card.completion_idle_ms;
       const activeCompletionTimeoutMs = meaningPhase ? card.listening_meaning_completion_timeout_ms : card.completion_timeout_ms;
-      const idleDeadline = completionDeadlineMs(activeCompletionIdleMs, activeComposing, activityText, currentTiming.compositionEnd, currentTiming.last);
+      const idleDeadline = activeCompletionTimeoutMs == null
+        ? completionDeadlineMs(
+            activeCompletionIdleMs,
+            meaningPhase ? meaningComposing.current : composing.current,
+            meaningPhase ? meaningAnswerRef.current : answerRef.current,
+            currentTiming.compositionEnd,
+            currentTiming.last,
+          )
+        : null;
       const recall = currentTiming.first === null && currentNow - currentTiming.start >= card.recall_timeout_ms;
-      const idleCompletion = completionDeadlineHasTimedOut(idleDeadline, currentNow);
-      const totalCompletion = totalCompletionHasTimedOut(
-        currentTiming.first,
-        activeCompletionTimeoutMs,
-        currentNow,
-      );
-      const completion = idleCompletion || totalCompletion;
+      const completion = completionHasTimedOut(idleDeadline, currentTiming.first, activeCompletionTimeoutMs, currentNow);
       if ((recall || completion) && !locked.current && !timeoutSent.current) {
         if (completion && card.mode === "listening" && !meaningPhase) {
           const visibleAnswer = input.current?.value ?? answerRef.current;

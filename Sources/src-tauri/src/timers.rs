@@ -57,9 +57,9 @@ impl TypingProfileState {
         Some(typing_ms.saturating_add(idle_buffer))
     }
 
-    pub fn completion_timed_out(&self, max_idle_gap_ms: u64, typing_duration_ms: u64, expected_answer_chars: usize) -> bool {
-        self.allowed_idle_ms().is_some_and(|limit| max_idle_gap_ms > limit.saturating_add(Self::COMPLETION_SUBMIT_GRACE_MS))
-            || self.allowed_completion_ms(expected_answer_chars).is_some_and(|limit| typing_duration_ms > limit.saturating_add(Self::COMPLETION_SUBMIT_GRACE_MS))
+    pub fn completion_timed_out(&self, _max_idle_gap_ms: u64, typing_duration_ms: u64, expected_answer_chars: usize) -> bool {
+        self.allowed_completion_ms(expected_answer_chars)
+            .is_some_and(|limit| typing_duration_ms > limit.saturating_add(Self::COMPLETION_SUBMIT_GRACE_MS))
     }
 }
 
@@ -89,11 +89,11 @@ mod tests {
     }
 
     #[test]
-    fn mature_profile_detects_thinking_pause() {
+    fn mature_profile_does_not_replace_total_budget_with_idle_gap() {
         let mut profile = TypingProfileState::default();
         for _ in 0..320 { profile.observe(&[160, 220, 240, 190], 900, 0, 4); }
         assert!(!profile.completion_timed_out(600, 1_500, 4));
-        assert!(profile.completion_timed_out(5_500, 1_500, 4));
+        assert!(!profile.completion_timed_out(5_500, 1_500, 4));
     }
 
     #[test]
@@ -122,9 +122,9 @@ mod tests {
     fn completion_timeout_keeps_a_small_submit_grace() {
         let mut profile = TypingProfileState::default();
         for _ in 0..100 { profile.observe(&[200, 220], 1_000, 0, 4); }
-        let idle = profile.allowed_idle_ms().unwrap();
-        assert!(!profile.completion_timed_out(idle + TypingProfileState::COMPLETION_SUBMIT_GRACE_MS, 1_000, 4));
-        assert!(profile.completion_timed_out(idle + TypingProfileState::COMPLETION_SUBMIT_GRACE_MS + 1, 1_000, 4));
+        let total = profile.allowed_completion_ms(4).unwrap();
+        assert!(!profile.completion_timed_out(9_000, total + TypingProfileState::COMPLETION_SUBMIT_GRACE_MS, 4));
+        assert!(profile.completion_timed_out(0, total + TypingProfileState::COMPLETION_SUBMIT_GRACE_MS + 1, 4));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { COMPLETION_SUBMIT_GRACE_MS, completionDeadlineHasTimedOut, completionDeadlineMs, completionDelayMs, completionIdleDisplay, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut, totalCompletionHasTimedOut } from "./studyTimers";
+import { COMPLETION_SUBMIT_GRACE_MS, completionDeadlineHasTimedOut, completionDeadlineMs, completionDelayMs, completionHasTimedOut, completionIdleDisplay, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut, totalCompletionHasTimedOut } from "./studyTimers";
 
 describe("study timer semantics", () => {
   it("does not treat keydown or whitespace as meaningful recall input", () => {
@@ -57,5 +57,18 @@ describe("study timer semantics", () => {
     expect(completionDeadlineHasTimedOut(deadline, deadline + COMPLETION_SUBMIT_GRACE_MS)).toBe(true);
     expect(totalCompletionHasTimedOut(1_000, 2_000, 3_000 + COMPLETION_SUBMIT_GRACE_MS - 1)).toBe(false);
     expect(totalCompletionHasTimedOut(1_000, 2_000, 3_000 + COMPLETION_SUBMIT_GRACE_MS)).toBe(true);
+  });
+
+  it("still fires the total timeout when IME composition has no idle deadline", () => {
+    const totalDeadline = 1_000 + 2_000 + COMPLETION_SUBMIT_GRACE_MS;
+    expect(completionHasTimedOut(null, 1_000, 2_000, totalDeadline - 1)).toBe(false);
+    expect(completionHasTimedOut(null, 1_000, 2_000, totalDeadline)).toBe(true);
+  });
+
+  it("keeps one total deadline instead of switching to an earlier idle deadline", () => {
+    const idleDeadline = 2_000;
+    const totalDeadline = 1_000 + 5_000 + COMPLETION_SUBMIT_GRACE_MS;
+    expect(completionHasTimedOut(idleDeadline, 1_000, 5_000, idleDeadline + COMPLETION_SUBMIT_GRACE_MS)).toBe(false);
+    expect(completionHasTimedOut(idleDeadline, 1_000, 5_000, totalDeadline)).toBe(true);
   });
 });

@@ -71,3 +71,15 @@ export function totalCompletionHasTimedOut(
     && configuredTimeoutMs != null
     && now - firstInputAt >= configuredTimeoutMs + COMPLETION_SUBMIT_GRACE_MS;
 }
+
+export function completionHasTimedOut(
+  idleDeadlineMs: number | null,
+  firstInputAt: number | null,
+  configuredTimeoutMs: number | null | undefined,
+  now: number,
+): boolean {
+  if (configuredTimeoutMs != null) {
+    return totalCompletionHasTimedOut(firstInputAt, configuredTimeoutMs, now);
+  }
+  return completionDeadlineHasTimedOut(idleDeadlineMs, now);
+}
