@@ -1,4 +1,5 @@
 export const IME_COMPLETION_GRACE_MS = 800;
+export const COMPLETION_SUBMIT_GRACE_MS = 250;
 
 export function isMeaningfulInput(value: string): boolean {
   return value.trim().length > 0;
@@ -36,6 +37,31 @@ export function completionDeadlineMs(
   return delay === null ? null : lastInputAt + delay;
 }
 
+export function completionIdleDisplay(
+  configuredIdleMs: number | null | undefined,
+  composing: boolean,
+  partialAnswer: string,
+  compositionEndedAt: number | null,
+  lastInputAt: number | null,
+  now: number,
+): { leftMs: number; totalMs: number } | null {
+  if (!configuredIdleMs || !isMeaningfulInput(partialAnswer) || lastInputAt === null) return null;
+  if (composing) {
+    const totalMs = configuredIdleMs + IME_COMPLETION_GRACE_MS;
+    return { leftMs: totalMs, totalMs };
+  }
+  const deadline = completionDeadlineMs(configuredIdleMs, false, partialAnswer, compositionEndedAt, lastInputAt);
+  if (deadline === null) return null;
+  return {
+    leftMs: Math.max(0, deadline - now),
+    totalMs: Math.max(1, deadline - lastInputAt),
+  };
+}
+
+export function completionDeadlineHasTimedOut(deadlineMs: number | null, now: number): boolean {
+  return deadlineMs !== null && now >= deadlineMs + COMPLETION_SUBMIT_GRACE_MS;
+}
+
 export function totalCompletionHasTimedOut(
   firstInputAt: number | null,
   configuredTimeoutMs: number | null | undefined,
@@ -43,5 +69,5 @@ export function totalCompletionHasTimedOut(
 ): boolean {
   return firstInputAt !== null
     && configuredTimeoutMs != null
-    && now - firstInputAt >= configuredTimeoutMs;
+    && now - firstInputAt >= configuredTimeoutMs + COMPLETION_SUBMIT_GRACE_MS;
 }

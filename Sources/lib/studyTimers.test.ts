@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { completionDeadlineMs, completionDelayMs, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut, totalCompletionHasTimedOut } from "./studyTimers";
+import { COMPLETION_SUBMIT_GRACE_MS, completionDeadlineHasTimedOut, completionDeadlineMs, completionDelayMs, completionIdleDisplay, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut, totalCompletionHasTimedOut } from "./studyTimers";
 
 describe("study timer semantics", () => {
   it("does not treat keydown or whitespace as meaningful recall input", () => {
@@ -43,8 +43,19 @@ describe("study timer semantics", () => {
     expect(Math.max(0, deadline! - 2_800)).toBe(0);
   });
 
-  it("fires the hard completion timeout exactly at its deadline", () => {
-    expect(totalCompletionHasTimedOut(1_000, 2_000, 2_999)).toBe(false);
-    expect(totalCompletionHasTimedOut(1_000, 2_000, 3_000)).toBe(true);
+  it("keeps the IME idle bar stable while composition is active", () => {
+    expect(completionIdleDisplay(1_000, true, "한", 900, 1_000, 1_500)).toEqual({
+      leftMs: 1_000 + IME_COMPLETION_GRACE_MS,
+      totalMs: 1_000 + IME_COMPLETION_GRACE_MS,
+    });
+  });
+
+  it("gives a small hidden grace after the visible completion deadline", () => {
+    const deadline = 3_000;
+    expect(completionDeadlineHasTimedOut(deadline, deadline)).toBe(false);
+    expect(completionDeadlineHasTimedOut(deadline, deadline + COMPLETION_SUBMIT_GRACE_MS - 1)).toBe(false);
+    expect(completionDeadlineHasTimedOut(deadline, deadline + COMPLETION_SUBMIT_GRACE_MS)).toBe(true);
+    expect(totalCompletionHasTimedOut(1_000, 2_000, 3_000 + COMPLETION_SUBMIT_GRACE_MS - 1)).toBe(false);
+    expect(totalCompletionHasTimedOut(1_000, 2_000, 3_000 + COMPLETION_SUBMIT_GRACE_MS)).toBe(true);
   });
 });

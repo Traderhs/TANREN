@@ -14,7 +14,7 @@ import {
   type PitchLevel,
   type PitchSelection,
 } from "./lib/studyFlow";
-import { completionDeadlineMs, firstMeaningfulInputAt, isMeaningfulInput, totalCompletionHasTimedOut } from "./lib/studyTimers";
+import { completionDeadlineHasTimedOut, completionDeadlineMs, completionIdleDisplay, firstMeaningfulInputAt, isMeaningfulInput, totalCompletionHasTimedOut } from "./lib/studyTimers";
 import { japaneseImeEnterCommitsYomi, japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { JapaneseImeSegment, JapaneseImeSession } from "./lib/japaneseIme";
 import { playEffectSound } from "./lib/soundEffects";
@@ -298,12 +298,18 @@ export function BookStudy({
     timing.current.compositionEnd,
     timing.current.last,
   );
-  const inputIdleBudget = inputIdleDeadline !== null && timing.current.last !== null
-    ? inputIdleDeadline - timing.current.last
+  const inputIdleDisplay = !recalling
+    ? completionIdleDisplay(
+        completionIdleMs,
+        phaseComposing,
+        phaseAnswer,
+        timing.current.compositionEnd,
+        timing.current.last,
+        now,
+      )
     : null;
-  const inputIdleLeft = !recalling && inputIdleDeadline !== null
-    ? Math.max(0, inputIdleDeadline - now)
-    : null;
+  const inputIdleBudget = inputIdleDisplay?.totalMs ?? null;
+  const inputIdleLeft = inputIdleDisplay?.leftMs ?? null;
   const inputTotalLeft = !recalling && completionTimeoutMs != null
     ? Math.max(0, completionTimeoutMs - inputElapsed)
     : null;
@@ -959,7 +965,7 @@ export function BookStudy({
       const activeCompletionTimeoutMs = meaningPhase ? card.listening_meaning_completion_timeout_ms : card.completion_timeout_ms;
       const idleDeadline = completionDeadlineMs(activeCompletionIdleMs, activeComposing, activityText, currentTiming.compositionEnd, currentTiming.last);
       const recall = currentTiming.first === null && currentNow - currentTiming.start >= card.recall_timeout_ms;
-      const idleCompletion = idleDeadline !== null && currentNow >= idleDeadline;
+      const idleCompletion = completionDeadlineHasTimedOut(idleDeadline, currentNow);
       const totalCompletion = totalCompletionHasTimedOut(
         currentTiming.first,
         activeCompletionTimeoutMs,

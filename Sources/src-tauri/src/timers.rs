@@ -14,6 +14,8 @@ impl TypingProfileState {
     const MAX_VALID_INTERKEY_GAP_MS: u64 = 3_000;
     const MAX_VALID_COMPLETION_MS: u64 = 60_000;
     const MAX_VALID_IME_MS: u64 = 30_000;
+    const LEARNED_IDLE_BUFFER_MS: u64 = 2_000;
+    const COMPLETION_SUBMIT_GRACE_MS: u64 = 250;
 
     pub fn observe(&mut self, gaps: &[u64], completion_ms: u64, ime_ms: u64, answer_chars: usize) {
         if gaps.is_empty()
@@ -44,8 +46,7 @@ impl TypingProfileState {
     pub fn allowed_idle_ms(&self) -> Option<u64> {
         match self.sample_count {
             0..=99 => None,
-            100..=299 => Some(self.p95_gap().unwrap_or(700.0).max(700.0) as u64 + 2_000),
-            _ => Some(self.p95_gap().unwrap_or(500.0).max(350.0) as u64 + 850),
+            _ => Some(self.p95_gap().unwrap_or(700.0).max(700.0) as u64 + Self::LEARNED_IDLE_BUFFER_MS),
         }
     }
 
@@ -57,8 +58,8 @@ impl TypingProfileState {
     }
 
     pub fn completion_timed_out(&self, max_idle_gap_ms: u64, typing_duration_ms: u64, expected_answer_chars: usize) -> bool {
-        self.allowed_idle_ms().is_some_and(|limit| max_idle_gap_ms > limit)
-            || self.allowed_completion_ms(expected_answer_chars).is_some_and(|limit| typing_duration_ms > limit)
+        self.allowed_idle_ms().is_some_and(|limit| max_idle_gap_ms > limit.saturating_add(Self::COMPLETION_SUBMIT_GRACE_MS))
+            || self.allowed_completion_ms(expected_answer_chars).is_some_and(|limit| typing_duration_ms > limit.saturating_add(Self::COMPLETION_SUBMIT_GRACE_MS))
     }
 }
 
@@ -103,7 +104,27 @@ mod tests {
         let multiple_meanings = profile.allowed_completion_ms(12).unwrap();
         assert!(multiple_meanings > short);
         assert!(!profile.completion_timed_out(500, short, 12));
-        assert!(profile.completion_timed_out(500, multiple_meanings + 1, 12));
+        assert!(profile.completion_timed_out(500, multiple_meanings + TypingProfileState::COMPLETION_SUBMIT_GRACE_MS + 1, 12));
+    }
+
+    #[test]
+    fn learned_idle_buffer_does_not_shrink_after_more_samples() {
+        let mut warm = TypingProfileState::default();
+        for _ in 0..100 { warm.observe(&[180, 220, 240], 1_000, 0, 4); }
+        let first_limit = warm.allowed_idle_ms().unwrap();
+
+        let mut mature = TypingProfileState::default();
+        for _ in 0..320 { mature.observe(&[180, 220, 240], 1_000, 0, 4); }
+        assert_eq!(mature.allowed_idle_ms(), Some(first_limit));
+    }
+
+    #[test]
+    fn completion_timeout_keeps_a_small_submit_grace() {
+        let mut profile = TypingProfileState::default();
+        for _ in 0..100 { profile.observe(&[200, 220], 1_000, 0, 4); }
+        let idle = profile.allowed_idle_ms().unwrap();
+        assert!(!profile.completion_timed_out(idle + TypingProfileState::COMPLETION_SUBMIT_GRACE_MS, 1_000, 4));
+        assert!(profile.completion_timed_out(idle + TypingProfileState::COMPLETION_SUBMIT_GRACE_MS + 1, 1_000, 4));
     }
 
     #[test]
