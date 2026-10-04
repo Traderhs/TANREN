@@ -1037,6 +1037,11 @@ export function BookStudy({
         : meaningAnswerRef.current
       : null;
     if (isCompletionTimeoutSubmission) {
+      if (japanese) {
+        ime.current?.reset();
+        setImeSegments([]);
+        composing.current = false;
+      }
       answerRef.current = submittedAnswer;
       setAnswer(submittedAnswer);
       if (isListening && submittedMeaningAnswer !== null) {
