@@ -24,9 +24,10 @@ $SourceRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $VendorRoot = Join-Path $SourceRoot "public\vendor"
 $AdapterPath = Join-Path $VendorRoot "hechima\hechima.js"
 $MarkerPath = Join-Path $VendorRoot ".tanren-hechima-pin"
+$PatchedWorkerSha256 = "7a6c11a1043b4d3714a5fc88bb136dcf1336d0c41dbef7dade454f2dba998bfa"
 
 $Files = @(
-  @{ Source = "site/public/vendor/hechima/hechima-worker.js"; Destination = "hechima/hechima-worker.js"; BaselineSha256 = "dc39ff4b6281a6f8013a733522f7fdf4b87676500096ca353866989624a836ac" },
+  @{ Source = "site/public/vendor/hechima/hechima-worker.js"; Destination = "hechima/hechima-worker.js"; BaselineSha256 = "dc39ff4b6281a6f8013a733522f7fdf4b87676500096ca353866989624a836ac"; LocalSha256 = $PatchedWorkerSha256 },
   @{ Source = "site/public/vendor/hechima/hechima.d.ts"; Destination = "hechima/hechima.d.ts"; BaselineSha256 = "a3d916709114e4005086aba5c10810314adeee1d2a554eeda16b251a3ce1b7e2" },
   @{ Source = "site/public/vendor/hechima-wasm/hechima-wasm.js"; Destination = "hechima-wasm/hechima-wasm.js"; BaselineSha256 = "919c95012901731ec490660b9e823d20998c658dba2d78a60119fa00438f8e7d" },
   @{ Source = "site/public/vendor/hechima-wasm/hechima-wasm.wasm"; Destination = "hechima-wasm/hechima-wasm.wasm"; BaselineSha256 = "e0d3d7e7a84b8a4980626bf16f7404d7c65d67403b98da298f33690fd74a33a4" },
@@ -36,6 +37,23 @@ $Files = @(
   @{ Source = "THIRD_PARTY_NOTICES.md"; Destination = "hechima-notices/THIRD_PARTY_NOTICES.md"; BaselineSha256 = "228a0670b44bcdc4da61fca575ea767323cab9b1de22cd8d7e94517ad44f96ba" },
   @{ Source = "site/public/vendor/VENDOR.md"; Destination = "hechima-notices/VENDOR.md"; BaselineSha256 = "b51a939e615e3609732a0d57a68357fedcf557f74a1967de26c549d3d0512ae8" }
 )
+
+function Add-TanrenWorkerPersistencePatch {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  $text = [System.IO.File]::ReadAllText($Path)
+  if ($text.Contains("const writable = await file.createWritable();") -and $text.Contains("async function handleLearn(id, kana, sizes, values)")) { return }
+
+  $writePattern = '(?ms)\t\t\ttry \{\r?\n\t\t\t\tconst access = await \(await opfsDir\.getFileHandle\(name, \{ create: true \}\)\)\.createSyncAccessHandle\(\);\r?\n\t\t\t\taccess\.truncate\(0\);\r?\n\t\t\t\taccess\.write\(data, \{ at: 0 \}\);\r?\n\t\t\t\taccess\.flush\(\);\r?\n\t\t\t\taccess\.close\(\);\r?\n\t\t\t\} catch \{\}'
+  $writeReplacement = "`t`t`tconst file = await opfsDir.getFileHandle(name, { create: true });`n`t`t`ttry {`n`t`t`t`tconst access = await file.createSyncAccessHandle();`n`t`t`t`taccess.truncate(0);`n`t`t`t`taccess.write(data, { at: 0 });`n`t`t`t`taccess.flush();`n`t`t`t`taccess.close();`n`t`t`t`tcontinue;`n`t`t`t} catch {}`n`t`t`ttry {`n`t`t`t`tconst writable = await file.createWritable();`n`t`t`t`tawait writable.write(data);`n`t`t`t`tawait writable.close();`n`t`t`t} catch {}"
+  $updated = [regex]::Replace($text, $writePattern, $writeReplacement, 1)
+  $updated = $updated.Replace("`tfunction handleLearn(id, kana, sizes, values) {", "`tasync function handleLearn(id, kana, sizes, values) {")
+  $updated = $updated.Replace("`t`t`tif (ok) scheduleSave();", "`t`t`tif (ok) await saveLearning();")
+  if (-not $updated.Contains("const writable = await file.createWritable();") -or -not $updated.Contains("async function handleLearn(id, kana, sizes, values)")) {
+    throw "Could not apply TANREN Hechima persistence patch."
+  }
+  [System.IO.File]::WriteAllText($Path, $updated, (New-Object System.Text.UTF8Encoding($false)))
+}
 
 function Get-AdapterVersion {
   param([string]$Path)
@@ -55,7 +73,8 @@ function Test-BaselineBundle {
     $path = Join-Path $VendorRoot $file.Destination
     if (-not (Test-Path -LiteralPath $path)) { return $false }
     $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne $file.BaselineSha256) { return $false }
+    $localMatch = $file.LocalSha256 -and $actual -eq ([string]$file.LocalSha256).ToLowerInvariant()
+    if ($actual -ne $file.BaselineSha256 -and -not $localMatch) { return $false }
   }
   return $true
 }
@@ -68,11 +87,13 @@ function Test-MarkerBundle {
     $path = Join-Path $VendorRoot $file.Destination
     if (-not $record -or -not (Test-Path -LiteralPath $path)) { return $false }
     $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne ([string]$record.sha256).ToLowerInvariant()) { return $false }
+    $localMatch = $file.LocalSha256 -and $actual -eq ([string]$file.LocalSha256).ToLowerInvariant()
+    if ($actual -ne ([string]$record.sha256).ToLowerInvariant() -and -not $localMatch) { return $false }
   }
   return $true
 }
 
+Add-TanrenWorkerPersistencePatch (Join-Path $VendorRoot "hechima\hechima-worker.js")
 $marker = Get-Marker
 try {
   $latest = Invoke-RestMethod -Headers @{ "User-Agent" = "TANREN" } -Uri "https://api.github.com/repos/$Repo/commits/main" -TimeoutSec 10
@@ -150,6 +171,15 @@ try {
     $replacement = "$destinationPath.new"
     Copy-Item -LiteralPath $sourcePath -Destination $replacement -Force
     Move-Item -LiteralPath $replacement -Destination $destinationPath -Force
+  }
+  Add-TanrenWorkerPersistencePatch (Join-Path $VendorRoot "hechima\hechima-worker.js")
+  $records = @()
+  foreach ($file in $Files) {
+    $destinationPath = Join-Path $VendorRoot $file.Destination
+    $records += [pscustomobject]@{
+      path = $file.Destination
+      sha256 = (Get-FileHash -LiteralPath $destinationPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
   }
   Set-TanrenProgress 96
 

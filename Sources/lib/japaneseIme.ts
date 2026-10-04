@@ -38,8 +38,15 @@ interface HechimaConnection {
     dataUrl?: string;
     learning?: boolean;
     scope?: string;
-  }): Promise<unknown>;
+  }): Promise<{ features?: { persist?: boolean } } | null>;
+  learn(segments: HechimaLearningSegment[]): Promise<boolean>;
+  revert(): Promise<boolean>;
   callbacks(): Record<string, unknown>;
+}
+
+interface HechimaLearningSegment {
+  key: string;
+  value: string;
 }
 
 interface HechimaApi {
@@ -58,6 +65,28 @@ const HECHIMA_WORKER = "vendor/hechima/hechima-worker.js";
 const HECHIMA_WASM_JS = "vendor/hechima-wasm/hechima-wasm.js";
 const HECHIMA_WASM = "vendor/hechima-wasm/mozc.data";
 const EXPECTED_HECHIMA_VERSION = "0.22.1";
+const HECHIMA_LEARNING_BACKUP_KEY = "tanren.hechima.learning.v1";
+
+function loadLearningBackup(): HechimaLearningSegment[][] {
+  try {
+    const raw = globalThis.localStorage?.getItem(HECHIMA_LEARNING_BACKUP_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((commit): commit is HechimaLearningSegment[] =>
+      Array.isArray(commit)
+      && commit.length > 0
+      && commit.every((segment) => segment && typeof segment.key === "string" && typeof segment.value === "string"));
+  } catch {
+    return [];
+  }
+}
+
+function saveLearningBackup(history: HechimaLearningSegment[][]) {
+  try {
+    globalThis.localStorage?.setItem(HECHIMA_LEARNING_BACKUP_KEY, JSON.stringify(history));
+  } catch {}
+}
 
 let scriptPromise: Promise<void> | null = null;
 let runtimePromise: Promise<JapaneseImeRuntime> | null = null;
@@ -125,6 +154,7 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
     timeoutId = window.setTimeout(() => reject(new Error("Japanese IME initialization timed out.")), 15_000);
   });
 
+  let readyInfo: { features?: { persist?: boolean } } | null = null;
   try {
     const loadingStarted = performance.now();
     setRuntimeProgress(40);
@@ -132,7 +162,7 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
       const elapsed = performance.now() - loadingStarted;
       setRuntimeProgress(Math.min(95, 40 + (elapsed / 15_000) * 55));
     }, 50);
-    await Promise.race([
+    readyInfo = await Promise.race([
       connection.init({
         wasmJs: assetUrl(HECHIMA_WASM_JS),
         dataUrl: assetUrl(HECHIMA_WASM),
@@ -150,13 +180,38 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
     if (progressId !== null) window.clearInterval(progressId);
   }
 
+  const useLearningBackup = readyInfo?.features?.persist !== true;
+  const learningHistory = useLearningBackup ? loadLearningBackup() : [];
+  if (useLearningBackup) {
+    for (const segments of learningHistory) {
+      await connection.learn(segments);
+    }
+  }
+
   setRuntimeProgress(100);
 
   return {
     version: hechima.version,
     createSession(callbacks) {
+      const engineCallbacks = connection.callbacks();
       return hechima.createFep({
-        ...connection.callbacks(),
+        ...engineCallbacks,
+        ...(useLearningBackup ? {
+          learn: (segments: HechimaLearningSegment[]) => {
+            void connection.learn(segments).then((ok) => {
+              if (!ok) return;
+              learningHistory.push(segments.map((segment) => ({ ...segment })));
+              saveLearningBackup(learningHistory);
+            });
+          },
+          unlearn: () => {
+            void connection.revert().then((ok) => {
+              if (!ok || learningHistory.length === 0) return;
+              learningHistory.pop();
+              saveLearningBackup(learningHistory);
+            });
+          },
+        } : {}),
         ...callbacks,
       });
     },
