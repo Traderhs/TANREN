@@ -1,6 +1,6 @@
 [package]
 name = "tanren"
-version = "1.2.6"
+version = "1.3.0"
 description = "TANREN active-recall language trainer"
 authors = ["TANREN"]
 edition = "2024"
