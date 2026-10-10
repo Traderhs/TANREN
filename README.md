@@ -103,7 +103,7 @@ VOICEVOX 기반 여러 음성 프로필도 사용할 수 있어요. 매번 똑�
 
 TANREN uses rounds instead of making you manage another complicated scheduling system.
 
-The study range grows in **50-entry steps**, with a **cumulative review every 500 entries**.
+The study range grows in **50-entry steps**, with a **cumulative review every 300 entries**.
 
 Get an item right and it leaves the current round. Miss it and it stays. Finish the round, go again, and keep narrowing the list until only the things you still do not know remain. A miss does not lock the word to the same question type: when it comes back, the mode is selected again from the latest per-word performance.
 
@@ -113,7 +113,7 @@ No need to rate every card as “Again,” “Hard,” or “Good.” Your actua
 
 TANREN은 복잡한 스케줄표 대신 **회독**을 사용해요.
 
-50개씩 범위를 넓히고, 500개마다 누적 총복습을 해요.
+50개씩 범위를 넓히고, 300개마다 누적 총복습을 해요.
 
 한 바퀴에서 맞힌 문제는 빠져요.
 

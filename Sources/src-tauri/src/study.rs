@@ -335,6 +335,55 @@ impl StudySession {
         self.sync_entries(entries, modes);
     }
 
+    pub fn rebase_stage(
+        &mut self,
+        stage: u32,
+        study_range: StudyRange,
+        entry_slots: Vec<Option<String>>,
+        entries: &[EntryRecord],
+        modes: &[StudyMode],
+    ) {
+        let old_ids: HashSet<String> = self.entry_slots
+            [self.study_range.start.min(self.entry_slots.len())..self.study_range.end.min(self.entry_slots.len())]
+            .iter().filter_map(Clone::clone).collect();
+        let active: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        let new_ids: HashSet<String> = entry_slots
+            [study_range.start.min(entry_slots.len())..study_range.end.min(entry_slots.len())]
+            .iter().filter_map(Clone::clone)
+            .filter(|id| active.contains(id.as_str())).collect();
+
+        self.queue.remaining.retain(|v| new_ids.contains(&v.entry_id));
+        self.queue.queue.retain(|v| new_ids.contains(&v.entry_id));
+        self.queue.recent_entries.retain(|id| new_ids.contains(id));
+        self.queue.retry_modes.retain(|id, _| new_ids.contains(id));
+        if self.current.as_ref().is_some_and(|v| !new_ids.contains(&v.entry_id)) {
+            self.current = None;
+        }
+        let pending_id = match self.pending.as_ref() {
+            Some(PendingState::Review { variant, .. })
+            | Some(PendingState::CycleComplete { variant })
+            | Some(PendingState::Ambiguous { variant, .. })
+            | Some(PendingState::Pitch { variant, .. })
+            | Some(PendingState::PitchCorrection { variant, .. }) => Some(variant.entry_id.as_str()),
+            None => None,
+        };
+        if pending_id.is_some_and(|id| !new_ids.contains(id)) {
+            self.pending = None;
+        }
+        let extra = new_ids.iter().filter(|id| !old_ids.contains(*id))
+            .filter_map(|id| modes.first().copied().map(|mode| VariantKey { entry_id: id.clone(), mode }))
+            .collect::<Vec<_>>();
+        if !extra.is_empty() && matches!(self.pending, Some(PendingState::CycleComplete { .. })) {
+            self.pending = None;
+        }
+        self.queue.add_variants(extra);
+        self.queue.dedupe_entries();
+        self.stage = stage;
+        self.study_range = study_range;
+        self.entry_slots = entry_slots;
+        self.range_total = new_ids.len();
+    }
+
     #[cfg(test)]
     pub fn remove_entry(&mut self, entry_id: &str) {
         for slot in &mut self.entry_slots {
@@ -421,7 +470,7 @@ mod tests {
     use crate::model::{PitchConfidence, SubmitStatus};
 
     const INCREMENT: usize = 50;
-    const CHECKPOINT: usize = 500;
+    const CHECKPOINT: usize = 300;
 
     fn labels(size: usize) -> Vec<String> {
         study_ranges(size, INCREMENT, CHECKPOINT).into_iter().map(|range| range.label).collect()
@@ -429,7 +478,7 @@ mod tests {
 
     #[test]
     fn exact_progression_ranges_cover_required_odd_sizes() {
-        let cases = [49, 50, 51, 499, 500, 501, 999, 1000, 1001, 3042];
+        let cases = [49, 50, 51, 299, 300, 301, 599, 600, 601, 3042];
         for size in cases {
             let ranges = study_ranges(size, INCREMENT, CHECKPOINT);
             assert!(!ranges.is_empty(), "{size}");
@@ -439,8 +488,8 @@ mod tests {
         assert_eq!(labels(49), vec!["0~48"]);
         assert_eq!(labels(50), vec!["0~49"]);
         assert_eq!(labels(51), vec!["0~49", "0~50"]);
-        assert_eq!(labels(500), vec!["0~49", "0~99", "0~149", "0~199", "0~249", "0~299", "0~349", "0~399", "0~449", "0~499"]);
-        assert_eq!(labels(501).last().unwrap(), "0~500 · cumulative");
+        assert_eq!(labels(300), vec!["0~49", "0~99", "0~149", "0~199", "0~249", "0~299"]);
+        assert_eq!(labels(301).last().unwrap(), "0~300 · cumulative");
         assert_eq!(labels(999).last().unwrap(), "0~998 · cumulative");
         assert_eq!(labels(1000).last().unwrap(), "0~999 · cumulative");
         assert_eq!(labels(1001).last().unwrap(), "0~1000 · cumulative");
@@ -453,8 +502,10 @@ mod tests {
     fn selectable_ranges_match_cardbook_progression() {
         let labels: Vec<_> = study_ranges(1000, INCREMENT, CHECKPOINT).into_iter().map(|range| range.label).collect();
         assert_eq!(labels, vec![
-            "0~49", "0~99", "0~149", "0~199", "0~249", "0~299", "0~349", "0~399", "0~449", "0~499",
-            "500~549", "500~599", "500~649", "500~699", "500~749", "500~799", "500~849", "500~899", "500~949", "500~999",
+            "0~49", "0~99", "0~149", "0~199", "0~249", "0~299",
+            "300~349", "300~399", "300~449", "300~499", "300~549", "300~599", "0~599 · cumulative",
+            "600~649", "600~699", "600~749", "600~799", "600~849", "600~899", "0~899 · cumulative",
+            "900~949", "900~999",
             "0~999 · cumulative",
         ]);
     }
@@ -463,20 +514,21 @@ mod tests {
     fn each_stage_maps_to_exactly_one_progression_range() {
         let expected = [
             "0~49", "0~99", "0~149", "0~199", "0~249",
-            "0~299", "0~349", "0~399", "0~449", "0~499",
+            "0~299", "300~349", "300~399", "300~449", "300~499",
         ];
         for (index, label) in expected.into_iter().enumerate() {
             assert_eq!(stage_study_range(500, INCREMENT, CHECKPOINT, index as u32 + 1).unwrap().label, label);
         }
-        assert!(stage_study_range(500, INCREMENT, CHECKPOINT, 11).is_none());
+        assert_eq!(stage_study_range(500, INCREMENT, CHECKPOINT, 11).unwrap().label, "0~499 · cumulative");
+        assert!(stage_study_range(500, INCREMENT, CHECKPOINT, 12).is_none());
     }
 
     #[test]
     fn session_uses_exactly_the_range_owned_by_its_stage() {
         let values = entries(600);
         let session = StudySession::new_for_stage("deck".into(), 12, &values, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
-        assert_eq!(session.range().label, "500~599");
-        assert_eq!(session.range_total, 100);
+        assert_eq!(session.range().label, "300~599");
+        assert_eq!(session.range_total, 300);
     }
 
     #[test]

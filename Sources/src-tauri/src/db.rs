@@ -7,12 +7,159 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    model::{AudioAssetDraft, DeckRecord, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImportResult, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageCompletionStats, StageScheduleSummary, StudyMode},
+    model::{AudioAssetDraft, DeckRecord, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImportResult, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageCompletionStats, StageScheduleSummary, StudyMode, StudyRange},
     study::{stage_study_range, study_ranges, StudySession},
     timers::TypingProfileState,
 };
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
+const CHECKPOINT_SIZE: usize = 300;
+const OLD_CHECKPOINT_SIZE: usize = 500;
+
+fn mapped_stage(ranges: &[StudyRange], old: &StudyRange) -> u32 {
+    let index = if old.cumulative {
+        ranges.iter().position(|r| r.cumulative && r.end >= old.end)
+            .or_else(|| ranges.iter().rposition(|r| r.cumulative))
+    } else {
+        ranges.iter().position(|r| !r.cumulative && r.end >= old.end)
+    };
+    index.unwrap_or_else(|| ranges.len().saturating_sub(1)) as u32 + 1
+}
+
+// Retain existing study history in the corresponding 300-entry stages.
+fn migrate_checkpoint_decks(tx: &Transaction<'_>, only_deck: Option<&str>) -> Result<(), String> {
+    let decks = {
+        let mut stmt = tx.prepare("SELECT id,increment_size,current_stage,enabled_modes,revision,device_id FROM decks WHERE checkpoint_size=?1 AND (?2 IS NULL OR id=?2)")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map(params![OLD_CHECKPOINT_SIZE as i64, only_deck], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize,
+            row.get::<_, i64>(2)? as u32, row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?, row.get::<_, String>(5)?,
+        ))).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+    };
+
+    for (deck_id, increment, current_stage, modes_json, revision, device_id) in decks {
+        let modes: Vec<StudyMode> = serde_json::from_str(&modes_json).map_err(|e| e.to_string())?;
+        let entries = {
+            let mut stmt = tx.prepare("SELECT id,term,meanings,reading FROM entries WHERE deck_id=?1 AND deleted_at IS NULL ORDER BY position")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([&deck_id], |row| {
+                let meanings: String = row.get(2)?;
+                Ok(EntryRecord { id: row.get(0)?, term: row.get(1)?, meanings: parse_json_column(&meanings, 2)?, reading: row.get(3)? })
+            }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        let mut slots = Vec::<Option<String>>::new();
+        let mut best_stage = 0;
+        {
+            let mut stmt = tx.prepare("SELECT stage,entry_slots_json FROM stage_schedules WHERE deck_id=?1 AND stage>0 ORDER BY stage")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([&deck_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (stage, raw) = row.map_err(|e| e.to_string())?;
+                let candidate: Vec<Option<String>> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                if candidate.len() > slots.len() || (candidate.len() == slots.len() && stage > best_stage) {
+                    best_stage = stage;
+                    slots = candidate;
+                }
+            }
+        }
+        let mut known: HashSet<String> = slots.iter().filter_map(Clone::clone).collect();
+        for entry in &entries {
+            if known.insert(entry.id.clone()) { slots.push(Some(entry.id.clone())); }
+        }
+        let old_ranges = study_ranges(slots.len(), increment, OLD_CHECKPOINT_SIZE);
+        let new_ranges = study_ranges(slots.len(), increment, CHECKPOINT_SIZE);
+        let next_stage = old_ranges.get(current_stage.saturating_sub(1) as usize)
+            .map(|range| mapped_stage(&new_ranges, range)).unwrap_or(1);
+
+        let stages = {
+            let mut stmt = tx.prepare(
+                "SELECT stage FROM stage_schedules WHERE deck_id=?1 AND stage>0 \
+                 UNION SELECT stage FROM stage_states WHERE deck_id=?1 AND stage>0 \
+                 UNION SELECT stage FROM stage_completions WHERE deck_id=?1 AND stage>0 \
+                 UNION SELECT stage FROM attempts WHERE deck_id=?1 AND stage>0",
+            ).map_err(|e| e.to_string())?;
+            stmt.query_map([&deck_id], |row| row.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        let mapping: Vec<(i64, i64)> = stages.into_iter().map(|old| {
+            let mapped = old_ranges.get(old.saturating_sub(1) as usize)
+                .map(|range| mapped_stage(&new_ranges, range)).unwrap_or(next_stage);
+            (old, mapped as i64)
+        }).collect();
+
+        let saved_schedules = {
+            let mut stmt = tx.prepare("SELECT stage,created_at FROM stage_schedules WHERE deck_id=?1 AND stage>0 ORDER BY stage")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([&deck_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+
+        let saved_states = {
+            let mut stmt = tx.prepare("SELECT state_json,updated_at FROM stage_states WHERE deck_id=?1 AND stage>0 ORDER BY updated_at,rowid")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([&deck_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        let mut rebased_states = BTreeMap::<u32, (StudySession, String)>::new();
+        for (raw, updated_at) in saved_states {
+            let mut session: StudySession = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            if new_ranges.is_empty() { continue; }
+            let stage = mapped_stage(&new_ranges, &session.study_range);
+            session.rebase_stage(stage, new_ranges[(stage - 1) as usize].clone(), slots.clone(), &entries, &modes);
+            rebased_states.insert(stage, (session, updated_at));
+        }
+
+        tx.execute("DELETE FROM stage_schedules WHERE deck_id=?1 AND stage>0", [&deck_id]).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM stage_states WHERE deck_id=?1 AND stage>0", [&deck_id]).map_err(|e| e.to_string())?;
+        for table in ["stage_completions", "attempts"] {
+            tx.execute(&format!("UPDATE {table} SET stage=-stage WHERE deck_id=?1 AND stage>0"), [&deck_id])
+                .map_err(|e| e.to_string())?;
+        }
+        tx.execute("UPDATE sync_journal SET entity_id=?1 || ':previous-stage:' || substr(entity_id,length(?1)+2) WHERE entity_type='stage_state' AND entity_id LIKE (?1 || ':%')", [&deck_id])
+            .map_err(|e| e.to_string())?;
+
+        for &(old, new) in &mapping {
+            tx.execute("UPDATE sync_journal SET payload=json_set(payload,'$.stage',?1) WHERE entity_type='attempt' AND json_valid(payload) AND json_type(payload,'$.stage') IS NOT NULL AND entity_id IN (SELECT id FROM attempts WHERE deck_id=?2 AND stage=?3)",
+                params![new, deck_id, -old]).map_err(|e| e.to_string())?;
+            for table in ["stage_completions", "attempts"] {
+                tx.execute(&format!("UPDATE {table} SET stage=?1 WHERE deck_id=?2 AND stage=?3"),
+                    params![new, deck_id, -old]).map_err(|e| e.to_string())?;
+            }
+            tx.execute("UPDATE sync_journal SET entity_id=?1,payload=CASE WHEN json_valid(payload) AND json_type(payload,'$.stage') IS NOT NULL THEN json_set(payload,'$.stage',?2) ELSE payload END WHERE entity_type='stage_state' AND entity_id=?3",
+                params![format!("{deck_id}:{new}"), new, format!("{deck_id}:previous-stage:{old}")]).map_err(|e| e.to_string())?;
+        }
+
+        let timestamp = now();
+        for (old, created_at) in saved_schedules {
+            let stage = mapping.iter().find(|(source, _)| *source == old).map(|(_, target)| *target).unwrap_or(next_stage as i64);
+            tx.execute("INSERT OR IGNORE INTO stage_schedules(deck_id,stage,entry_slots_json,created_at,device_id) VALUES(?1,?2,?3,?4,?5)",
+                params![deck_id, stage, serde_json::to_string(&slots).map_err(|e| e.to_string())?, created_at, device_id])
+                .map_err(|e| e.to_string())?;
+        }
+        for (stage, (session, updated_at)) in rebased_states {
+            tx.execute("INSERT OR IGNORE INTO stage_schedules(deck_id,stage,entry_slots_json,created_at,device_id) VALUES(?1,?2,?3,?4,?5)",
+                params![deck_id, stage, serde_json::to_string(&slots).map_err(|e| e.to_string())?, timestamp, device_id])
+                .map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO stage_states(deck_id,stage,state_json,updated_at,device_id) VALUES(?1,?2,?3,?4,?5)",
+                params![deck_id, stage, serde_json::to_string(&session).map_err(|e| e.to_string())?, updated_at, device_id])
+                .map_err(|e| e.to_string())?;
+            journal(tx, &format!("{deck_id}:{stage}"), "stage_state", &device_id, 1, "upsert",
+                &serde_json::json!({"deck_id":deck_id,"stage":stage,"range_label":session.study_range.label}))?;
+        }
+        tx.execute("UPDATE decks SET checkpoint_size=?1,current_stage=?2,updated_at=?3,revision=revision+1 WHERE id=?4",
+            params![CHECKPOINT_SIZE as i64, next_stage, timestamp, deck_id]).map_err(|e| e.to_string())?;
+        journal(tx, &deck_id, "deck", &device_id, revision + 1, "update",
+            &serde_json::json!({"checkpoint_size":CHECKPOINT_SIZE,"current_stage":next_stage}))?;
+    }
+    Ok(())
+}
 
 fn normalize_meanings(values: &[String]) -> Vec<String> {
     values.iter()
@@ -226,6 +373,21 @@ impl Database {
             if version == 16 {
                 let tx = conn.transaction().map_err(|e| e.to_string())?;
                 normalize_stored_meanings(&tx)?;
+                tx.execute("UPDATE schema_info SET version=17 WHERE id=1", []).map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                version = 17;
+            }
+            if version == 17 {
+                let old_decks: i64 = conn.query_row("SELECT COUNT(*) FROM decks WHERE checkpoint_size=?1", [OLD_CHECKPOINT_SIZE as i64], |row| row.get(0))
+                    .map_err(|e| e.to_string())?;
+                if old_decks > 0 {
+                    let backup_path = self.path.with_extension(format!("before-300-{}.sqlite", Uuid::new_v4()));
+                    let mut backup_conn = Connection::open(&backup_path).map_err(|e| e.to_string())?;
+                    let backup = rusqlite::backup::Backup::new(&conn, &mut backup_conn).map_err(|e| e.to_string())?;
+                    backup.run_to_completion(128, Duration::from_millis(5), None).map_err(|e| e.to_string())?;
+                }
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                migrate_checkpoint_decks(&tx, None)?;
                 tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [SCHEMA_VERSION]).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 version = SCHEMA_VERSION;
@@ -260,7 +422,7 @@ impl Database {
               target_language TEXT NOT NULL,
               enabled_modes TEXT NOT NULL,
               increment_size INTEGER NOT NULL DEFAULT 50,
-              checkpoint_size INTEGER NOT NULL DEFAULT 500,
+              checkpoint_size INTEGER NOT NULL DEFAULT 300,
               recall_timeout_by_mode TEXT NOT NULL DEFAULT '{"reading":3000,"listening":3000,"writing":3000}',
               adaptive_completion_timer_enabled INTEGER NOT NULL DEFAULT 1,
               pitch_policy TEXT NOT NULL DEFAULT 'verified_only',
@@ -703,7 +865,7 @@ impl Database {
         let live_stage_count = study_ranges(self.effective_stage_slots(deck_id)?.len(), deck.increment_size, deck.checkpoint_size).len() as u32;
         let conn = self.conn()?;
         let max_scheduled: Option<i64> = conn.query_row(
-            "SELECT MAX(stage) FROM stage_schedules WHERE deck_id=?1",
+            "SELECT MAX(stage) FROM stage_schedules WHERE deck_id=?1 AND stage>0",
             [deck_id],
             |row| row.get(0),
         ).map_err(|e| e.to_string())?;
@@ -763,7 +925,7 @@ impl Database {
         let mut fallback_count = None;
         let mut summaries = Vec::with_capacity(stages.len());
         let active_stage = conn.query_row(
-            "SELECT stage FROM stage_states WHERE deck_id=?1 ORDER BY updated_at DESC,rowid DESC LIMIT 1",
+            "SELECT stage FROM stage_states WHERE deck_id=?1 AND stage>0 ORDER BY updated_at DESC,rowid DESC LIMIT 1",
             [deck_id],
             |row| row.get::<_, i64>(0),
         ).optional().map_err(|e| e.to_string())?.map(|value| value as u32);
@@ -806,13 +968,13 @@ impl Database {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?
         };
-        let mut best_stage = 0u32;
+        let mut best_stage = i64::MIN;
         let mut slots = Vec::<Option<String>>::new();
         {
             let mut stmt = conn.prepare(
                 "SELECT stage,entry_slots_json FROM stage_schedules WHERE deck_id=?1 ORDER BY stage",
             ).map_err(|e| e.to_string())?;
-            let rows = stmt.query_map([deck_id], |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, String>(1)?)))
+            let rows = stmt.query_map([deck_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
                 .map_err(|e| e.to_string())?;
             for row in rows {
                 let (stage, raw) = row.map_err(|e| e.to_string())?;
@@ -1072,7 +1234,7 @@ impl Database {
         }
         let schedules = {
             let mut stmt = tx.prepare(
-                "SELECT stage,entry_slots_json FROM stage_schedules WHERE deck_id=?1 ORDER BY stage",
+                "SELECT stage,entry_slots_json FROM stage_schedules WHERE deck_id=?1 AND stage>0 ORDER BY stage",
             ).map_err(|e| e.to_string())?;
             stmt.query_map([deck_id], |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, String>(1)?)))
                 .map_err(|e| e.to_string())?
@@ -2169,6 +2331,7 @@ impl Database {
             }
         }
         purge_retired_mode(&tx, "speaking")?;
+        migrate_checkpoint_decks(&tx, Some(&deck_id))?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(deck_id)
     }
@@ -2211,7 +2374,7 @@ impl Database {
             [],
             |row| row.get(0),
         ).map_err(|e| format!("백업 버전을 확인하지 못했어요: {e}"))?;
-        if !matches!(version, 13 | 14 | 15 | 16 | SCHEMA_VERSION) {
+        if !matches!(version, 13 | 14 | 15 | 16 | 17 | SCHEMA_VERSION) {
             return Err("현재 버전과 맞지 않는 TANREN 백업이에요".into());
         }
         let integrity: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(|e| e.to_string())?;
@@ -2295,6 +2458,94 @@ fn local_date(timestamp:&str)->Result<String,String>{
 mod tests{
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn migration_to_300_rehomes_attempts_clears_and_in_progress_queue_without_loss() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tanren.db");
+        let db = Database::open(&path).unwrap();
+        let deck = db.create_deck("legacy", "ko-KR", "ja-JP").unwrap();
+        let drafts = (0..601).map(|i| EntryDraft {
+            term: format!("term{i}"), meanings: vec![format!("meaning{i}")], reading: None,
+        }).collect::<Vec<_>>();
+        db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute("UPDATE decks SET checkpoint_size=500,current_stage=11 WHERE id=?1", [&deck.id]).unwrap();
+        drop(conn);
+
+        let entries = db.entries(&deck.id).unwrap();
+        let slots = db.ensure_stage_schedule(&deck.id, 11, &entries).unwrap();
+        let mut session = StudySession::new_for_stage_with_slots(
+            deck.id.clone(), 11, slots, &entries, &deck.enabled_modes, 50, 500, 42,
+        ).unwrap();
+        let answered = session.next_variant(10).unwrap();
+        session.resolve_current(&answered, true).unwrap();
+        db.save_session(&session).unwrap();
+        db.mark_stage_completed(&deck.id, 10, 1234, 2).unwrap();
+        db.insert_attempt(&entries[550].id, &deck.id, StudyMode::Reading, 12, "500~599", "answer", true, None, true, "exact", None, 100, 200, None).unwrap();
+        db.mark_stage_completed(&deck.id, 12, 5678, 3).unwrap();
+        let baseline = db.export_deck(&deck.id).unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute("UPDATE schema_info SET version=17", []).unwrap();
+        drop(conn);
+        drop(db);
+
+        let migrated = Database::open(&path).unwrap();
+        assert_eq!(migrated.deck(&deck.id).unwrap().checkpoint_size, 300);
+        assert_eq!(migrated.deck(&deck.id).unwrap().current_stage, 11);
+        let restored = migrated.load_session(&deck.id, 11).unwrap().unwrap();
+        assert_eq!(restored.study_range.label, "300~549");
+        assert_eq!(restored.range_total, 250);
+        assert_eq!(restored.queue.remaining_count(), 249);
+        assert!(!restored.queue.remaining.contains(&answered));
+        assert_eq!(migrated.stage_schedule_summary(&deck.id, 10).unwrap().clear_times_ms, vec![1234]);
+        assert_eq!(migrated.stage_schedule_summary(&deck.id, 12).unwrap().clear_times_ms, vec![5678]);
+        assert_eq!(migrated.stage_schedule_summary(&deck.id, 12).unwrap().clear_cycles, vec![3]);
+        assert_eq!(migrated.stage_completion_stats(&deck.id, 12).unwrap().attempts, 1);
+        assert_eq!(migrated.list_decks().unwrap()[0].completed_stage_count, 2);
+
+        let conn = migrated.conn().unwrap();
+        let relocated: (i64, String) = conn.query_row("SELECT stage,range_label FROM attempts WHERE deck_id=?1", [&deck.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(relocated, (12, "500~599".into()));
+        for table in ["stage_schedules", "stage_states", "stage_completions", "attempts"] {
+            let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE deck_id=?1 AND stage<0"), [&deck.id], |r| r.get(0)).unwrap();
+            assert_eq!(count, 0, "old stage left in {table}");
+        }
+        assert_eq!(conn.query_row("SELECT version FROM schema_info WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        drop(conn);
+        let backups = fs::read_dir(dir.path()).unwrap().map(Result::unwrap).map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains("before-300") && p.extension().is_some_and(|ext| ext == "sqlite"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        let original = Connection::open(&backups[0]).unwrap();
+        assert_eq!(original.query_row("SELECT checkpoint_size FROM decks WHERE id=?1", [&deck.id], |r| r.get::<_, i64>(0)).unwrap(), 500);
+        assert_eq!(original.query_row("SELECT version FROM schema_info", [], |r| r.get::<_, i64>(0)).unwrap(), 17);
+        assert!(baseline.contains("\"checkpoint_size\": 500"));
+        drop(migrated);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.stage_schedule_summary(&deck.id, 12).unwrap().clear_times_ms, vec![5678]);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().contains("before-300") && e.path().extension().is_some_and(|ext| ext == "sqlite")).count(), 1);
+
+        let restored_backup = Database::open(dir.path().join("restored.db")).unwrap();
+        restored_backup.import_backup(&backups[0]).unwrap();
+        assert_eq!(restored_backup.deck(&deck.id).unwrap().checkpoint_size, 300);
+        assert_eq!(restored_backup.stage_schedule_summary(&deck.id, 12).unwrap().clear_times_ms, vec![5678]);
+
+        let restored_portable = Database::open(dir.path().join("portable.db")).unwrap();
+        restored_portable.import_deck_export(&baseline).unwrap();
+        assert_eq!(restored_portable.deck(&deck.id).unwrap().checkpoint_size, 300);
+        assert_eq!(restored_portable.stage_schedule_summary(&deck.id, 12).unwrap().clear_times_ms, vec![5678]);
+        assert_eq!(restored_portable.load_session(&deck.id, 11).unwrap().unwrap().queue.remaining_count(), 249);
+    }
+
+    #[test]
+    fn legacy_stages_map_to_corresponding_300_entry_ranges() {
+        let old = study_ranges(1000, 50, OLD_CHECKPOINT_SIZE);
+        let new = study_ranges(1000, 50, CHECKPOINT_SIZE);
+        for (old_stage, new_stage) in [(1, 1), (6, 6), (10, 10), (11, 11), (12, 12), (13, 14), (20, 22), (21, 23)] {
+            assert_eq!(mapped_stage(&new, &old[old_stage - 1]), new_stage, "old stage {old_stage}");
+        }
+    }
 
     #[test]
     fn schema_and_roundtrip_are_durable(){
@@ -2874,7 +3125,7 @@ mod tests{
         db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
         let summary = db.list_decks().unwrap().remove(0);
         assert_eq!(summary.total_stage_count, 12);
-        assert_eq!(db.stage_schedule_summary(&deck.id, 11).unwrap().study_range.label, "500~500");
+        assert_eq!(db.stage_schedule_summary(&deck.id, 11).unwrap().study_range.label, "300~500");
         assert_eq!(db.stage_schedule_summary(&deck.id, 12).unwrap().study_range.label, "0~500 · cumulative");
     }
 
@@ -3091,7 +3342,7 @@ mod tests{
     }
 
     #[test]
-    fn five_hundred_entries_are_ten_stages_with_one_range_per_stage() {
+    fn five_hundred_entries_include_second_block_cumulative_review() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
         let deck = db.create_deck("stages", "ko-KR", "ja-JP").unwrap();
@@ -3103,13 +3354,14 @@ mod tests{
         db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
 
         let summary = db.list_decks().unwrap().remove(0);
-        assert_eq!(summary.total_stage_count, 10);
+        assert_eq!(summary.total_stage_count, 11);
         assert_eq!(summary.completed_stage_count, 0);
         assert_eq!(db.stage_schedule_summary(&deck.id, 1).unwrap().study_range.label, "0~49");
         assert_eq!(db.stage_schedule_summary(&deck.id, 2).unwrap().study_range.label, "0~99");
-        assert_eq!(db.stage_schedule_summary(&deck.id, 7).unwrap().study_range.label, "0~349");
-        assert_eq!(db.stage_schedule_summary(&deck.id, 10).unwrap().study_range.label, "0~499");
-        assert!(db.stage_schedule_summary(&deck.id, 11).is_err());
+        assert_eq!(db.stage_schedule_summary(&deck.id, 7).unwrap().study_range.label, "300~349");
+        assert_eq!(db.stage_schedule_summary(&deck.id, 10).unwrap().study_range.label, "300~499");
+        assert_eq!(db.stage_schedule_summary(&deck.id, 11).unwrap().study_range.label, "0~499 · cumulative");
+        assert!(db.stage_schedule_summary(&deck.id, 12).is_err());
 
         db.mark_stage_completed(&deck.id, 1, 4_320_000, 2).unwrap();
         db.mark_stage_completed(&deck.id, 1, 3_780_000, 3).unwrap();
@@ -3119,7 +3371,7 @@ mod tests{
         assert_eq!(stage_one.clear_cycles, vec![2, 3]);
         let summary = db.list_decks().unwrap().remove(0);
         assert_eq!(summary.completed_stage_count, 1);
-        assert_eq!(summary.total_stage_count, 10);
+        assert_eq!(summary.total_stage_count, 11);
 
         db.select_stage(&deck.id, 7).unwrap();
         assert_eq!(db.list_decks().unwrap().remove(0).current_stage, 7);
