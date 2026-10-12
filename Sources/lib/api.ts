@@ -77,4 +77,7 @@ export const api = {
   importBackup: () => invoke<boolean>("import_backup"),
   activateInputProfile: (language: string) => invoke<string | null>("activate_input_profile", { language }),
   exitStudy: () => invoke<void>("exit_study"),
+  japaneseImeLearningHistory: () => invoke<{ key: string; value: string }[][]>("japanese_ime_learning_history"),
+  recordJapaneseImeLearning: (segments: { key: string; value: string }[]) => invoke<void>("record_japanese_ime_learning", { segments }),
+  undoJapaneseImeLearning: () => invoke<void>("undo_japanese_ime_learning"),
 };

@@ -25,7 +25,7 @@ use db::Database;
 use grading::{grade_form_with_reading, normalize_generic, split_reading_answer};
 use japanese::{JapaneseAnalyzer, ListeningHint, PITCH_DATA_REVISION, VOICE_AUDIO_REVISION};
 use model::{
-    AdjudicationPrompt, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, LibraryStats,
+    AdjudicationPrompt, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, FailureType, GradeDecision, ImeLearningSegment, LibraryStats,
     ListeningFeedback, MeaningGrade, PitchQuestion, StageScheduleSummary, StudyCard, StudyMode, SubmitResult, SubmitStatus, VariantKey,
 };
 use rand::random;
@@ -39,6 +39,21 @@ use voicevox::{VoicevoxRuntime, VoicevoxRuntimeStatus};
 use windows_input::WindowsInputAdapter;
 
 const LISTENING_HINT_BACKFILL_REVISION: &str = "external-context-v2";
+
+#[tauri::command]
+fn japanese_ime_learning_history(state: State<'_, AppState>) -> Result<Vec<Vec<ImeLearningSegment>>, String> {
+    state.db.japanese_ime_learning_history()
+}
+
+#[tauri::command]
+fn record_japanese_ime_learning(state: State<'_, AppState>, segments: Vec<ImeLearningSegment>) -> Result<(), String> {
+    state.db.record_japanese_ime_learning(&segments)
+}
+
+#[tauri::command]
+fn undo_japanese_ime_learning(state: State<'_, AppState>) -> Result<(), String> {
+    state.db.undo_japanese_ime_learning()
+}
 
 #[derive(Default)]
 struct Engine {
@@ -2043,6 +2058,9 @@ pub fn run() {
             start_study,
             record_study_activity,
             submit_answer,
+            japanese_ime_learning_history,
+            record_japanese_ime_learning,
+            undo_japanese_ime_learning,
             timeout_current,
             adjudicate_answer,
             submit_pitch,

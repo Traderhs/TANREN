@@ -12,7 +12,7 @@ import { prepareBookClosing } from "./lib/bookClosing";
 import { parseEntryText } from "./lib/importParser";
 import { BookInlineEntryManager } from "./BookInlineEntryManager";
 import { BookStudy } from "./BookStudy";
-import { loadJapaneseImeRuntime } from "./lib/japaneseIme";
+import { flushJapaneseImeLearning, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import { playEffectSound, preloadBookEffectSounds } from "./lib/soundEffects";
 import type { SubmitResult } from "./lib/types";
 import type { AudioSettings, DeckSummary, EntryDetails, EntryListRecord, EntryRecord, LibraryStats, SemanticRuntimeStatus, StageCompletionStats, StageScheduleSummary, StartupRuntimeProgress, StorageSettings, StudyMode, VoicevoxRuntimeStatus } from "./lib/types";
@@ -70,7 +70,7 @@ function AppTitleBar() {
           </> : <rect x="1.2" y="1.2" width="8.8" height="8.8" rx="1" ry="1" />}
         </svg>
       </button>
-      <button type="button" className="app-titlebar-button app-titlebar-close" aria-label="닫기" title="닫기" onClick={() => runWindowAction(() => appWindow.close())}>
+      <button type="button" className="app-titlebar-button app-titlebar-close" aria-label="닫기" title="닫기" onClick={() => runWindowAction(async () => { await flushJapaneseImeLearning(); await appWindow.close(); })}>
         <span className="app-titlebar-close-icon" aria-hidden="true" />
       </button>
     </div>

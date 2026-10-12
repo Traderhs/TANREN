@@ -28,6 +28,17 @@ describe("study command payloads", () => {
     expect(invoke).toHaveBeenCalledWith("stage_stats", { deckId: "deck", stage: 3 });
   });
 
+  it("loads and records Japanese IME learning through persistent app storage", async () => {
+    const segments = [{ key: "きょう", value: "今日" }];
+    invoke.mockResolvedValue([]);
+    await api.japaneseImeLearningHistory();
+    expect(invoke).toHaveBeenCalledWith("japanese_ime_learning_history");
+    await api.recordJapaneseImeLearning(segments);
+    expect(invoke).toHaveBeenCalledWith("record_japanese_ime_learning", { segments });
+    await api.undoJapaneseImeLearning();
+    expect(invoke).toHaveBeenCalledWith("undo_japanese_ime_learning");
+  });
+
   it("loads a specific historical stage completion", async () => {
     invoke.mockResolvedValue({ stage: 3, attempts: 8 });
     await api.stageStatsAt("deck", 3, 1);

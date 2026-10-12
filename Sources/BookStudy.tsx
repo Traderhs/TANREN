@@ -664,6 +664,7 @@ export function BookStudy({
             insertText(text);
           },
           hostKey: (key) => { if (!cancelled) hostKey(key); },
+          learningError: (message) => { if (!cancelled) setInputWarning(message); },
         });
         ime.current.setActive(true);
         setImeReady(true);

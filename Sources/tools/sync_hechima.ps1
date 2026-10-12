@@ -24,7 +24,7 @@ $SourceRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $VendorRoot = Join-Path $SourceRoot "public\vendor"
 $AdapterPath = Join-Path $VendorRoot "hechima\hechima.js"
 $MarkerPath = Join-Path $VendorRoot ".tanren-hechima-pin"
-$PatchedWorkerSha256 = "7a6c11a1043b4d3714a5fc88bb136dcf1336d0c41dbef7dade454f2dba998bfa"
+$PatchedWorkerSha256 = "8cb237f4a7ca40b8e9a66c2793d048ca1c92bbaa10a32273d8d70bc5301742e2"
 
 $Files = @(
   @{ Source = "site/public/vendor/hechima/hechima-worker.js"; Destination = "hechima/hechima-worker.js"; BaselineSha256 = "dc39ff4b6281a6f8013a733522f7fdf4b87676500096ca353866989624a836ac"; LocalSha256 = $PatchedWorkerSha256 },
@@ -42,17 +42,23 @@ function Add-TanrenWorkerPersistencePatch {
   param([string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { return }
   $text = [System.IO.File]::ReadAllText($Path)
-  if ($text.Contains("const writable = await file.createWritable();") -and $text.Contains("async function handleLearn(id, kana, sizes, values)")) { return }
-
-  $writePattern = '(?ms)\t\t\ttry \{\r?\n\t\t\t\tconst access = await \(await opfsDir\.getFileHandle\(name, \{ create: true \}\)\)\.createSyncAccessHandle\(\);\r?\n\t\t\t\taccess\.truncate\(0\);\r?\n\t\t\t\taccess\.write\(data, \{ at: 0 \}\);\r?\n\t\t\t\taccess\.flush\(\);\r?\n\t\t\t\taccess\.close\(\);\r?\n\t\t\t\} catch \{\}'
-  $writeReplacement = "`t`t`tconst file = await opfsDir.getFileHandle(name, { create: true });`n`t`t`ttry {`n`t`t`t`tconst access = await file.createSyncAccessHandle();`n`t`t`t`taccess.truncate(0);`n`t`t`t`taccess.write(data, { at: 0 });`n`t`t`t`taccess.flush();`n`t`t`t`taccess.close();`n`t`t`t`tcontinue;`n`t`t`t} catch {}`n`t`t`ttry {`n`t`t`t`tconst writable = await file.createWritable();`n`t`t`t`tawait writable.write(data);`n`t`t`t`tawait writable.close();`n`t`t`t} catch {}"
-  $updated = [regex]::Replace($text, $writePattern, $writeReplacement, 1)
-  $updated = $updated.Replace("`tfunction handleLearn(id, kana, sizes, values) {", "`tasync function handleLearn(id, kana, sizes, values) {")
-  $updated = $updated.Replace("`t`t`tif (ok) scheduleSave();", "`t`t`tif (ok) await saveLearning();")
-  if (-not $updated.Contains("const writable = await file.createWritable();") -or -not $updated.Contains("async function handleLearn(id, kana, sizes, values)")) {
+  $updated = $text
+  if (-not $updated.Contains("const writable = await file.createWritable();")) {
+    $writePattern = '(?ms)\t\t\ttry \{\r?\n\t\t\t\tconst access = await \(await opfsDir\.getFileHandle\(name, \{ create: true \}\)\)\.createSyncAccessHandle\(\);\r?\n\t\t\t\taccess\.truncate\(0\);\r?\n\t\t\t\taccess\.write\(data, \{ at: 0 \}\);\r?\n\t\t\t\taccess\.flush\(\);\r?\n\t\t\t\taccess\.close\(\);\r?\n\t\t\t\} catch \{\}'
+    $writeReplacement = "`t`t`tconst file = await opfsDir.getFileHandle(name, { create: true });`n`t`t`ttry {`n`t`t`t`tconst access = await file.createSyncAccessHandle();`n`t`t`t`taccess.truncate(0);`n`t`t`t`taccess.write(data, { at: 0 });`n`t`t`t`taccess.flush();`n`t`t`t`taccess.close();`n`t`t`t`tcontinue;`n`t`t`t} catch {}`n`t`t`ttry {`n`t`t`t`tconst writable = await file.createWritable();`n`t`t`t`tawait writable.write(data);`n`t`t`t`tawait writable.close();`n`t`t`t} catch {}"
+    $updated = [regex]::Replace($updated, $writePattern, $writeReplacement, 1)
+    $updated = $updated.Replace("`tfunction handleLearn(id, kana, sizes, values) {", "`tasync function handleLearn(id, kana, sizes, values) {")
+    $updated = $updated.Replace("`t`t`tif (ok) scheduleSave();", "`t`t`tif (ok) await saveLearning();")
+  }
+  if (-not $updated.Contains("let persistenceEnabled = true;")) {
+    $updated = $updated.Replace("let learningEnabled = true;", "let learningEnabled = true;`n`tlet persistenceEnabled = true;")
+    $updated = $updated.Replace("if (learningEnabled) {", "if (learningEnabled && persistenceEnabled) {")
+    $updated = $updated.Replace("learningEnabled = m.learning !== false;", "learningEnabled = m.learning !== false;`n`t`t`tpersistenceEnabled = m.persist !== false;")
+  }
+  if (-not $updated.Contains("const writable = await file.createWritable();") -or -not $updated.Contains("async function handleLearn(id, kana, sizes, values)") -or -not $updated.Contains("persistenceEnabled = m.persist !== false;")) {
     throw "Could not apply TANREN Hechima persistence patch."
   }
-  [System.IO.File]::WriteAllText($Path, $updated, (New-Object System.Text.UTF8Encoding($false)))
+  if ($updated -ne $text) { [System.IO.File]::WriteAllText($Path, $updated, (New-Object System.Text.UTF8Encoding($false))) }
 }
 
 function Get-AdapterVersion {

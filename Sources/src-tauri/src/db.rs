@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    model::{AudioAssetDraft, DeckRecord, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImportResult, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageCompletionStats, StageScheduleSummary, StudyMode, StudyRange},
+    model::{AudioAssetDraft, DeckRecord, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImeLearningSegment, ImportResult, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageCompletionStats, StageScheduleSummary, StudyMode, StudyRange},
     study::{stage_study_range, study_ranges, StudySession},
     timers::TypingProfileState,
 };
@@ -656,6 +656,11 @@ impl Database {
               value TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS japanese_ime_learning (
+              id INTEGER PRIMARY KEY,
+              segments_json TEXT NOT NULL
+            );
             "#,
         ).map_err(|e| e.to_string())?;
         tx.execute(
@@ -699,6 +704,27 @@ impl Database {
         } else {
             conn.execute("DELETE FROM app_settings WHERE key=?1", [key]).map_err(|e| e.to_string())?;
         }
+        Ok(())
+    }
+
+    pub fn japanese_ime_learning_history(&self) -> Result<Vec<Vec<ImeLearningSegment>>, String> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT segments_json FROM japanese_ime_learning ORDER BY id").map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
+            .map(|row| serde_json::from_str(&row.map_err(|e| e.to_string())?).map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    pub fn record_japanese_ime_learning(&self, segments: &[ImeLearningSegment]) -> Result<(), String> {
+        if segments.is_empty() { return Err("empty Japanese IME learning record".into()); }
+        self.conn()?.execute("INSERT INTO japanese_ime_learning(segments_json) VALUES(?1)",
+            [serde_json::to_string(segments).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn undo_japanese_ime_learning(&self) -> Result<(), String> {
+        self.conn()?.execute("DELETE FROM japanese_ime_learning WHERE id=(SELECT MAX(id) FROM japanese_ime_learning)", [])
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -2458,6 +2484,23 @@ fn local_date(timestamp:&str)->Result<String,String>{
 mod tests{
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn japanese_ime_learning_survives_database_reopen_and_undo() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tanren.db");
+        let first = vec![ImeLearningSegment { key: "きょう".into(), value: "今日".into() }];
+        let second = vec![ImeLearningSegment { key: "あした".into(), value: "明日".into() }];
+        {
+            let db = Database::open(&path).unwrap();
+            db.record_japanese_ime_learning(&first).unwrap();
+            db.record_japanese_ime_learning(&second).unwrap();
+        }
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.japanese_ime_learning_history().unwrap(), vec![first.clone(), second]);
+        reopened.undo_japanese_ime_learning().unwrap();
+        assert_eq!(Database::open(&path).unwrap().japanese_ime_learning_history().unwrap(), vec![first]);
+    }
 
     #[test]
     fn migration_to_300_rehomes_attempts_clears_and_in_progress_queue_without_loss() {

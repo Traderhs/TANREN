@@ -1,3 +1,5 @@
+import { api } from "./api";
+
 export interface JapaneseImeSegment {
   text: string;
   kind: "yomi" | "focus" | "other";
@@ -30,6 +32,7 @@ export interface JapaneseImeCallbacks {
   hide(): void;
   commit(text: string): void;
   hostKey(name: string): void;
+  learningError?(message: string): void;
 }
 
 interface HechimaConnection {
@@ -37,6 +40,7 @@ interface HechimaConnection {
     wasmJs?: string;
     dataUrl?: string;
     learning?: boolean;
+    persist?: boolean;
     scope?: string;
   }): Promise<{ features?: { persist?: boolean } } | null>;
   learn(segments: HechimaLearningSegment[]): Promise<boolean>;
@@ -82,16 +86,15 @@ function loadLearningBackup(): HechimaLearningSegment[][] {
   }
 }
 
-function saveLearningBackup(history: HechimaLearningSegment[][]) {
-  try {
-    globalThis.localStorage?.setItem(HECHIMA_LEARNING_BACKUP_KEY, JSON.stringify(history));
-  } catch {}
-}
-
 let scriptPromise: Promise<void> | null = null;
 let runtimePromise: Promise<JapaneseImeRuntime> | null = null;
+let pendingLearning = Promise.resolve();
 let runtimeProgress = 0;
 const runtimeProgressListeners = new Set<(progress: number) => void>();
+
+export function flushJapaneseImeLearning() {
+  return pendingLearning;
+}
 
 function setRuntimeProgress(progress: number) {
   runtimeProgress = Math.max(runtimeProgress, Math.min(100, Math.round(progress)));
@@ -154,7 +157,6 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
     timeoutId = window.setTimeout(() => reject(new Error("Japanese IME initialization timed out.")), 15_000);
   });
 
-  let readyInfo: { features?: { persist?: boolean } } | null = null;
   try {
     const loadingStarted = performance.now();
     setRuntimeProgress(40);
@@ -162,11 +164,12 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
       const elapsed = performance.now() - loadingStarted;
       setRuntimeProgress(Math.min(95, 40 + (elapsed / 15_000) * 55));
     }, 50);
-    readyInfo = await Promise.race([
+    await Promise.race([
       connection.init({
         wasmJs: assetUrl(HECHIMA_WASM_JS),
         dataUrl: assetUrl(HECHIMA_WASM),
         learning: true,
+        persist: false,
         scope: "tanren",
       }),
       workerFailure,
@@ -180,12 +183,19 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
     if (progressId !== null) window.clearInterval(progressId);
   }
 
-  const useLearningBackup = readyInfo?.features?.persist !== true;
-  const learningHistory = useLearningBackup ? loadLearningBackup() : [];
-  if (useLearningBackup) {
-    for (const segments of learningHistory) {
-      await connection.learn(segments);
+  try {
+    const learningHistory = await api.japaneseImeLearningHistory();
+    const legacyBackup = loadLearningBackup();
+    for (const segments of legacyBackup.slice(learningHistory.length)) {
+      await api.recordJapaneseImeLearning(segments);
+      learningHistory.push(segments);
     }
+    for (const segments of learningHistory) {
+      if (!await connection.learn(segments)) throw new Error("Japanese IME learning could not be restored.");
+    }
+  } catch (error) {
+    worker.terminate();
+    throw error;
   }
 
   setRuntimeProgress(100);
@@ -196,22 +206,24 @@ async function createRuntime(): Promise<JapaneseImeRuntime> {
       const engineCallbacks = connection.callbacks();
       return hechima.createFep({
         ...engineCallbacks,
-        ...(useLearningBackup ? {
-          learn: (segments: HechimaLearningSegment[]) => {
-            void connection.learn(segments).then((ok) => {
-              if (!ok) return;
-              learningHistory.push(segments.map((segment) => ({ ...segment })));
-              saveLearningBackup(learningHistory);
-            });
-          },
-          unlearn: () => {
-            void connection.revert().then((ok) => {
-              if (!ok || learningHistory.length === 0) return;
-              learningHistory.pop();
-              saveLearningBackup(learningHistory);
-            });
-          },
-        } : {}),
+        learn: (segments: HechimaLearningSegment[]) => {
+          const committed = segments.map((segment) => ({ ...segment }));
+          pendingLearning = pendingLearning.then(async () => {
+            if (!await connection.learn(committed)) throw new Error("Japanese IME learning failed.");
+            await api.recordJapaneseImeLearning(committed);
+          }).catch((error) => {
+            console.error("Japanese IME learning save failed:", error);
+            callbacks.learningError?.("일본어 입력 학습 기록을 저장하지 못했어요");
+          });
+        },
+        unlearn: () => {
+          pendingLearning = pendingLearning.then(async () => {
+            if (await connection.revert()) await api.undoJapaneseImeLearning();
+          }).catch((error) => {
+            console.error("Japanese IME learning undo failed:", error);
+            callbacks.learningError?.("일본어 입력 학습 기록을 되돌리지 못했어요");
+          });
+        },
         ...callbacks,
       });
     },
