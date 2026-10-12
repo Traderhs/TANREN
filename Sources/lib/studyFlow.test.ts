@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { StudyCard, SubmitResult } from "./types";
-import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchSubmission, refreshReviewEntry, reviewAnswerForMode, setPitchLevel } from "./studyFlow";
+import { activeCardTimerRuns, cardAfterResult, emptyPitchSelection, enterAction, exitStudyForDeckNavigation, pitchKeyAction, pitchSubmission, refreshReviewEntry, reviewAnswerForMode, setPitchLevel } from "./studyFlow";
 
 const card = (id = "entry:reading"): StudyCard => ({
   entry_id: "entry", variant_id: id, stage: 1, active_duration_ms: 0, mode: "reading", question: "問",
@@ -95,6 +95,15 @@ describe("writing study user actions", () => {
     selection = setPitchLevel(selection, 2, 1);
     selection = setPitchLevel(selection, 3, 0);
     expect(pitchSubmission(selection)).toEqual([0, 1, 1, 0]);
+  });
+
+  it("uses WASD and arrow keys interchangeably for pitch input", () => {
+    for (const [key, action] of [["a", "left"], ["A", "left"], ["ArrowLeft", "left"],
+      ["d", "right"], ["ArrowRight", "right"], ["w", "high"], ["ArrowUp", "high"],
+      ["s", "low"], ["ArrowDown", "low"]] as const) {
+      expect(pitchKeyAction(key)).toBe(action);
+    }
+    expect(pitchKeyAction("Enter")).toBeNull();
   });
 
   it("a new pitch question starts with no stale contour selection", () => {

@@ -15,6 +15,16 @@ export type StudyEnterAction = "submit" | "pitch" | "review" | "none";
 export type PitchLevel = 0 | 1;
 export type PitchSelection = Array<PitchLevel | null>;
 
+export function pitchKeyAction(key: string): "left" | "right" | "high" | "low" | null {
+  switch (key.toLowerCase()) {
+    case "arrowleft": case "a": return "left";
+    case "arrowright": case "d": return "right";
+    case "arrowup": case "w": return "high";
+    case "arrowdown": case "s": return "low";
+    default: return null;
+  }
+}
+
 export function emptyPitchSelection(moraCount: number): PitchSelection {
   return Array.from({ length: moraCount }, () => null);
 }

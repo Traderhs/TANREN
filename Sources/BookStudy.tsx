@@ -7,6 +7,7 @@ import {
   activeCardTimerRuns,
   cardAfterResult,
   emptyPitchSelection,
+  pitchKeyAction,
   pitchSubmission,
   reviewAnswerForMode,
   refreshReviewEntry,
@@ -1108,22 +1109,24 @@ export function BookStudy({
   }
 
   function pitchKeydown(event: ReactKeyboardEvent<HTMLDivElement>, index: number) {
-    if (event.key === "ArrowLeft") {
+    if (event.ctrlKey || event.altKey || event.metaKey || event.nativeEvent.isComposing) return;
+    const action = pitchKeyAction(event.key);
+    if (action === "left") {
       event.preventDefault();
       focusPitch(index - 1, !event.repeat);
       return;
     }
-    if (event.key === "ArrowRight") {
+    if (action === "right") {
       event.preventDefault();
       focusPitch(index + 1, !event.repeat);
       return;
     }
-    if (event.key === "ArrowUp") {
+    if (action === "high") {
       event.preventDefault();
       choosePitch(index, 1, true, !event.repeat);
       return;
     }
-    if (event.key === "ArrowDown") {
+    if (action === "low") {
       event.preventDefault();
       choosePitch(index, 0, true, !event.repeat);
       return;
