@@ -576,6 +576,7 @@ export function BookStudy({
       interkeyGapsMs: [...currentTiming.gaps],
       imeCompositionMs: Math.round(currentTiming.compositionMs + activeCompositionMs),
     };
+    composing.current = false; // IME reset does not emit a composition-end event.
     timing.current = {
       start: currentNow,
       first: null,
