@@ -1195,7 +1195,7 @@ export function BookStudy({
     <header className="book-learning-header">
       {review && !pitchQuestion && <button type="button" className="book-close ghost" onClick={exitStudy} disabled={busy} aria-label="책으로 돌아가기" title="책으로 돌아가기" />}
       <div className="learning-stage">
-        <span>{card?.stage ?? lastStage.current}단계</span>
+        <span>{(card?.stage ?? lastStage.current) === 0 ? "약점 단련" : `${card?.stage ?? lastStage.current}단계`}</span>
         <strong aria-label={`완료 문항 ${completedCount} / ${total}`}>{completedCount.toLocaleString("ko-KR")} / {total.toLocaleString("ko-KR")}</strong>
       </div>
       <div className="learning-stage-time" role="timer" aria-label={`이번 회독 공부 시간 ${formatStageStudyTime(stageStudyTimeMs)}`}>
@@ -1217,7 +1217,7 @@ export function BookStudy({
             <div>
               <span className="learning-eyebrow">STAGE COMPLETE</span>
               <h1>한 걸음 더, 익숙해졌어요</h1>
-              <p>{lastStage.current}단계를 모두 마쳤어요</p>
+              <p>{lastStage.current === 0 ? "약점 단련을 모두 마쳤어요" : `${lastStage.current}단계를 모두 마쳤어요`}</p>
             </div>
           </div>
         </div>

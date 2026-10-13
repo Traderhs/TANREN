@@ -292,7 +292,6 @@ fn start_study_session(state: &AppState, deck_id: String, stage: Option<u32>) ->
     let entries = state.db.entries(&deck_id)?;
     if entries.is_empty() { return Err("먼저 표현을 추가해주세요".into()); }
     let selected_stage = stage.unwrap_or(deck.current_stage);
-    let slots = state.db.ensure_stage_schedule(&deck_id, selected_stage, &entries)?;
 
     let mut engine = state.engine.lock().map_err(|_| "학습 상태를 불러오지 못했어요")?;
     let stale_session = if let Some(session) = engine.session.as_ref() {
@@ -306,6 +305,7 @@ fn start_study_session(state: &AppState, deck_id: String, stage: Option<u32>) ->
     if engine.session.as_ref().is_some_and(|session| session.deck_id != deck_id || session.stage != selected_stage) {
         return Err("다른 책이나 단계를 학습 중이에요 먼저 종료해주세요".into());
     }
+    let slots = state.db.ensure_stage_schedule(&deck_id, selected_stage, &entries)?;
     if engine.session.is_none() {
         let mut session = if let Some(persisted) = state.db.load_session(&deck_id, selected_stage)? {
             persisted
@@ -329,7 +329,7 @@ fn start_study_session(state: &AppState, deck_id: String, stage: Option<u32>) ->
         let _ = input.remember_current();
     }
     let result = resume_session(&state, &mut engine)?;
-    state.db.select_stage(&deck_id, selected_stage)?;
+    if selected_stage > 0 { state.db.select_stage(&deck_id, selected_stage)?; }
     Ok(result)
 }
 
@@ -1377,8 +1377,12 @@ fn complete_current_stage(state: &AppState, engine: &mut Engine) -> Result<Submi
     let session = engine.session.as_ref().ok_or("진행 중인 학습이 없어요")?;
         (session.deck_id.clone(), session.stage, session.active_duration_ms, session.queue.completed_cycles as u32 + 1)
     };
-    state.db.mark_stage_completed(&deck_id, stage, duration_ms, cycles)?;
-    state.db.clear_stage_session(&deck_id, stage)?;
+    if stage == 0 {
+        state.db.complete_weak_review(&deck_id, duration_ms, cycles)?;
+    } else {
+        state.db.mark_stage_completed(&deck_id, stage, duration_ms, cycles)?;
+        state.db.clear_stage_session(&deck_id, stage)?;
+    }
     engine.session = None;
     let _ = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요")?.restore();
     Ok(SubmitResult::simple(SubmitStatus::StageComplete))

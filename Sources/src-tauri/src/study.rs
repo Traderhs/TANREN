@@ -257,7 +257,12 @@ impl StudySession {
         checkpoint: usize,
         seed: u64,
     ) -> Option<Self> {
-        let study_range = stage_study_range(entry_slots.len(), increment, checkpoint, stage)?;
+        let study_range = if stage == 0 {
+            if entry_slots.is_empty() { return None; }
+            StudyRange { label: "약점 단련".into(), start: 0, end: entry_slots.len(), cumulative: false }
+        } else {
+            stage_study_range(entry_slots.len(), increment, checkpoint, stage)?
+        };
         let variants = variants_for_slots(&entry_slots, entries, modes, &study_range);
         let total = variants.len();
         Some(Self {

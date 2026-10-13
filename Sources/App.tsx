@@ -1392,7 +1392,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
       return;
     }
     let disposed = false;
-    const stages = Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1);
+    const stages = [0, ...Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1)];
     void api.stageSchedules(openedDeck.id, stages).catch(async () => {
       // Keep valid stage summaries available when an individual snapshot is corrupt.
       const schedules = await Promise.all(stages.map((stage) => api.stageSchedule(openedDeck.id, stage).catch(() => null)));
@@ -1496,7 +1496,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     setEntryMessage("");
     try {
       const stats = await api.stageStatsAt(openedDeck.id, stage, clearIndex);
-      setCompletionReplay({ stage, total: entryCount, stats });
+      setCompletionReplay({ stage, total: stage === 0 ? stats.attempts - stats.retry_count : entryCount, stats });
       setStudyResult({ status: "stage_complete" });
       if (reduceMotion) {
         flipBookRef.current?.pageFlip?.().turnToPage(BOOK_STUDY_PAGE);
@@ -1869,13 +1869,14 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     scheduleBookFlutter(sessionKey, 4);
   };
 
-  const bookStageCards = useMemo(() => openedDeck ? Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1).map((stage) => {
-    const fallbackRange = openedDeck.study_ranges[stage - 1];
+  const bookStageCards = useMemo(() => openedDeck ? [0, ...Array.from({ length: openedDeck.total_stage_count }, (_, index) => index + 1)].map((stage) => {
+    const weakReview = stage === 0;
+    const fallbackRange = weakReview ? undefined : openedDeck.study_ranges[stage - 1];
     const schedule = stageSchedules[stage];
     const current = Boolean(schedule?.active);
     const range = schedule?.study_range ?? fallbackRange;
     const entryCount = range ? Math.max(0, range.end - range.start) : 0;
-    const completed = Boolean(schedule?.completed);
+    const completed = !weakReview && Boolean(schedule?.completed);
     return <div className={`book-stage-group ${current ? "is-current-stage" : ""} ${completed ? "is-completed-stage" : ""}`} key={stage}>
       <button
         type="button"
@@ -1887,20 +1888,21 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
             void openStageCompletion(stage, Number(clearIndex), entryCount);
             return;
           }
+          if (weakReview && entryCount === 0) return;
           void startBookStudy(stage);
         }}
       >
         <strong className={`book-stage-title ${range?.cumulative ? "is-cumulative" : ""}`}>
           {range?.cumulative && <small>총복습</small>}
-          <span>{numberFormat.format(stage)}단계</span>
+          <span>{weakReview ? "약점 단련" : `${numberFormat.format(stage)}단계`}</span>
         </strong>
 
         <span className={`book-stage-middle ${schedule?.clear_times_ms.length ? "has-clear-times" : ""}`}>
-          <span className="book-stage-range" aria-label={`${stage}단계 학습 단계`}>
+          <span className="book-stage-range" aria-label={weakReview ? "약점 단련" : `${stage}단계 학습 단계`}>
             {range && <>
               <span
                 className={`book-stage-range-link ${schedule?.active ? "is-current" : ""}`}
-              >{formatStudyRangeLabel(range.label)}</span>
+              >{weakReview ? (schedule?.active ? "진행 중" : "수집 중") : formatStudyRangeLabel(range.label)}</span>
               <span className="book-stage-range-meta">
                 <span>{numberFormat.format(entryCount)}개</span>
               </span>

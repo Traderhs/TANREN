@@ -12,9 +12,53 @@ use crate::{
     timers::TypingProfileState,
 };
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const CHECKPOINT_SIZE: usize = 300;
 const OLD_CHECKPOINT_SIZE: usize = 500;
+
+fn seed_weak_review_candidates(tx: &Transaction<'_>, deck_id: Option<&str>) -> Result<(), String> {
+    tx.execute(
+        "INSERT OR IGNORE INTO weak_review_candidates(deck_id,entry_id,collected_at) \
+         SELECT recent.deck_id,recent.entry_id,?2 FROM ( \
+           SELECT a.deck_id,a.entry_id,CASE WHEN a.base_correct=0 OR a.pitch_correct=0 THEN 1 ELSE 0 END AS incorrect, \
+                  ROW_NUMBER() OVER (PARTITION BY a.deck_id,a.entry_id ORDER BY a.timestamp DESC,a.rowid DESC) AS rank \
+           FROM attempts a JOIN entries e ON e.id=a.entry_id AND e.deleted_at IS NULL \
+           WHERE (?1 IS NULL OR a.deck_id=?1) \
+             AND (a.base_correct=0 OR a.pitch_correct IS NOT NULL OR a.joint_correct=1) \
+             AND ( \
+               (a.stage>0 AND a.timestamp>COALESCE((SELECT MAX(completed_at) FROM stage_completions WHERE deck_id=a.deck_id AND stage=0),'')) \
+               OR (a.stage=0 AND a.timestamp>COALESCE((SELECT completed_at FROM stage_completions WHERE deck_id=a.deck_id AND stage=0 ORDER BY completed_at DESC,id DESC LIMIT 1 OFFSET 1),'') \
+                   AND a.timestamp<=(SELECT MAX(completed_at) FROM stage_completions WHERE deck_id=a.deck_id AND stage=0)) \
+             ) \
+             AND NOT EXISTS(SELECT 1 FROM stage_schedules WHERE deck_id=a.deck_id AND stage=0) \
+         ) recent WHERE recent.rank<=5 \
+         GROUP BY recent.deck_id,recent.entry_id \
+         HAVING SUM(recent.incorrect)>=2",
+        params![deck_id, now()],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn collect_weak_review_candidate(tx: &Transaction<'_>, deck_id: &str, entry_id: &str) -> Result<(), String> {
+    tx.execute(
+        "INSERT OR IGNORE INTO weak_review_candidates(deck_id,entry_id,collected_at) \
+         SELECT ?1,?2,?3 WHERE \
+           NOT EXISTS(SELECT 1 FROM stage_schedules WHERE deck_id=?1 AND stage=0) \
+           AND (SELECT COUNT(*) FROM ( \
+             SELECT CASE WHEN base_correct=0 OR pitch_correct=0 THEN 1 ELSE 0 END AS incorrect FROM attempts \
+             WHERE deck_id=?1 AND entry_id=?2 \
+               AND (base_correct=0 OR pitch_correct IS NOT NULL OR joint_correct=1) \
+               AND ( \
+                 (stage>0 AND timestamp>COALESCE((SELECT MAX(completed_at) FROM stage_completions WHERE deck_id=?1 AND stage=0),'')) \
+                 OR (stage=0 AND timestamp>COALESCE((SELECT completed_at FROM stage_completions WHERE deck_id=?1 AND stage=0 ORDER BY completed_at DESC,id DESC LIMIT 1 OFFSET 1),'') \
+                     AND timestamp<=(SELECT MAX(completed_at) FROM stage_completions WHERE deck_id=?1 AND stage=0)) \
+               ) \
+             ORDER BY timestamp DESC,rowid DESC LIMIT 5 \
+           ) WHERE incorrect=1)>=2",
+        params![deck_id, entry_id, now()],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 fn mapped_stage(ranges: &[StudyRange], old: &StudyRange) -> u32 {
     let index = if old.cumulative {
@@ -248,7 +292,7 @@ impl StatsAggregate {
     fn record(&mut self, base_correct: bool, pitch_correct: Option<bool>, joint_correct: bool, recall_latency_ms: u64, typing_duration_ms: u64) {
         self.attempts += 1;
         self.base_correct += usize::from(base_correct);
-        self.joint_correct += usize::from(joint_correct);
+        self.joint_correct += usize::from(base_correct && pitch_correct.unwrap_or(joint_correct));
         if let Some(correct) = pitch_correct {
             self.pitch_attempts += 1;
             self.pitch_correct += usize::from(correct);
@@ -388,6 +432,21 @@ impl Database {
                 }
                 let tx = conn.transaction().map_err(|e| e.to_string())?;
                 migrate_checkpoint_decks(&tx, None)?;
+                tx.execute("UPDATE schema_info SET version=18 WHERE id=1", []).map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                version = 18;
+            }
+            if version == 18 {
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS weak_review_candidates (\
+                        deck_id TEXT NOT NULL REFERENCES decks(id),\
+                        entry_id TEXT NOT NULL REFERENCES entries(id),\
+                        collected_at TEXT NOT NULL,\
+                        PRIMARY KEY(deck_id,entry_id)\
+                    );",
+                ).map_err(|e| e.to_string())?;
+                seed_weak_review_candidates(&tx, None)?;
                 tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [SCHEMA_VERSION]).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 version = SCHEMA_VERSION;
@@ -562,6 +621,13 @@ impl Database {
               device_id TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_stage_completions_deck_stage ON stage_completions(deck_id, stage, completed_at);
+
+            CREATE TABLE IF NOT EXISTS weak_review_candidates (
+              deck_id TEXT NOT NULL REFERENCES decks(id),
+              entry_id TEXT NOT NULL REFERENCES entries(id),
+              collected_at TEXT NOT NULL,
+              PRIMARY KEY(deck_id, entry_id)
+            );
 
             CREATE TABLE IF NOT EXISTS attempts (
               id TEXT PRIMARY KEY,
@@ -789,6 +855,20 @@ impl Database {
         Ok(())
     }
 
+    pub fn complete_weak_review(&self, deck_id: &str, duration_ms: u64, cycle_count: u32) -> Result<(), String> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO stage_completions(id,deck_id,stage,duration_ms,cycle_count,completed_at,device_id) VALUES(?1,?2,0,?3,?4,?5,?6)",
+            params![Uuid::new_v4().to_string(), deck_id, duration_ms as i64, cycle_count as i64, now(), self.device_id],
+        ).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM stage_states WHERE deck_id=?1 AND stage=0", [deck_id]).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM stage_schedules WHERE deck_id=?1 AND stage=0", [deck_id]).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM weak_review_candidates WHERE deck_id=?1", [deck_id]).map_err(|e| e.to_string())?;
+        seed_weak_review_candidates(&tx, Some(deck_id))?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn stage_completion_stats(&self, deck_id: &str, stage: u32) -> Result<StageCompletionStats, String> {
         self.stage_completion_stats_for_clear(deck_id, stage, None)
     }
@@ -843,7 +923,7 @@ impl Database {
         ))).map_err(|e| e.to_string())?;
         for row in rows {
             let (entry_id, base_correct, pitch_correct, joint_correct, recall_latency_ms, typing_duration_ms, failure_type) = row.map_err(|e| e.to_string())?;
-            if seen_entries.insert(entry_id) && joint_correct {
+            if seen_entries.insert(entry_id) && base_correct && pitch_correct.unwrap_or(joint_correct) {
                 first_passes += 1;
             }
             if failure_type.as_deref().is_some_and(|failure| matches!(failure, "RECALL_TIMEOUT" | "COMPLETION_TIMEOUT")) {
@@ -929,6 +1009,33 @@ impl Database {
     }
 
     pub fn ensure_stage_schedule(&self, deck_id: &str, stage: u32, _live_entries: &[EntryRecord]) -> Result<Vec<Option<String>>, String> {
+        if stage == 0 {
+            let mut conn = self.conn()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            let previous: Option<String> = tx.query_row(
+                "SELECT entry_slots_json FROM stage_schedules WHERE deck_id=?1 AND stage=0",
+                [deck_id], |row| row.get(0),
+            ).optional().map_err(|e| e.to_string())?;
+            if let Some(raw) = previous {
+                return serde_json::from_str(&raw).map_err(|e| e.to_string());
+            }
+            let slots = {
+                let mut stmt = tx.prepare(
+                    "SELECT c.entry_id FROM weak_review_candidates c JOIN entries e ON e.id=c.entry_id AND e.deleted_at IS NULL WHERE c.deck_id=?1 ORDER BY c.collected_at,c.rowid",
+                ).map_err(|e| e.to_string())?;
+                stmt.query_map([deck_id], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .map(|row| row.map(Some))
+                    .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            };
+            if slots.is_empty() { return Err("아직 모인 약점 어휘가 없어요".into()); }
+            tx.execute(
+                "INSERT INTO stage_schedules(deck_id,stage,entry_slots_json,created_at,device_id) VALUES(?1,0,?2,?3,?4)",
+                params![deck_id,serde_json::to_string(&slots).map_err(|e| e.to_string())?,now(),self.device_id],
+            ).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(slots);
+        }
         if let Some(slots) = self.load_stage_schedule(deck_id, stage)? {
             return Ok(slots);
         }
@@ -959,6 +1066,28 @@ impl Database {
         let mut clears_query = conn.prepare("SELECT duration_ms,cycle_count FROM stage_completions WHERE deck_id=?1 AND stage=?2 ORDER BY completed_at,id").map_err(|e| e.to_string())?;
         for &stage in stages {
             let raw: Option<String> = slots_query.query_row(params![deck_id, stage as i64], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
+            if stage == 0 {
+                let locked = raw.is_some();
+                let count: usize = if let Some(ref raw) = raw {
+                    serde_json::from_str::<Vec<Option<String>>>(raw).map_err(|e| e.to_string())?.len()
+                } else {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM weak_review_candidates c JOIN entries e ON e.id=c.entry_id AND e.deleted_at IS NULL WHERE c.deck_id=?1",
+                        [deck_id], |row| row.get(0),
+                    ).map_err(|e| e.to_string())?
+                };
+                let clears = clears_query.query_map(params![deck_id, 0], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                    .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+                summaries.push(StageScheduleSummary {
+                    stage: 0,
+                    study_range: StudyRange { label: "약점 단련".into(), start: 0, end: count, cumulative: false },
+                    completed: false,
+                    active: locked,
+                    clear_times_ms: clears.iter().map(|(duration, _)| (*duration).max(0) as u64).collect(),
+                    clear_cycles: clears.iter().map(|(_, cycles)| (*cycles).max(1) as u32).collect(),
+                });
+                continue;
+            }
             let slot_count = match raw {
                 Some(raw) => serde_json::from_str::<Vec<Option<String>>>(&raw).map_err(|e| e.to_string())?.len(),
                 None => match fallback_count {
@@ -998,7 +1127,7 @@ impl Database {
         let mut slots = Vec::<Option<String>>::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT stage,entry_slots_json FROM stage_schedules WHERE deck_id=?1 ORDER BY stage",
+                "SELECT stage,entry_slots_json FROM stage_schedules WHERE deck_id=?1 AND stage>0 ORDER BY stage",
             ).map_err(|e| e.to_string())?;
             let rows = stmt.query_map([deck_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
                 .map_err(|e| e.to_string())?;
@@ -1607,6 +1736,7 @@ impl Database {
             "INSERT INTO attempts(id,entry_id,deck_id,variant,stage,range_label,answer_text,base_correct,pitch_correct,joint_correct,grading_method,semantic_score,recall_latency_ms,typing_duration_ms,total_duration_ms,failure_type,timestamp,device_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![id,entry_id,deck_id,variant.as_str(),stage,range_label,answer,base_correct,pitch_correct,joint_correct,grading_method,semantic_score,recall_latency_ms,typing_duration_ms,recall_latency_ms+typing_duration_ms,failure_type,now(),self.device_id],
         ).map_err(|e|e.to_string())?;
+        if stage > 0 { collect_weak_review_candidate(&tx, deck_id, entry_id)?; }
         journal(&tx, &id, "attempt", &self.device_id, 1, "insert", &serde_json::json!({"entry_id":entry_id,"deck_id":deck_id,"variant":variant,"stage":stage,"range_label":range_label}))?;
         tx.commit().map_err(|e|e.to_string())
     }
@@ -1617,6 +1747,7 @@ impl Database {
         let id:Option<String>=tx.query_row("SELECT id FROM attempts WHERE deck_id=?1 AND entry_id=?2 AND variant=?3 ORDER BY timestamp DESC LIMIT 1",params![deck_id,entry_id,variant.as_str()],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         if let Some(id)=id {
             tx.execute("UPDATE attempts SET pitch_correct=?1,joint_correct=?2,failure_type=COALESCE(?3,failure_type) WHERE id=?4",params![correct,joint_correct,failure_type,id]).map_err(|e|e.to_string())?;
+            collect_weak_review_candidate(&tx, deck_id, entry_id)?;
             journal(&tx, &id, "attempt", &self.device_id, 2, "update", &serde_json::json!({"pitch_correct":correct,"joint_correct":joint_correct,"failure_type":failure_type}))?;
         }
         tx.commit().map_err(|e|e.to_string())
@@ -2319,6 +2450,7 @@ impl Database {
             ("stage_schedules", "SELECT * FROM stage_schedules WHERE deck_id=?1 ORDER BY stage"),
             ("stage_states", "SELECT * FROM stage_states WHERE deck_id=?1 ORDER BY stage"),
             ("stage_completions", "SELECT * FROM stage_completions WHERE deck_id=?1 ORDER BY stage"),
+            ("weak_review_candidates", "SELECT * FROM weak_review_candidates WHERE deck_id=?1 ORDER BY collected_at"),
             ("attempts", "SELECT * FROM attempts WHERE deck_id=?1 ORDER BY timestamp"),
             ("typing_profiles", "SELECT * FROM typing_profiles WHERE deck_id=?1"),
             ("grading_decisions", "SELECT g.* FROM grading_decisions g JOIN entries e ON e.id=g.entry_id WHERE e.deck_id=?1"),
@@ -2350,7 +2482,7 @@ impl Database {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM decks WHERE id=?1)", [&deck_id], |row| row.get(0)).map_err(|e| e.to_string())?;
         if exists { return Err("this deck already exists; restore into a fresh TANREN database or delete the existing database first".into()); }
-        let order = ["decks", "entries", "entry_aliases", "japanese_analyses", "pitch_patterns", "audio_assets", "audio_playback_state", "stage_schedules", "stage_states", "stage_completions", "attempts", "typing_profiles", "grading_decisions", "enrichment_jobs", "sync_journal"];
+        let order = ["decks", "entries", "entry_aliases", "japanese_analyses", "pitch_patterns", "audio_assets", "audio_playback_state", "stage_schedules", "stage_states", "stage_completions", "weak_review_candidates", "attempts", "typing_profiles", "grading_decisions", "enrichment_jobs", "sync_journal"];
         for table in order {
             if let Some(rows) = tables.get(table).and_then(Value::as_array) {
                 for row in rows { insert_json_row(&tx, table, row)?; }
@@ -2358,6 +2490,9 @@ impl Database {
         }
         purge_retired_mode(&tx, "speaking")?;
         migrate_checkpoint_decks(&tx, Some(&deck_id))?;
+        if !tables.contains_key("weak_review_candidates") {
+            seed_weak_review_candidates(&tx, Some(&deck_id))?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(deck_id)
     }
@@ -2400,7 +2535,7 @@ impl Database {
             [],
             |row| row.get(0),
         ).map_err(|e| format!("백업 버전을 확인하지 못했어요: {e}"))?;
-        if !matches!(version, 13 | 14 | 15 | 16 | 17 | SCHEMA_VERSION) {
+        if !matches!(version, 13 | 14 | 15 | 16 | 17 | 18 | SCHEMA_VERSION) {
             return Err("현재 버전과 맞지 않는 TANREN 백업이에요".into());
         }
         let integrity: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(|e| e.to_string())?;
@@ -2484,6 +2619,246 @@ fn local_date(timestamp:&str)->Result<String,String>{
 mod tests{
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn schema_18_upgrade_collects_existing_frequently_missed_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let db = Database::open(&path).unwrap();
+        let deck = db.create_deck("Existing", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "語".into(), meanings: vec!["말".into()], reading: None,
+        }]).unwrap();
+        let id = db.entries(&deck.id).unwrap()[0].id.clone();
+        for _ in 0..2 {
+            db.insert_attempt(&id, &deck.id, StudyMode::Reading, 1, "0~49", "wrong",
+                false, None, false, "test", None, 100, 100, Some("WRONG_ANSWER")).unwrap();
+        }
+        let conn = db.conn().unwrap();
+        conn.execute("DROP TABLE weak_review_candidates", []).unwrap();
+        conn.execute("UPDATE schema_info SET version=18", []).unwrap();
+        drop(conn);
+        drop(db);
+
+        let migrated = Database::open(&path).unwrap();
+        assert_eq!(migrated.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 1);
+        assert_eq!(migrated.conn().unwrap().query_row("SELECT version FROM schema_info", [],
+            |row| row.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn weak_review_misses_carry_to_next_round_without_replaying_older_cycles() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.sqlite")).unwrap();
+        let deck = db.create_deck("Carry", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[
+            EntryDraft { term: "一".into(), meanings: vec!["하나".into()], reading: None },
+            EntryDraft { term: "二".into(), meanings: vec!["둘".into()], reading: None },
+        ]).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let a = &entries[0].id;
+        let b = &entries[1].id;
+        let answer = |entry_id: &str, stage: u32, correct: bool| {
+            db.insert_attempt(entry_id, &deck.id, StudyMode::Reading, stage, "0~1", "response",
+                correct, None, correct, "test", None, 100, 100,
+                (!correct).then_some("WRONG_ANSWER")).unwrap();
+        };
+
+        answer(a, 1, false);
+        answer(a, 1, false);
+        assert_eq!(db.ensure_stage_schedule(&deck.id, 0, &entries).unwrap(), vec![Some(a.clone())]);
+        answer(b, 1, false);
+        answer(b, 1, false);
+        answer(a, 0, false);
+        db.insert_attempt(a, &deck.id, StudyMode::Reading, 0, "약점 단련", "pitch-miss",
+            true, Some(false), true, "legacy", None, 100, 100, None).unwrap();
+        answer(a, 0, true);
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 1);
+        db.complete_weak_review(&deck.id, 1_000, 3).unwrap();
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 1);
+        assert_eq!(db.ensure_stage_schedule(&deck.id, 0, &entries).unwrap(), vec![Some(a.clone())]);
+
+        answer(a, 0, true);
+        db.complete_weak_review(&deck.id, 600, 1).unwrap();
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 0);
+        answer(b, 1, false);
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 0);
+        answer(b, 1, false);
+        assert_eq!(db.ensure_stage_schedule(&deck.id, 0, &entries).unwrap(), vec![Some(b.clone())]);
+    }
+
+    #[test]
+    fn weak_review_one_miss_contributes_to_later_normal_stage_selection() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.sqlite")).unwrap();
+        let deck = db.create_deck("Carry one", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "一".into(), meanings: vec!["하나".into()], reading: None,
+        }]).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let id = &entries[0].id;
+        for _ in 0..2 {
+            db.insert_attempt(id, &deck.id, StudyMode::Reading, 1, "0~0", "wrong",
+                false, None, false, "test", None, 100, 100, Some("WRONG_ANSWER")).unwrap();
+        }
+        db.ensure_stage_schedule(&deck.id, 0, &entries).unwrap();
+        db.insert_attempt(id, &deck.id, StudyMode::Reading, 0, "약점 단련", "wrong",
+            false, None, false, "test", None, 100, 100, Some("WRONG_ANSWER")).unwrap();
+        db.insert_attempt(id, &deck.id, StudyMode::Reading, 0, "약점 단련", "correct",
+            true, None, true, "test", None, 100, 100, None).unwrap();
+        db.complete_weak_review(&deck.id, 900, 2).unwrap();
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 0);
+        db.insert_attempt(id, &deck.id, StudyMode::Reading, 1, "0~0", "wrong",
+            false, None, false, "test", None, 100, 100, Some("WRONG_ANSWER")).unwrap();
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 1);
+    }
+
+    #[test]
+    fn weak_review_uses_strict_base_and_pitch_grades_in_book_and_global_stats() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.sqlite")).unwrap();
+        let deck = db.create_deck("Japanese", "ko-KR", "ja-JP").unwrap();
+        let other = db.create_deck("Other", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &(0..4).map(|i| EntryDraft {
+            term: format!("word{i}"), meanings: vec![format!("meaning{i}")], reading: None,
+        }).collect::<Vec<_>>()).unwrap();
+        db.import_entries(&other.id, "ja-JP", &[EntryDraft {
+            term: "other".into(), meanings: vec!["different".into()], reading: None,
+        }]).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let a = &entries[0].id;
+        let b = &entries[1].id;
+        let c = &entries[2].id;
+        let d = &entries[3].id;
+        for _ in 0..2 {
+            // Historical joint_correct may disagree with the strict base/pitch conjunction.
+            db.insert_attempt(a, &deck.id, StudyMode::Reading, 1, "0~3", "base-pass",
+                true, Some(false), true, "legacy", None, 100, 100, None).unwrap();
+            db.insert_attempt(b, &deck.id, StudyMode::Reading, 1, "0~3", "base-fail",
+                false, Some(true), true, "legacy", None, 100, 100, None).unwrap();
+            db.insert_attempt(c, &deck.id, StudyMode::Reading, 1, "0~3", "both-pass",
+                true, Some(true), false, "legacy", None, 100, 100, None).unwrap();
+            db.insert_attempt(d, &deck.id, StudyMode::Reading, 1, "0~3", "pitch-pending",
+                true, None, false, "pending", None, 100, 100, None).unwrap();
+        }
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 2);
+        let snapshot = db.ensure_stage_schedule(&deck.id, 0, &entries).unwrap();
+        assert_eq!(snapshot, vec![Some(a.clone()), Some(b.clone())]);
+        db.insert_attempt(a, &deck.id, StudyMode::Reading, 0, "약점 단련", "pitch-fail",
+            true, Some(false), true, "legacy", None, 100, 100, None).unwrap();
+        db.insert_attempt(a, &deck.id, StudyMode::Reading, 0, "약점 단련", "both-pass",
+            true, Some(true), true, "test", None, 100, 100, None).unwrap();
+        db.record_study_activity(&deck.id, Some(StudyMode::Reading), 2_500).unwrap();
+        let other_entry = db.entries(&other.id).unwrap().remove(0);
+        db.insert_attempt(&other_entry.id, &other.id, StudyMode::Writing, 1, "0~0", "other",
+            true, None, true, "test", None, 100, 100, None).unwrap();
+        db.record_study_activity(&other.id, Some(StudyMode::Writing), 1_000).unwrap();
+        db.complete_weak_review(&deck.id, 2_500, 2).unwrap();
+
+        let stage = db.stage_completion_stats(&deck.id, 0).unwrap();
+        assert_eq!(stage.attempts, 2);
+        assert_eq!(stage.base_accuracy, Some(1.0));
+        assert_eq!(stage.pitch_accuracy, Some(0.5));
+        assert_eq!(stage.joint_accuracy, Some(0.5));
+        assert_eq!(stage.first_pass_accuracy, Some(0.0));
+        assert_eq!(stage.study_time_ms, 2_500);
+        let book = db.library_stats(Some(&deck.id)).unwrap();
+        let global = db.library_stats(None).unwrap();
+        assert_eq!(book.attempts, 10);
+        assert_eq!(book.joint_accuracy, Some(0.3));
+        assert_eq!(book.study_time_ms, 2_500);
+        assert_eq!(book.history.last().unwrap().attempts, 10);
+        assert_eq!(book.history.last().unwrap().study_time_ms, 2_500);
+        assert_eq!(global.attempts, 11);
+        assert_eq!(global.study_time_ms, 3_500);
+        assert!((global.joint_accuracy.unwrap() - 4.0 / 11.0).abs() < 1e-9);
+        assert_eq!(db.library_stats(Some(&other.id)).unwrap().attempts, 1);
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().clear_times_ms, vec![2_500]);
+    }
+
+    #[test]
+    fn weak_review_collects_freezes_recovers_and_starts_fresh_after_clear() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("study.sqlite");
+        let db = Database::open(&path).unwrap();
+        let deck = db.create_deck("Japanese", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &(0..3).map(|index| EntryDraft {
+            term: format!("word{index}"), meanings: vec![format!("meaning{index}")], reading: None,
+        }).collect::<Vec<_>>()).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let a = &entries[0].id;
+        let b = &entries[1].id;
+        let answer = |id: &str, correct: bool, stage: u32| {
+            db.insert_attempt(id, &deck.id, StudyMode::Reading, stage, "0~49", "answer", correct,
+                None, correct, "test", None, 100, 100,
+                (!correct).then_some("WRONG_ANSWER")).unwrap();
+        };
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 0);
+        assert!(db.ensure_stage_schedule(&deck.id, 0, &entries).is_err());
+        answer(a, false, 1);
+        answer(a, true, 1);
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 0);
+        answer(a, false, 1);
+        for _ in 0..5 { answer(a, true, 1); }
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 1);
+
+        let frozen = db.ensure_stage_schedule(&deck.id, 0, &entries).unwrap();
+        assert_eq!(frozen, vec![Some(a.clone())]);
+        let session = StudySession::new_for_stage_with_slots(deck.id.clone(), 0, frozen.clone(),
+            &entries, &deck.enabled_modes, 50, 300, 42).unwrap();
+        assert_eq!(session.range().label, "약점 단련");
+        assert_eq!(session.queue.remaining_count(), 1);
+        db.save_session(&session).unwrap();
+        answer(b, false, 1);
+        answer(b, false, 1);
+        answer(a, false, 0);
+        assert_eq!(db.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 1);
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.ensure_stage_schedule(&deck.id, 0, &entries).unwrap(), frozen);
+        assert_eq!(reopened.load_session(&deck.id, 0).unwrap().unwrap().queue.remaining_count(), 1);
+        assert!(reopened.stage_schedule_summary(&deck.id, 0).unwrap().active);
+        reopened.complete_weak_review(&deck.id, 1200, 2).unwrap();
+        let cleared = reopened.stage_schedule_summary(&deck.id, 0).unwrap();
+        assert_eq!(cleared.study_range.end, 0);
+        assert!(!cleared.active);
+        assert_eq!(cleared.clear_times_ms, vec![1200]);
+        assert_eq!(cleared.clear_cycles, vec![2]);
+        assert!(reopened.load_session(&deck.id, 0).unwrap().is_none());
+        assert_eq!(reopened.deck(&deck.id).unwrap().current_stage, 1);
+        reopened.insert_attempt(b, &deck.id, StudyMode::Reading, 1, "0~49", "bad", false,
+            None, false, "test", None, 100, 100, Some("WRONG_ANSWER")).unwrap();
+        assert_eq!(reopened.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 0);
+        reopened.insert_attempt(b, &deck.id, StudyMode::Reading, 1, "0~49", "bad", false,
+            None, false, "test", None, 100, 100, Some("WRONG_ANSWER")).unwrap();
+        assert_eq!(reopened.ensure_stage_schedule(&deck.id, 0, &entries).unwrap(), vec![Some(b.clone())]);
+    }
+
+    #[test]
+    fn weak_review_counts_pitch_only_after_grading_and_survives_portable_export() {
+        let dir = tempdir().unwrap();
+        let source = Database::open(dir.path().join("source.sqlite")).unwrap();
+        let deck = source.create_deck("Pitch", "ko-KR", "ja-JP").unwrap();
+        source.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "言葉".into(), meanings: vec!["말".into()], reading: None,
+        }]).unwrap();
+        let entries = source.entries(&deck.id).unwrap();
+        let id = &entries[0].id;
+        for iteration in 0..2 {
+            source.insert_attempt(id, &deck.id, StudyMode::Writing, 1, "0~49", "言葉", true,
+                None, false, "exact", None, 100, 100, None).unwrap();
+            assert_eq!(source.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 0);
+            source.update_attempt_pitch(&deck.id, id, StudyMode::Writing, false, false, Some("PITCH_WRONG")).unwrap();
+            assert_eq!(source.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, iteration);
+        }
+        let frozen = source.ensure_stage_schedule(&deck.id, 0, &entries).unwrap();
+        let portable = source.export_deck(&deck.id).unwrap();
+        let restored = Database::open(dir.path().join("restored.sqlite")).unwrap();
+        restored.import_deck_export(&portable).unwrap();
+        assert_eq!(restored.ensure_stage_schedule(&deck.id, 0, &entries).unwrap(), frozen);
+        assert_eq!(restored.stage_schedule_summary(&deck.id, 0).unwrap().study_range.end, 1);
+    }
 
     #[test]
     fn japanese_ime_learning_survives_database_reopen_and_undo() {
