@@ -1011,7 +1011,7 @@ def resolve_voice_profiles(speakers: list[dict[str, Any]]) -> list[dict[str, Any
         speaker = by_name.get(profile["speaker_name"])
         if not speaker:
             continue
-        styles = [style for style in speaker.get("styles", []) if style.get("type", "talk") == "talk"]
+        styles = [style for style in speaker.get("styles", []) if style.get("type", "talk") in {"talk", "streaming_talk"}]
         if not styles:
             continue
         style = next((value for value in styles if str(value.get("name")) in {"ノーマル", "Normal"}), styles[0])

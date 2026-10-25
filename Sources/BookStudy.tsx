@@ -15,7 +15,7 @@ import {
   type PitchLevel,
   type PitchSelection,
 } from "./lib/studyFlow";
-import { completionDeadlineMs, completionHasTimedOut, completionIdleDisplay, firstMeaningfulInputAt, isMeaningfulInput } from "./lib/studyTimers";
+import { completionDeadlineMs, completionHasTimedOut, completionIdleDisplay, completionVisibleDeadlineReached, firstMeaningfulInputAt, isMeaningfulInput } from "./lib/studyTimers";
 import { japaneseImeEnterCommitsYomi, japaneseImeKeyStartsInput, japaneseImeKeyTap, loadJapaneseImeRuntime } from "./lib/japaneseIme";
 import type { JapaneseImeSegment, JapaneseImeSession } from "./lib/japaneseIme";
 import { playEffectSound } from "./lib/soundEffects";
@@ -563,9 +563,27 @@ export function BookStudy({
     setMeaningAnswer(value);
   }
 
+  function completionReachedVisibleZero(now: number): boolean {
+    const currentCard = cardRef.current;
+    if (!currentCard) return false;
+    const meaningPhase = currentCard.mode === "listening" && listeningPhaseRef.current === "meaning";
+    const totalMs = meaningPhase ? currentCard.listening_meaning_completion_timeout_ms : currentCard.completion_timeout_ms;
+    const idleDeadline = totalMs == null
+      ? completionDeadlineMs(
+          meaningPhase ? currentCard.listening_meaning_completion_idle_ms : currentCard.completion_idle_ms,
+          meaningPhase ? meaningComposing.current : composing.current,
+          meaningPhase ? meaningInput.current?.value ?? meaningAnswerRef.current : input.current?.value ?? answerRef.current,
+          timing.current.compositionEnd,
+          timing.current.last,
+        )
+      : null;
+    return completionVisibleDeadlineReached(idleDeadline, timing.current.first, totalMs, now);
+  }
+
   function focusListeningMeaning() {
     if (cardRef.current?.mode !== "listening" || listeningPhaseRef.current === "meaning") return;
     const currentNow = performance.now();
+    if (completionReachedVisibleZero(currentNow)) completionTimeoutSubmission.current = true;
     const currentTiming = timing.current;
     const activeCompositionMs = composing.current
       ? Math.max(0, currentNow - currentTiming.compositionStart)
@@ -1030,7 +1048,7 @@ export function BookStudy({
     const meaningTypingDurationMs = isListening
       ? Math.round(currentNow - (currentTiming.first ?? currentNow))
       : 0;
-    const isCompletionTimeoutSubmission = completionTimeoutSubmit || completionTimeoutSubmission.current;
+    const isCompletionTimeoutSubmission = completionTimeoutSubmit || completionTimeoutSubmission.current || completionReachedVisibleZero(currentNow);
     const submittedAnswer = isCompletionTimeoutSubmission
       ? input.current?.value ?? answerRef.current
       : answerRef.current;

@@ -497,6 +497,15 @@ class ScopeAndCacheFixtures(unittest.TestCase):
         self.assertNotIn("玄野武宏", speaker_names)
         self.assertIn("雀松朱司", speaker_names)
 
+    def test_voice_profiles_accept_voicevox_streaming_talk_styles(self):
+        speakers = [
+            {"name": profile["speaker_name"], "styles": [{"name": "ノーマル", "id": index, "type": "streaming_talk"}]}
+            for index, profile in enumerate(jp.VOICE_PROFILES, start=1)
+        ]
+        resolved = jp.resolve_voice_profiles(speakers)
+        self.assertEqual(len(resolved), 10)
+        self.assertEqual([profile["speaker_id"] for profile in resolved], list(range(1, 11)))
+
     def test_voicevox_metadata_is_cached_for_the_lifetime_of_the_warm_sidecar(self):
         jp._VOICEVOX_METADATA_CACHE.clear()
         calls = []

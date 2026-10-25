@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { COMPLETION_SUBMIT_GRACE_MS, completionDeadlineHasTimedOut, completionDeadlineMs, completionDelayMs, completionHasTimedOut, completionIdleDisplay, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut, totalCompletionHasTimedOut } from "./studyTimers";
+import { COMPLETION_SUBMIT_GRACE_MS, completionDeadlineHasTimedOut, completionDeadlineMs, completionDelayMs, completionHasTimedOut, completionIdleDisplay, completionVisibleDeadlineReached, firstMeaningfulInputAt, IME_COMPLETION_GRACE_MS, isMeaningfulInput, recallHasTimedOut, totalCompletionHasTimedOut } from "./studyTimers";
 
 describe("study timer semantics", () => {
   it("does not treat keydown or whitespace as meaningful recall input", () => {
@@ -57,6 +57,14 @@ describe("study timer semantics", () => {
     expect(completionDeadlineHasTimedOut(deadline, deadline + COMPLETION_SUBMIT_GRACE_MS)).toBe(true);
     expect(totalCompletionHasTimedOut(1_000, 2_000, 3_000 + COMPLETION_SUBMIT_GRACE_MS - 1)).toBe(false);
     expect(totalCompletionHasTimedOut(1_000, 2_000, 3_000 + COMPLETION_SUBMIT_GRACE_MS)).toBe(true);
+  });
+
+  it("treats Enter at the visible zero as a normal gradable completion submission", () => {
+    expect(completionVisibleDeadlineReached(null, 1_000, 2_000, 2_999)).toBe(false);
+    expect(completionVisibleDeadlineReached(null, 1_000, 2_000, 3_000)).toBe(true);
+    expect(completionHasTimedOut(null, 1_000, 2_000, 3_000)).toBe(false);
+    expect(completionVisibleDeadlineReached(3_000, 1_000, null, 3_000)).toBe(true);
+    expect(completionVisibleDeadlineReached(null, null, 2_000, 3_000)).toBe(false);
   });
 
   it("still fires the total timeout when IME composition has no idle deadline", () => {
