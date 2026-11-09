@@ -1876,6 +1876,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
     const current = Boolean(schedule?.active);
     const range = schedule?.study_range ?? fallbackRange;
     const entryCount = range ? Math.max(0, range.end - range.start) : 0;
+    const reviewCount = !weakReview && range && range.start >= 300 ? 100 : 0;
     const completed = !weakReview && Boolean(schedule?.completed);
     return <div className={`book-stage-group ${current ? "is-current-stage" : ""} ${completed ? "is-completed-stage" : ""}`} key={stage}>
       <button
@@ -1905,6 +1906,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
               >{weakReview ? (schedule?.active ? "진행 중" : "수집 중") : formatStudyRangeLabel(range.label)}</span>
               <span className="book-stage-range-meta">
                 <span>{numberFormat.format(entryCount)}개</span>
+                {reviewCount > 0 && <span>+ 복습 {reviewCount}개</span>}
               </span>
             </>}
           </span>

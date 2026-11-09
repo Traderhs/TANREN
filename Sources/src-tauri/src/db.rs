@@ -8,11 +8,11 @@ use uuid::Uuid;
 
 use crate::{
     model::{AudioAssetDraft, DeckRecord, DeckSummary, EntryDraft, EntryListRecord, EntryRecord, ImeLearningSegment, ImportResult, LibraryStats, LibraryStatsModePoint, LibraryStatsPoint, PitchConfidence, PitchQuestion, StageCompletionStats, StageScheduleSummary, StudyMode, StudyRange},
-    study::{stage_study_range, study_ranges, StudySession},
+    study::{legacy_study_ranges, stage_study_range, study_ranges, StudySession},
     timers::TypingProfileState,
 };
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 const CHECKPOINT_SIZE: usize = 300;
 const OLD_CHECKPOINT_SIZE: usize = 500;
 
@@ -114,8 +114,8 @@ fn migrate_checkpoint_decks(tx: &Transaction<'_>, only_deck: Option<&str>) -> Re
         for entry in &entries {
             if known.insert(entry.id.clone()) { slots.push(Some(entry.id.clone())); }
         }
-        let old_ranges = study_ranges(slots.len(), increment, OLD_CHECKPOINT_SIZE);
-        let new_ranges = study_ranges(slots.len(), increment, CHECKPOINT_SIZE);
+        let old_ranges = legacy_study_ranges(slots.len(), increment, OLD_CHECKPOINT_SIZE);
+        let new_ranges = legacy_study_ranges(slots.len(), increment, CHECKPOINT_SIZE);
         let next_stage = old_ranges.get(current_stage.saturating_sub(1) as usize)
             .map(|range| mapped_stage(&new_ranges, range)).unwrap_or(1);
 
@@ -201,6 +201,85 @@ fn migrate_checkpoint_decks(tx: &Transaction<'_>, only_deck: Option<&str>) -> Re
             params![CHECKPOINT_SIZE as i64, next_stage, timestamp, deck_id]).map_err(|e| e.to_string())?;
         journal(tx, &deck_id, "deck", &device_id, revision + 1, "update",
             &serde_json::json!({"checkpoint_size":CHECKPOINT_SIZE,"current_stage":next_stage}))?;
+    }
+    Ok(())
+}
+
+// Keep completed normal stages and their attempts intact. Retired cumulative stages
+// remain archived under negative stage IDs, so historical attempts are not deleted.
+fn migrate_rotating_review_decks(tx: &Transaction<'_>, only_deck: Option<&str>) -> Result<(), String> {
+    let mut decks = tx.prepare("SELECT id,increment_size,checkpoint_size,current_stage,enabled_modes FROM decks WHERE deleted_at IS NULL AND (?1 IS NULL OR id=?1)")
+        .map_err(|e| e.to_string())?;
+    let decks = decks.query_map([only_deck], |row| Ok((
+        row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize, row.get::<_, i64>(2)? as usize,
+        row.get::<_, i64>(3)? as u32, row.get::<_, String>(4)?,
+    ))).map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+
+    for (deck_id, increment, checkpoint, current_stage, modes_json) in decks {
+        let modes: Vec<StudyMode> = serde_json::from_str(&modes_json).map_err(|e| e.to_string())?;
+        let entries = {
+            let mut stmt = tx.prepare("SELECT id,term,meanings,reading FROM entries WHERE deck_id=?1 AND deleted_at IS NULL ORDER BY position")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([&deck_id], |row| {
+                let meanings: String = row.get(2)?;
+                Ok(EntryRecord { id: row.get(0)?, term: row.get(1)?, meanings: parse_json_column(&meanings, 2)?, reading: row.get(3)? })
+            }).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        let mut slot_count = entries.len();
+        {
+            let mut stmt = tx.prepare("SELECT entry_slots_json FROM stage_schedules WHERE deck_id=?1 AND stage>0")
+                .map_err(|e| e.to_string())?;
+            for row in stmt.query_map([&deck_id], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())? {
+                let slots: Vec<Option<String>> = serde_json::from_str(&row.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                slot_count = slot_count.max(slots.len());
+            }
+        }
+        let old_ranges = legacy_study_ranges(slot_count, increment, checkpoint);
+        let new_ranges = study_ranges(slot_count, increment, checkpoint);
+        if new_ranges.is_empty() { continue; }
+
+        let target_stage = |old: u32| -> u32 {
+            old_ranges.get(old.saturating_sub(1) as usize).and_then(|range| {
+                new_ranges.iter().position(|candidate| {
+                    if range.cumulative { candidate.start >= range.end }
+                    else { candidate.start == range.start && candidate.end == range.end }
+                }).map(|index| index as u32 + 1)
+            }).unwrap_or(new_ranges.len() as u32)
+        };
+
+        for table in ["stage_schedules", "stage_states", "stage_completions", "attempts"] {
+            tx.execute(&format!("UPDATE {table} SET stage=-stage WHERE deck_id=?1 AND stage>0"), [&deck_id]).map_err(|e| e.to_string())?;
+        }
+        for (index, range) in old_ranges.iter().enumerate() {
+            let old_stage = index as i64 + 1;
+            let new_stage = if range.cumulative { -old_stage } else { target_stage(old_stage as u32) as i64 };
+            if !range.cumulative {
+                for table in ["stage_schedules", "stage_states", "stage_completions", "attempts"] {
+                    tx.execute(&format!("UPDATE {table} SET stage=?1 WHERE deck_id=?2 AND stage=?3"),
+                        params![new_stage, deck_id, -old_stage]).map_err(|e| e.to_string())?;
+                }
+            }
+            tx.execute("UPDATE sync_journal SET entity_id=?1,payload=CASE WHEN json_valid(payload) AND json_type(payload,'$.stage') IS NOT NULL THEN json_set(payload,'$.stage',?2) ELSE payload END WHERE entity_type='stage_state' AND entity_id=?3",
+                params![format!("{deck_id}:{new_stage}"), new_stage, format!("{deck_id}:{old_stage}")]).map_err(|e| e.to_string())?;
+            tx.execute("UPDATE sync_journal SET payload=json_set(payload,'$.stage',?1) WHERE entity_type='attempt' AND json_valid(payload) AND json_type(payload,'$.stage') IS NOT NULL AND entity_id IN (SELECT id FROM attempts WHERE deck_id=?2 AND stage=?1)",
+                params![new_stage, deck_id]).map_err(|e| e.to_string())?;
+        }
+
+        let mut stmt = tx.prepare("SELECT stage,state_json FROM stage_states WHERE deck_id=?1 AND stage>0")
+            .map_err(|e| e.to_string())?;
+        let sessions = stmt.query_map([&deck_id], |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        for (stage, json) in sessions {
+            let mut session: StudySession = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            session.stage = stage;
+            session.review_entry_ids = None;
+            session.seed_rotating_review(&entries, &modes, increment, checkpoint);
+            tx.execute("UPDATE stage_states SET state_json=?1 WHERE deck_id=?2 AND stage=?3",
+                params![serde_json::to_string(&session).map_err(|e| e.to_string())?, deck_id, stage]).map_err(|e| e.to_string())?;
+        }
+        tx.execute("UPDATE decks SET current_stage=?1 WHERE id=?2", params![target_stage(current_stage), deck_id]).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -447,6 +526,18 @@ impl Database {
                     );",
                 ).map_err(|e| e.to_string())?;
                 seed_weak_review_candidates(&tx, None)?;
+                tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [19]).map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                version = 19;
+            }
+            if version == 19 {
+                let backup_path = self.path.with_extension(format!("before-rotation-{}.sqlite", Uuid::new_v4()));
+                let mut backup_conn = Connection::open(&backup_path).map_err(|e| e.to_string())?;
+                let backup = rusqlite::backup::Backup::new(&conn, &mut backup_conn).map_err(|e| e.to_string())?;
+                backup.run_to_completion(128, Duration::from_millis(5), None).map_err(|e| e.to_string())?;
+                drop(backup);
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                migrate_rotating_review_decks(&tx, None)?;
                 tx.execute("UPDATE schema_info SET version=?1 WHERE id=1", [SCHEMA_VERSION]).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 version = SCHEMA_VERSION;
@@ -2462,6 +2553,7 @@ impl Database {
         serde_json::to_string_pretty(&serde_json::json!({
             "format": "tanren-portable-deck",
             "version": 3,
+            "rotation_v1": true,
             "exported_at": now(),
             "tables": tables,
         })).map_err(|e| e.to_string())
@@ -2490,6 +2582,9 @@ impl Database {
         }
         purge_retired_mode(&tx, "speaking")?;
         migrate_checkpoint_decks(&tx, Some(&deck_id))?;
+        if root.get("rotation_v1").and_then(Value::as_bool) != Some(true) {
+            migrate_rotating_review_decks(&tx, Some(&deck_id))?;
+        }
         if !tables.contains_key("weak_review_candidates") {
             seed_weak_review_candidates(&tx, Some(&deck_id))?;
         }
@@ -2535,7 +2630,7 @@ impl Database {
             [],
             |row| row.get(0),
         ).map_err(|e| format!("백업 버전을 확인하지 못했어요: {e}"))?;
-        if !matches!(version, 13 | 14 | 15 | 16 | 17 | 18 | SCHEMA_VERSION) {
+        if !matches!(version, 13 | 14 | 15 | 16 | 17 | 18 | 19 | SCHEMA_VERSION) {
             return Err("현재 버전과 맞지 않는 TANREN 백업이에요".into());
         }
         let integrity: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(|e| e.to_string())?;
@@ -2896,13 +2991,21 @@ mod tests{
         let mut session = StudySession::new_for_stage_with_slots(
             deck.id.clone(), 11, slots, &entries, &deck.enabled_modes, 50, 500, 42,
         ).unwrap();
+        // Recreate the pre-rotation queue for this legacy-version fixture.
+        session.queue = crate::study::QueueState::new((500..550).map(|index| crate::model::VariantKey {
+            entry_id: entries[index].id.clone(), mode: StudyMode::Reading,
+        }).collect(), 42);
+        session.review_entry_ids = None;
+        session.range_total = 50;
         let answered = session.next_variant(10).unwrap();
         session.resolve_current(&answered, true).unwrap();
         db.save_session(&session).unwrap();
         db.mark_stage_completed(&deck.id, 10, 1234, 2).unwrap();
         db.insert_attempt(&entries[550].id, &deck.id, StudyMode::Reading, 12, "500~599", "answer", true, None, true, "exact", None, 100, 200, None).unwrap();
         db.mark_stage_completed(&deck.id, 12, 5678, 3).unwrap();
-        let baseline = db.export_deck(&deck.id).unwrap();
+        let mut baseline_json: Value = serde_json::from_str(&db.export_deck(&deck.id).unwrap()).unwrap();
+        baseline_json.as_object_mut().unwrap().remove("rotation_v1");
+        let baseline = serde_json::to_string(&baseline_json).unwrap();
         let conn = db.conn().unwrap();
         conn.execute("UPDATE schema_info SET version=17", []).unwrap();
         drop(conn);
@@ -2913,8 +3016,8 @@ mod tests{
         assert_eq!(migrated.deck(&deck.id).unwrap().current_stage, 11);
         let restored = migrated.load_session(&deck.id, 11).unwrap().unwrap();
         assert_eq!(restored.study_range.label, "300~549");
-        assert_eq!(restored.range_total, 250);
-        assert_eq!(restored.queue.remaining_count(), 249);
+        assert_eq!(restored.range_total, 350);
+        assert_eq!(restored.queue.remaining_count(), 349);
         assert!(!restored.queue.remaining.contains(&answered));
         assert_eq!(migrated.stage_schedule_summary(&deck.id, 10).unwrap().clear_times_ms, vec![1234]);
         assert_eq!(migrated.stage_schedule_summary(&deck.id, 12).unwrap().clear_times_ms, vec![5678]);
@@ -2938,7 +3041,7 @@ mod tests{
         let original = Connection::open(&backups[0]).unwrap();
         assert_eq!(original.query_row("SELECT checkpoint_size FROM decks WHERE id=?1", [&deck.id], |r| r.get::<_, i64>(0)).unwrap(), 500);
         assert_eq!(original.query_row("SELECT version FROM schema_info", [], |r| r.get::<_, i64>(0)).unwrap(), 17);
-        assert!(baseline.contains("\"checkpoint_size\": 500"));
+        assert_eq!(baseline_json["tables"]["decks"][0]["checkpoint_size"], 500);
         drop(migrated);
         let reopened = Database::open(&path).unwrap();
         assert_eq!(reopened.stage_schedule_summary(&deck.id, 12).unwrap().clear_times_ms, vec![5678]);
@@ -2953,16 +3056,73 @@ mod tests{
         restored_portable.import_deck_export(&baseline).unwrap();
         assert_eq!(restored_portable.deck(&deck.id).unwrap().checkpoint_size, 300);
         assert_eq!(restored_portable.stage_schedule_summary(&deck.id, 12).unwrap().clear_times_ms, vec![5678]);
-        assert_eq!(restored_portable.load_session(&deck.id, 11).unwrap().unwrap().queue.remaining_count(), 249);
+        assert_eq!(restored_portable.load_session(&deck.id, 11).unwrap().unwrap().queue.remaining_count(), 349);
     }
 
     #[test]
     fn legacy_stages_map_to_corresponding_300_entry_ranges() {
-        let old = study_ranges(1000, 50, OLD_CHECKPOINT_SIZE);
-        let new = study_ranges(1000, 50, CHECKPOINT_SIZE);
+        let old = legacy_study_ranges(1000, 50, OLD_CHECKPOINT_SIZE);
+        let new = legacy_study_ranges(1000, 50, CHECKPOINT_SIZE);
         for (old_stage, new_stage) in [(1, 1), (6, 6), (10, 10), (11, 11), (12, 12), (13, 14), (20, 22), (21, 23)] {
             assert_eq!(mapped_stage(&new, &old[old_stage - 1]), new_stage, "old stage {old_stage}");
         }
+    }
+
+    #[test]
+    fn schema_19_rotation_migration_keeps_normal_progress_and_archives_cumulative_history() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tanren.db");
+        let db = Database::open(&path).unwrap();
+        let deck = db.create_deck("legacy", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &(0..900).map(|index| EntryDraft {
+            term: format!("word{index}"), meanings: vec![format!("meaning{index}")], reading: None,
+        }).collect::<Vec<_>>()).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let slots = entries.iter().map(|entry| Some(entry.id.clone())).collect::<Vec<_>>();
+        db.save_stage_schedule_if_absent(&deck.id, 14, &slots).unwrap();
+        let mut session = StudySession::new_for_stage_with_slots(
+            deck.id.clone(), 13, slots, &entries, &[StudyMode::Reading], 50, 300, 7,
+        ).unwrap();
+        session.stage = 14; // the pre-rotation number for the 600~649 stage
+        session.review_entry_ids = None;
+        session.range_total = 50;
+        session.queue = crate::study::QueueState::new((600..650).map(|index| crate::model::VariantKey {
+            entry_id: entries[index].id.clone(), mode: StudyMode::Reading,
+        }).collect(), 7);
+        let passed = session.next_variant(10).unwrap();
+        session.resolve_current(&passed, true).unwrap();
+        db.save_session(&session).unwrap();
+        db.mark_stage_completed(&deck.id, 13, 1200, 2).unwrap();
+        db.insert_attempt(&entries[2].id, &deck.id, StudyMode::Reading, 13, "0~599 · cumulative", "a", true, None, true, "test", None, 100, 100, None).unwrap();
+        db.insert_attempt(&entries[600].id, &deck.id, StudyMode::Reading, 14, "600~649", "a", true, None, true, "test", None, 100, 100, None).unwrap();
+        db.conn().unwrap().execute("UPDATE decks SET current_stage=14", []).unwrap();
+        db.conn().unwrap().execute("UPDATE schema_info SET version=19", []).unwrap();
+        drop(db);
+
+        let migrated = Database::open(&path).unwrap();
+        assert_eq!(migrated.deck(&deck.id).unwrap().current_stage, 13);
+        assert_eq!(migrated.stage_schedule_summary(&deck.id, 13).unwrap().study_range.label, "600~649");
+        let resumed = migrated.load_session(&deck.id, 13).unwrap().unwrap();
+        assert_eq!(resumed.stage, 13);
+        assert_eq!(resumed.range_total, 150);
+        assert_eq!(resumed.queue.remaining_count(), 149);
+        assert!(!resumed.queue.remaining.contains(&passed));
+        assert_eq!(resumed.review_entry_ids.as_ref().unwrap().len(), 100);
+        assert!(migrated.load_session(&deck.id, 14).unwrap().is_none());
+        let conn = migrated.conn().unwrap();
+        assert_eq!(conn.query_row("SELECT stage FROM stage_completions WHERE deck_id=?1", [&deck.id], |r| r.get::<_, i64>(0)).unwrap(), -13);
+        let stages = conn.prepare("SELECT stage FROM attempts WHERE deck_id=?1 ORDER BY stage").unwrap()
+            .query_map([&deck.id], |r| r.get::<_, i64>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(stages, vec![-13, 13]);
+        assert_eq!(conn.query_row("SELECT version FROM schema_info", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        drop(conn);
+        assert!(fs::read_dir(dir.path()).unwrap().filter_map(Result::ok).any(|entry| entry.file_name().to_string_lossy().contains("before-rotation")));
+
+        let exported = migrated.export_deck(&deck.id).unwrap();
+        let portable = Database::open(dir.path().join("portable.db")).unwrap();
+        portable.import_deck_export(&exported).unwrap();
+        assert_eq!(portable.deck(&deck.id).unwrap().current_stage, 13);
+        assert_eq!(portable.load_session(&deck.id, 13).unwrap().unwrap().queue.remaining_count(), 149);
     }
 
     #[test]
@@ -3533,7 +3693,7 @@ mod tests{
     }
 
     #[test]
-    fn partial_second_block_always_keeps_a_cumulative_review_available() {
+    fn partial_second_block_keeps_only_growing_regular_stages() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
         let deck = db.create_deck("checkpoint", "ko-KR", "ja-JP").unwrap();
@@ -3542,9 +3702,9 @@ mod tests{
         }).collect::<Vec<_>>();
         db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
         let summary = db.list_decks().unwrap().remove(0);
-        assert_eq!(summary.total_stage_count, 12);
+        assert_eq!(summary.total_stage_count, 11);
         assert_eq!(db.stage_schedule_summary(&deck.id, 11).unwrap().study_range.label, "300~500");
-        assert_eq!(db.stage_schedule_summary(&deck.id, 12).unwrap().study_range.label, "0~500 · cumulative");
+        assert!(db.stage_schedule_summary(&deck.id, 12).is_err());
     }
 
     #[test]
@@ -3760,7 +3920,7 @@ mod tests{
     }
 
     #[test]
-    fn five_hundred_entries_include_second_block_cumulative_review() {
+    fn five_hundred_entries_have_regular_stages_with_rotating_review() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
         let deck = db.create_deck("stages", "ko-KR", "ja-JP").unwrap();
@@ -3772,14 +3932,13 @@ mod tests{
         db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
 
         let summary = db.list_decks().unwrap().remove(0);
-        assert_eq!(summary.total_stage_count, 11);
+        assert_eq!(summary.total_stage_count, 10);
         assert_eq!(summary.completed_stage_count, 0);
         assert_eq!(db.stage_schedule_summary(&deck.id, 1).unwrap().study_range.label, "0~49");
         assert_eq!(db.stage_schedule_summary(&deck.id, 2).unwrap().study_range.label, "0~99");
         assert_eq!(db.stage_schedule_summary(&deck.id, 7).unwrap().study_range.label, "300~349");
         assert_eq!(db.stage_schedule_summary(&deck.id, 10).unwrap().study_range.label, "300~499");
-        assert_eq!(db.stage_schedule_summary(&deck.id, 11).unwrap().study_range.label, "0~499 · cumulative");
-        assert!(db.stage_schedule_summary(&deck.id, 12).is_err());
+        assert!(db.stage_schedule_summary(&deck.id, 11).is_err());
 
         db.mark_stage_completed(&deck.id, 1, 4_320_000, 2).unwrap();
         db.mark_stage_completed(&deck.id, 1, 3_780_000, 3).unwrap();
@@ -3789,7 +3948,7 @@ mod tests{
         assert_eq!(stage_one.clear_cycles, vec![2, 3]);
         let summary = db.list_decks().unwrap().remove(0);
         assert_eq!(summary.completed_stage_count, 1);
-        assert_eq!(summary.total_stage_count, 11);
+        assert_eq!(summary.total_stage_count, 10);
 
         db.select_stage(&deck.id, 7).unwrap();
         assert_eq!(db.list_decks().unwrap().remove(0).current_stage, 7);

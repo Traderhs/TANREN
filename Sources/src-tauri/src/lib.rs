@@ -323,6 +323,7 @@ fn start_study_session(state: &AppState, deck_id: String, stage: Option<u32>) ->
             session.recover_interrupted_card();
             state.db.save_session(&session)?;
         }
+        session.seed_rotating_review(&entries, &deck.enabled_modes, deck.increment_size, deck.checkpoint_size);
         session.sync_entries(&entries, &deck.enabled_modes);
         engine.session = Some(session);
     let mut input = state.input.lock().map_err(|_| "입력 설정을 불러오지 못했어요")?;

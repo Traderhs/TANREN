@@ -47,6 +47,14 @@ pub enum PendingState {
 }
 
 pub fn study_ranges(deck_size: usize, increment: usize, checkpoint: usize) -> Vec<StudyRange> {
+    ranges_with_legacy_reviews(deck_size, increment, checkpoint, false)
+}
+
+pub fn legacy_study_ranges(deck_size: usize, increment: usize, checkpoint: usize) -> Vec<StudyRange> {
+    ranges_with_legacy_reviews(deck_size, increment, checkpoint, true)
+}
+
+fn ranges_with_legacy_reviews(deck_size: usize, increment: usize, checkpoint: usize, cumulative: bool) -> Vec<StudyRange> {
     if deck_size == 0 || increment == 0 || checkpoint == 0 { return Vec::new(); }
     let mut ranges = Vec::new();
     let mut block_start = 0;
@@ -63,7 +71,7 @@ pub fn study_ranges(deck_size: usize, increment: usize, checkpoint: usize) -> Ve
             if end == block_end { break; }
             end = (end + increment).min(block_end);
         }
-        if block_start > 0 {
+        if cumulative && block_start > 0 {
             ranges.push(StudyRange {
                 label: format!("0~{} · cumulative", block_end - 1),
                 start: 0,
@@ -74,6 +82,26 @@ pub fn study_ranges(deck_size: usize, increment: usize, checkpoint: usize) -> Ve
         block_start = block_end;
     }
     ranges
+}
+
+pub fn rotating_review_count(range: &StudyRange) -> usize {
+    if range.start == 0 { 0 } else { 100.min(range.start) }
+}
+
+fn rotating_review_ids(
+    slots: &[Option<String>], entries: &[EntryRecord], range: &StudyRange,
+    stage: u32, increment: usize, checkpoint: usize,
+) -> Vec<String> {
+    if stage == 0 || increment == 0 || checkpoint == 0 || range.start == 0 { return Vec::new(); }
+    let active: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+    let eligible = slots[..range.start.min(slots.len())].iter().filter_map(Option::as_ref)
+        .filter(|id| active.contains(id.as_str())).collect::<Vec<_>>();
+    if eligible.is_empty() { return Vec::new(); }
+    let first_block_stages = checkpoint.div_ceil(increment);
+    let offset = (stage as usize - 1).saturating_sub(first_block_stages) * 100 % eligible.len();
+    (0..rotating_review_count(range).min(eligible.len()))
+        .map(|index| eligible[(offset + index) % eligible.len()].to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -233,6 +261,8 @@ pub struct StudySession {
     pub queue: QueueState,
     pub current: Option<VariantKey>,
     pub range_total: usize,
+    #[serde(default)]
+    pub review_entry_ids: Option<Vec<String>>,
     pub pending: Option<PendingState>,
 }
 
@@ -263,7 +293,11 @@ impl StudySession {
         } else {
             stage_study_range(entry_slots.len(), increment, checkpoint, stage)?
         };
-        let variants = variants_for_slots(&entry_slots, entries, modes, &study_range);
+        let review_ids = rotating_review_ids(&entry_slots, entries, &study_range, stage, increment, checkpoint);
+        let mut variants = variants_for_slots(&entry_slots, entries, modes, &study_range);
+        if let Some(mode) = modes.first().copied() {
+            variants.extend(review_ids.iter().map(|id| VariantKey { entry_id: id.clone(), mode }));
+        }
         let total = variants.len();
         Some(Self {
             deck_id,
@@ -274,6 +308,7 @@ impl StudySession {
             queue: QueueState::new(variants, seed),
             current: None,
             range_total: total,
+            review_entry_ids: Some(review_ids),
             pending: None,
         })
     }
@@ -281,6 +316,19 @@ impl StudySession {
     #[cfg(test)]
     pub fn scheduled_entry_count(&self) -> usize {
         self.entry_slots.len()
+    }
+
+    pub fn seed_rotating_review(&mut self, entries: &[EntryRecord], modes: &[StudyMode], increment: usize, checkpoint: usize) {
+        if self.review_entry_ids.is_some() { return; }
+        let ids = rotating_review_ids(&self.entry_slots, entries, &self.study_range, self.stage, increment, checkpoint);
+        if let Some(mode) = modes.first().copied() {
+            self.queue.add_variants(ids.iter().map(|id| VariantKey { entry_id: id.clone(), mode }));
+        }
+        if !ids.is_empty() && matches!(self.pending, Some(PendingState::CycleComplete { .. })) {
+            self.pending = None;
+        }
+        self.review_entry_ids = Some(ids);
+        self.sync_entries(entries, modes);
     }
 
     pub fn sync_entries(&mut self, entries: &[EntryRecord], modes: &[StudyMode]) {
@@ -292,6 +340,9 @@ impl StudySession {
         }
         self.queue.retain_entries(&active_ids);
         self.queue.dedupe_entries();
+        if let Some(review_ids) = &mut self.review_entry_ids {
+            review_ids.retain(|id| active_ids.contains(id.as_str()));
+        }
         if self.current.as_ref().is_some_and(|variant| !active_ids.contains(variant.entry_id.as_str())) {
             self.current = None;
         }
@@ -306,7 +357,8 @@ impl StudySession {
         if pending_entry_id.is_some_and(|entry_id| !active_ids.contains(entry_id)) {
             self.pending = None;
         }
-        self.range_total = variants_for_slots(&self.entry_slots, entries, modes, &self.study_range).len();
+        self.range_total = variants_for_slots(&self.entry_slots, entries, modes, &self.study_range).len()
+            + self.review_entry_ids.as_ref().map_or(0, Vec::len);
     }
 
     pub fn expand_schedule(
@@ -387,6 +439,7 @@ impl StudySession {
         self.study_range = study_range;
         self.entry_slots = entry_slots;
         self.range_total = new_ids.len();
+        self.review_entry_ids = None;
     }
 
     #[cfg(test)]
@@ -494,13 +547,13 @@ mod tests {
         assert_eq!(labels(50), vec!["0~49"]);
         assert_eq!(labels(51), vec!["0~49", "0~50"]);
         assert_eq!(labels(300), vec!["0~49", "0~99", "0~149", "0~199", "0~249", "0~299"]);
-        assert_eq!(labels(301).last().unwrap(), "0~300 · cumulative");
-        assert_eq!(labels(999).last().unwrap(), "0~998 · cumulative");
-        assert_eq!(labels(1000).last().unwrap(), "0~999 · cumulative");
-        assert_eq!(labels(1001).last().unwrap(), "0~1000 · cumulative");
-        assert_eq!(labels(3000).last().unwrap(), "0~2999 · cumulative");
-        assert_eq!(labels(3042).last().unwrap(), "0~3041 · cumulative");
-        assert_eq!(labels(5999).last().unwrap(), "0~5998 · cumulative");
+        assert_eq!(labels(301).last().unwrap(), "300~300");
+        assert_eq!(labels(999).last().unwrap(), "900~998");
+        assert_eq!(labels(1000).last().unwrap(), "900~999");
+        assert_eq!(labels(1001).last().unwrap(), "900~1000");
+        assert_eq!(labels(3000).last().unwrap(), "2700~2999");
+        assert_eq!(labels(3042).last().unwrap(), "3000~3041");
+        assert_eq!(labels(5999).last().unwrap(), "5700~5998");
     }
 
     #[test]
@@ -508,10 +561,9 @@ mod tests {
         let labels: Vec<_> = study_ranges(1000, INCREMENT, CHECKPOINT).into_iter().map(|range| range.label).collect();
         assert_eq!(labels, vec![
             "0~49", "0~99", "0~149", "0~199", "0~249", "0~299",
-            "300~349", "300~399", "300~449", "300~499", "300~549", "300~599", "0~599 · cumulative",
-            "600~649", "600~699", "600~749", "600~799", "600~849", "600~899", "0~899 · cumulative",
+            "300~349", "300~399", "300~449", "300~499", "300~549", "300~599",
+            "600~649", "600~699", "600~749", "600~799", "600~849", "600~899",
             "900~949", "900~999",
-            "0~999 · cumulative",
         ]);
     }
 
@@ -524,8 +576,7 @@ mod tests {
         for (index, label) in expected.into_iter().enumerate() {
             assert_eq!(stage_study_range(500, INCREMENT, CHECKPOINT, index as u32 + 1).unwrap().label, label);
         }
-        assert_eq!(stage_study_range(500, INCREMENT, CHECKPOINT, 11).unwrap().label, "0~499 · cumulative");
-        assert!(stage_study_range(500, INCREMENT, CHECKPOINT, 12).is_none());
+        assert!(stage_study_range(500, INCREMENT, CHECKPOINT, 11).is_none());
     }
 
     #[test]
@@ -533,7 +584,39 @@ mod tests {
         let values = entries(600);
         let session = StudySession::new_for_stage("deck".into(), 12, &values, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 1).unwrap();
         assert_eq!(session.range().label, "300~599");
-        assert_eq!(session.range_total, 300);
+        assert_eq!(session.range_total, 400);
+        assert_eq!(session.review_entry_ids.as_ref().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn rotating_review_mixes_100_older_entries_into_each_stage_after_first_block() {
+        let values = entries(900);
+        for (stage, review_start, review_end, core_count) in [
+            (7, 0, 100, 50), (8, 100, 200, 100), (9, 200, 300, 150),
+            (10, 0, 100, 200), (11, 100, 200, 250), (12, 200, 300, 300),
+            (13, 0, 100, 50), (16, 300, 400, 200), (18, 500, 600, 300),
+        ] {
+            let session = StudySession::new_for_stage("deck".into(), stage, &values, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 42).unwrap();
+            let expected = (review_start..review_end).map(|index| format!("e{index}")).collect::<Vec<_>>();
+            assert_eq!(session.review_entry_ids.as_ref().unwrap(), &expected, "stage {stage}");
+            assert_eq!(session.range_total, core_count + 100, "stage {stage}");
+            assert_eq!(session.queue.remaining_count(), core_count + 100, "stage {stage}");
+        }
+        let first = StudySession::new_for_stage("deck".into(), 6, &values, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 42).unwrap();
+        assert_eq!(first.range_total, 300);
+        assert!(first.review_entry_ids.unwrap().is_empty());
+    }
+
+    #[test]
+    fn rotating_review_resume_does_not_reinsert_already_passed_entries() {
+        let values = entries(600);
+        let mut session = StudySession::new_for_stage("deck".into(), 7, &values, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 7).unwrap();
+        let passed = session.next_variant(10).unwrap();
+        session.resolve_current(&passed, true).unwrap();
+        let mut resumed: StudySession = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        resumed.seed_rotating_review(&values, &[StudyMode::Reading], INCREMENT, CHECKPOINT);
+        assert_eq!(resumed.queue.remaining_count(), 149);
+        assert!(!resumed.queue.remaining.contains(&passed));
     }
 
     #[test]
