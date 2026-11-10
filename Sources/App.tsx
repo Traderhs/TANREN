@@ -1905,8 +1905,7 @@ function DeckList({ decks, onRefresh, onEdit, onOpenedDeckChange, onRequestHomeS
                 className={`book-stage-range-link ${schedule?.active ? "is-current" : ""}`}
               >{weakReview ? (schedule?.active ? "진행 중" : "수집 중") : formatStudyRangeLabel(range.label)}</span>
               <span className="book-stage-range-meta">
-                <span>{numberFormat.format(entryCount)}개</span>
-                {reviewCount > 0 && <span>+ 복습 {reviewCount}개</span>}
+                <span>{numberFormat.format(entryCount)}개{reviewCount > 0 ? ` + 복습 ${reviewCount}개` : ""}</span>
               </span>
             </>}
           </span>

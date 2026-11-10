@@ -1500,13 +1500,20 @@ impl Database {
                     expanded_slots.push(Some(entry.id.clone()));
                 }
             }
-            let Some(live_range) = stage_study_range(expanded_slots.len(), increment, checkpoint, stage) else {
+            let target_stage = if old_range.cumulative {
+                study_ranges(expanded_slots.len(), increment, checkpoint).len() as u32
+            } else {
+                stage
+            };
+            let Some(live_range) = stage_study_range(expanded_slots.len(), increment, checkpoint, target_stage) else {
                 continue;
             };
             let old_span = old_range.end.saturating_sub(old_range.start);
-            let is_growing_tail = !old_range.cumulative
-                && old_range.end == old_slots.len()
-                && old_span % increment != 0;
+            let is_growing_tail = if old_range.cumulative {
+                live_range.cumulative && live_range.end > old_range.end
+            } else {
+                old_range.end == old_slots.len() && old_span % increment != 0
+            };
             if !is_growing_tail
                 || live_range.start != old_range.start
                 || live_range.end <= old_range.end
@@ -1514,22 +1521,36 @@ impl Database {
                 continue;
             }
 
+            if target_stage != stage {
+                for table in ["stage_schedules", "stage_states", "stage_completions", "attempts"] {
+                    tx.execute(&format!("UPDATE {table} SET stage=?1 WHERE deck_id=?2 AND stage=?3"),
+                        params![target_stage as i64, deck_id, stage as i64]).map_err(|e| e.to_string())?;
+                }
+                tx.execute("UPDATE decks SET current_stage=?1 WHERE id=?2 AND current_stage=?3",
+                    params![target_stage as i64, deck_id, stage as i64]).map_err(|e| e.to_string())?;
+                tx.execute("UPDATE sync_journal SET entity_id=?1,payload=CASE WHEN json_valid(payload) AND json_type(payload,'$.stage') IS NOT NULL THEN json_set(payload,'$.stage',?2) ELSE payload END WHERE entity_type='stage_state' AND entity_id=?3",
+                    params![format!("{deck_id}:{target_stage}"), target_stage, format!("{deck_id}:{stage}")]).map_err(|e| e.to_string())?;
+                tx.execute("UPDATE sync_journal SET payload=json_set(payload,'$.stage',?1) WHERE entity_type='attempt' AND json_valid(payload) AND json_type(payload,'$.stage') IS NOT NULL AND entity_id IN (SELECT id FROM attempts WHERE deck_id=?2 AND stage=?1)",
+                    params![target_stage as i64, deck_id]).map_err(|e| e.to_string())?;
+            }
+
             tx.execute(
                 "UPDATE stage_schedules SET entry_slots_json=?1,created_at=?2 WHERE deck_id=?3 AND stage=?4",
-                params![serde_json::to_string(&expanded_slots).map_err(|e| e.to_string())?, timestamp, deck_id, stage as i64],
+                params![serde_json::to_string(&expanded_slots).map_err(|e| e.to_string())?, timestamp, deck_id, target_stage as i64],
             ).map_err(|e| e.to_string())?;
 
             let state_json: Option<String> = tx.query_row(
                 "SELECT state_json FROM stage_states WHERE deck_id=?1 AND stage=?2",
-                params![deck_id, stage as i64],
+                params![deck_id, target_stage as i64],
                 |row| row.get(0),
             ).optional().map_err(|e| e.to_string())?;
             if let Some(state_json) = state_json {
                 let mut session: StudySession = serde_json::from_str(&state_json).map_err(|e| e.to_string())?;
+                session.stage = target_stage;
                 session.expand_schedule(expanded_slots.clone(), live_range, &live_entries, &modes);
                 tx.execute(
                     "UPDATE stage_states SET state_json=?1,updated_at=?2 WHERE deck_id=?3 AND stage=?4",
-                    params![serde_json::to_string(&session).map_err(|e| e.to_string())?, timestamp, deck_id, stage as i64],
+                    params![serde_json::to_string(&session).map_err(|e| e.to_string())?, timestamp, deck_id, target_stage as i64],
                 ).map_err(|e| e.to_string())?;
             }
         }
@@ -3693,7 +3714,7 @@ mod tests{
     }
 
     #[test]
-    fn partial_second_block_keeps_only_growing_regular_stages() {
+    fn partial_second_block_keeps_final_cumulative_review() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
         let deck = db.create_deck("checkpoint", "ko-KR", "ja-JP").unwrap();
@@ -3702,9 +3723,50 @@ mod tests{
         }).collect::<Vec<_>>();
         db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
         let summary = db.list_decks().unwrap().remove(0);
-        assert_eq!(summary.total_stage_count, 11);
+        assert_eq!(summary.total_stage_count, 12);
         assert_eq!(db.stage_schedule_summary(&deck.id, 11).unwrap().study_range.label, "300~500");
-        assert!(db.stage_schedule_summary(&deck.id, 12).is_err());
+        assert_eq!(db.stage_schedule_summary(&deck.id, 12).unwrap().study_range.label, "0~500 · cumulative");
+        assert!(db.stage_schedule_summary(&deck.id, 13).is_err());
+    }
+
+    #[test]
+    fn growing_book_moves_only_the_final_cumulative_stage_and_preserves_progress() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("tanren.db")).unwrap();
+        let deck = db.create_deck("growing final", "ko-KR", "ja-JP").unwrap();
+        db.import_entries(&deck.id, "ja-JP", &(0..600).map(|index| EntryDraft {
+            term: format!("word{index}"), meanings: vec![format!("meaning{index}")], reading: None,
+        }).collect::<Vec<_>>()).unwrap();
+        let entries = db.entries(&deck.id).unwrap();
+        let final_stage = db.total_stages(&deck.id).unwrap();
+        assert_eq!(final_stage, 13);
+        let slots = db.ensure_stage_schedule(&deck.id, final_stage, &entries).unwrap();
+        let mut session = StudySession::new_for_stage_with_slots(deck.id.clone(), final_stage, slots,
+            &entries, &[StudyMode::Reading], 50, 300, 42).unwrap();
+        let answered = session.next_variant(10).unwrap();
+        session.resolve_current(&answered, true).unwrap();
+        db.save_session(&session).unwrap();
+        db.select_stage(&deck.id, final_stage).unwrap();
+        db.insert_attempt(&entries[0].id, &deck.id, StudyMode::Reading, final_stage,
+            "0~599 · cumulative", "answer", true, None, true, "test", None, 100, 100, None).unwrap();
+        db.mark_stage_completed(&deck.id, final_stage, 1234, 1).unwrap();
+
+        db.import_entries(&deck.id, "ja-JP", &[EntryDraft {
+            term: "additional".into(), meanings: vec!["new".into()], reading: None,
+        }]).unwrap();
+
+        assert_eq!(db.total_stages(&deck.id).unwrap(), 14);
+        assert_eq!(db.deck(&deck.id).unwrap().current_stage, 14);
+        assert_eq!(db.stage_schedule_summary(&deck.id, 13).unwrap().study_range.label, "600~600");
+        assert_eq!(db.stage_schedule_summary(&deck.id, 14).unwrap().study_range.label, "0~600 · cumulative");
+        let resumed = db.load_session(&deck.id, 14).unwrap().unwrap();
+        assert_eq!(resumed.stage, 14);
+        assert_eq!(resumed.range_total, 601);
+        assert_eq!(resumed.queue.remaining_count(), 600);
+        assert!(!resumed.queue.remaining.contains(&answered));
+        assert!(db.load_session(&deck.id, 13).unwrap().is_none());
+        assert_eq!(db.stage_schedule_summary(&deck.id, 14).unwrap().clear_times_ms, vec![1234]);
+        assert_eq!(db.stage_completion_stats(&deck.id, 14).unwrap().attempts, 1);
     }
 
     #[test]
@@ -3920,7 +3982,7 @@ mod tests{
     }
 
     #[test]
-    fn five_hundred_entries_have_regular_stages_with_rotating_review() {
+    fn five_hundred_entries_end_in_cumulative_review() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("tanren.db")).unwrap();
         let deck = db.create_deck("stages", "ko-KR", "ja-JP").unwrap();
@@ -3932,13 +3994,14 @@ mod tests{
         db.import_entries(&deck.id, "ja-JP", &drafts).unwrap();
 
         let summary = db.list_decks().unwrap().remove(0);
-        assert_eq!(summary.total_stage_count, 10);
+        assert_eq!(summary.total_stage_count, 11);
         assert_eq!(summary.completed_stage_count, 0);
         assert_eq!(db.stage_schedule_summary(&deck.id, 1).unwrap().study_range.label, "0~49");
         assert_eq!(db.stage_schedule_summary(&deck.id, 2).unwrap().study_range.label, "0~99");
         assert_eq!(db.stage_schedule_summary(&deck.id, 7).unwrap().study_range.label, "300~349");
         assert_eq!(db.stage_schedule_summary(&deck.id, 10).unwrap().study_range.label, "300~499");
-        assert!(db.stage_schedule_summary(&deck.id, 11).is_err());
+        assert_eq!(db.stage_schedule_summary(&deck.id, 11).unwrap().study_range.label, "0~499 · cumulative");
+        assert!(db.stage_schedule_summary(&deck.id, 12).is_err());
 
         db.mark_stage_completed(&deck.id, 1, 4_320_000, 2).unwrap();
         db.mark_stage_completed(&deck.id, 1, 3_780_000, 3).unwrap();
@@ -3948,7 +4011,7 @@ mod tests{
         assert_eq!(stage_one.clear_cycles, vec![2, 3]);
         let summary = db.list_decks().unwrap().remove(0);
         assert_eq!(summary.completed_stage_count, 1);
-        assert_eq!(summary.total_stage_count, 10);
+        assert_eq!(summary.total_stage_count, 11);
 
         db.select_stage(&deck.id, 7).unwrap();
         assert_eq!(db.list_decks().unwrap().remove(0).current_stage, 7);

@@ -71,7 +71,7 @@ fn ranges_with_legacy_reviews(deck_size: usize, increment: usize, checkpoint: us
             if end == block_end { break; }
             end = (end + increment).min(block_end);
         }
-        if cumulative && block_start > 0 {
+        if block_start > 0 && (cumulative || block_end == deck_size) {
             ranges.push(StudyRange {
                 label: format!("0~{} · cumulative", block_end - 1),
                 start: 0,
@@ -547,13 +547,13 @@ mod tests {
         assert_eq!(labels(50), vec!["0~49"]);
         assert_eq!(labels(51), vec!["0~49", "0~50"]);
         assert_eq!(labels(300), vec!["0~49", "0~99", "0~149", "0~199", "0~249", "0~299"]);
-        assert_eq!(labels(301).last().unwrap(), "300~300");
-        assert_eq!(labels(999).last().unwrap(), "900~998");
-        assert_eq!(labels(1000).last().unwrap(), "900~999");
-        assert_eq!(labels(1001).last().unwrap(), "900~1000");
-        assert_eq!(labels(3000).last().unwrap(), "2700~2999");
-        assert_eq!(labels(3042).last().unwrap(), "3000~3041");
-        assert_eq!(labels(5999).last().unwrap(), "5700~5998");
+        assert_eq!(labels(301).last().unwrap(), "0~300 · cumulative");
+        assert_eq!(labels(999).last().unwrap(), "0~998 · cumulative");
+        assert_eq!(labels(1000).last().unwrap(), "0~999 · cumulative");
+        assert_eq!(labels(1001).last().unwrap(), "0~1000 · cumulative");
+        assert_eq!(labels(3000).last().unwrap(), "0~2999 · cumulative");
+        assert_eq!(labels(3042).last().unwrap(), "0~3041 · cumulative");
+        assert_eq!(labels(5999).last().unwrap(), "0~5998 · cumulative");
     }
 
     #[test]
@@ -563,8 +563,27 @@ mod tests {
             "0~49", "0~99", "0~149", "0~199", "0~249", "0~299",
             "300~349", "300~399", "300~449", "300~499", "300~549", "300~599",
             "600~649", "600~699", "600~749", "600~799", "600~849", "600~899",
-            "900~949", "900~999",
+            "900~949", "900~999", "0~999 · cumulative",
         ]);
+    }
+
+    #[test]
+    fn only_the_last_stage_is_the_original_full_cumulative_review() {
+        for count in [301, 500, 600, 601, 900, 1000, 9151] {
+            let ranges = study_ranges(count, INCREMENT, CHECKPOINT);
+            assert_eq!(ranges.iter().filter(|range| range.cumulative).count(), 1, "{count}");
+            let final_stage = ranges.last().unwrap();
+            assert_eq!((final_stage.start, final_stage.end), (0, count));
+            assert_eq!(final_stage.label, format!("0~{} · cumulative", count - 1));
+            assert!(!ranges[ranges.len() - 2].cumulative);
+        }
+        assert!(!study_ranges(300, INCREMENT, CHECKPOINT).iter().any(|range| range.cumulative));
+        let values = entries(900);
+        let final_stage = study_ranges(900, INCREMENT, CHECKPOINT).len() as u32;
+        let session = StudySession::new_for_stage("deck".into(), final_stage, &values, &[StudyMode::Reading], INCREMENT, CHECKPOINT, 42).unwrap();
+        assert_eq!(session.range_total, 900);
+        assert_eq!(session.queue.remaining_count(), 900);
+        assert!(session.review_entry_ids.unwrap().is_empty());
     }
 
     #[test]
@@ -576,7 +595,8 @@ mod tests {
         for (index, label) in expected.into_iter().enumerate() {
             assert_eq!(stage_study_range(500, INCREMENT, CHECKPOINT, index as u32 + 1).unwrap().label, label);
         }
-        assert!(stage_study_range(500, INCREMENT, CHECKPOINT, 11).is_none());
+        assert_eq!(stage_study_range(500, INCREMENT, CHECKPOINT, 11).unwrap().label, "0~499 · cumulative");
+        assert!(stage_study_range(500, INCREMENT, CHECKPOINT, 12).is_none());
     }
 
     #[test]
